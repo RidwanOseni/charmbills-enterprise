@@ -1,48 +1,37 @@
-import type React from "react"
-import type { Metadata } from "next"
-import { Geist, Geist_Mono } from "next/font/google"
-import { Analytics } from "@vercel/analytics/next"
-import "./globals.css"
-import { WalletProvider } from "@/lib/WalletContext"
+import type { Metadata } from 'next'
+import { Geist, Geist_Mono } from 'next/font/google'
+import './globals.css'
+import { WalletProvider } from '@/lib/WalletContext'
+import { Header } from '@/components/Header'
 
-const _geist = Geist({ subsets: ["latin"] })
-const _geistMono = Geist_Mono({ subsets: ["latin"] })
+const geistSans = Geist({
+  subsets: ['latin'],
+  variable: '--font-geist-sans', 
+})
+
+const geistMono = Geist_Mono({
+  subsets: ['latin'],
+  variable: '--font-geist-mono',
+})
 
 export const metadata: Metadata = {
-  title: "CharmBills - Bitcoin Recurring Payments",
-  description: "Accept monthly subscriptions in BTC. No intermediaries, no chargebacks. 1% flat fee.",
-  generator: "v0.app",
-  icons: {
-    icon: [
-      {
-        url: "/icon-light-32x32.png",
-        media: "(prefers-color-scheme: light)",
-      },
-      {
-        url: "/icon-dark-32x32.png",
-        media: "(prefers-color-scheme: dark)",
-      },
-      {
-        url: "/icon.svg",
-        type: "image/svg+xml",
-      },
-    ],
-    apple: "/apple-icon.png",
-  },
+  title: 'CharmBills - Bitcoin Payroll',
+  description: 'Automated payroll for employees and freelancers.',
 }
 
 export default function RootLayout({
   children,
-}: Readonly<{
-  children: React.ReactNode
-}>) {
+}: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className={`${_geist.className} ${_geistMono.className} antialiased`}>
+      <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
+        {/* Wrap everything in the Wallet Provider to enable global state */}
         <WalletProvider>
-          {children}
+          <Header />
+          <main className="min-h-screen bg-background">
+            {children}
+          </main>
         </WalletProvider>
-        <Analytics />
       </body>
     </html>
   )

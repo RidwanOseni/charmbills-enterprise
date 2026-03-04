@@ -2,6 +2,8 @@
   "compilerOptions": {
     "target": "ES2020",
     "module": "commonjs",
+    "allowJs": true,
+    "checkJs": false,
     "moduleResolution": "node",
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
@@ -9,7 +11,8 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["../*"]
+      "@shared/*": ["../charmbills-frontend/shared/*"],
+      "@wasm/*": ["src/charms/wasm/*"]
     },
     "outDir": "dist",
     "resolveJsonModule": true

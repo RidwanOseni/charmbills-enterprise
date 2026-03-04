@@ -1,288 +1,345 @@
 import { Request, Response } from 'express';
-import { generateUnsignedTransactions } from '../charms/proverClient';
-import { SpellRequest, ProverResult } from '../../../shared/types';
-import * as constants from '../../../shared/constants';
+import { Database } from 'sqlite3';
+import { generateUnsignedTransactions } from '../charms/proverClient'; 
+import { encryptPayrollData } from '@shared/encryption';
+import { pinToIPFS } from '../lib/ipfs-pinner';
+import { SpellRequest, ProverResult } from '@shared/types';
+import * as constants from '@shared/constants';
+import * as crypto from 'crypto';
 
-/**
- * Endpoint to generate the Plan NFT (Authority) transactions.
- * Triggered by the Merchant Dashboard when a new plan is created.
- */
-export async function createPlanNFT(req: Request, res: Response) {
-  console.log('\n[DEBUG] ===== START createPlanNFT API =====');
-  console.log('[DEBUG] Request received at /api/plans/mint');
-  console.log('[DEBUG] Request method:', req.method);
-  console.log('[DEBUG] Request headers:', JSON.stringify(req.headers, null, 2));
+const db = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
+
+// --------------------------------------------------------------------------------
+// Types
+// --------------------------------------------------------------------------------
+
+interface CreatePayrollPlanRequest {
+  // Bitcoin UTXO data
+  anchorUtxo: string;
+  anchorTxHex: string;
+  anchorValue: number;
+  fundingUtxo: string;
+  fundingValue: number;
+  employerAddress: string;
   
-  // Check if body exists
-  console.log('[DEBUG] req.body exists:', !!req.body);
-  console.log('[DEBUG] req.body type:', typeof req.body);
+  // Payroll configuration
+  department: string;
+  role: string;
   
-  if (!req.body) {
-    console.error('[ERROR] Request body is empty or undefined');
-    return res.status(400).json({ 
-      error: 'Request body is required',
-      receivedBody: req.body 
-    });
+  // Enforcement fields
+  compensationSats: number;
+  payPeriodSeconds: number;
+  scrollPolicy: 0 | 1;
+  
+  // NEW PRODUCTION FIELDS
+  encryptionEntropy: string; // From wallet signature [3]
+  multiSigRequired?: boolean;
+  multiSigSigners?: string[]; // Allows dynamic signer sets instead of .env [4]
+}
+
+interface PayrollPlanResponse extends ProverResult {
+  ipfsCid: string;
+  appId: string;
+  metadataHash: string;
+  department: string;
+}
+
+// --------------------------------------------------------------------------------
+// Validation Functions
+// --------------------------------------------------------------------------------
+
+function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPlanRequest {
+  const required = [
+    'anchorUtxo', 'anchorTxHex', 'anchorValue',
+    'fundingUtxo', 'fundingValue',
+    'employerAddress',
+    'department', 'role',
+    'compensationSats', 'payPeriodSeconds', 'scrollPolicy',
+    'encryptionEntropy' // ADDED: Required for non-custodial encryption
+  ];
+  
+  const missing = required.filter(field => {
+    const value = body[field];
+    return value === undefined || value === null || value === '';
+  });
+  
+  if (missing.length > 0) {
+    throw new Error(`Missing required fields: ${missing.join(', ')}`);
   }
   
-  // Log the raw body
-  console.log('[DEBUG] Raw request body (truncated):', 
-    JSON.stringify(req.body).substring(0, 500) + '...');
+  // Validate types and ranges
+  if (typeof body.anchorValue !== 'number' || body.anchorValue < constants.MIN_OUTPUT_SATS) {
+    throw new Error(`anchorValue must be a number >= ${constants.MIN_OUTPUT_SATS}`);
+  }
+  
+  if (typeof body.fundingValue !== 'number' || body.fundingValue < constants.MIN_OUTPUT_SATS) {
+    throw new Error(`fundingValue must be a number >= ${constants.MIN_OUTPUT_SATS}`);
+  }
+  
+  if (typeof body.compensationSats !== 'number' || body.compensationSats < constants.MIN_OUTPUT_SATS) {
+    throw new Error(`compensationSats must be a number >= ${constants.MIN_OUTPUT_SATS}`);
+  }
+  
+  if (typeof body.payPeriodSeconds !== 'number' || body.payPeriodSeconds <= 0) {
+    throw new Error('payPeriodSeconds must be a positive number');
+  }
+  
+  if (![0, 1].includes(body.scrollPolicy)) {
+    throw new Error('scrollPolicy must be 0 (Time) or 1 (Proof)');
+  }
+  
+  // Validate hex strings
+  if (!/^[0-9a-f]+$/i.test(body.anchorTxHex.replace(/\s/g, ''))) {
+    throw new Error('anchorTxHex contains invalid hex characters');
+  }
+  
+  // Validate UTXO format
+  if (!/^[0-9a-f]+:\d+$/i.test(body.anchorUtxo)) {
+    throw new Error('anchorUtxo must be in format "txid:vout"');
+  }
+  
+  if (!/^[0-9a-f]+:\d+$/i.test(body.fundingUtxo)) {
+    throw new Error('fundingUtxo must be in format "txid:vout"');
+  }
+  
+  // Validate encryptionEntropy is a non-empty string
+  if (typeof body.encryptionEntropy !== 'string' || body.encryptionEntropy.length === 0) {
+    throw new Error('encryptionEntropy must be a non-empty string');
+  }
+  
+  // Validate multiSigSigners if provided
+  if (body.multiSigSigners !== undefined) {
+    if (!Array.isArray(body.multiSigSigners)) {
+      throw new Error('multiSigSigners must be an array if provided');
+    }
+    if (body.multiSigSigners.length < 2) {
+      throw new Error('multiSigSigners must contain at least 2 signers');
+    }
+  }
+}
+
+// --------------------------------------------------------------------------------
+// Flexible Multi-sig Configuration
+// --------------------------------------------------------------------------------
+
+function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]): {
+  multiSigSigners?: string[];
+  multiSigThreshold?: number;
+} {
+  if (!multiSigRequired) return {};
+
+  // Prioritize dynamic signers passed in request for flexibility
+  if (requestSigners && requestSigners.length >= 2) {
+    return {
+      multiSigSigners: requestSigners,
+      multiSigThreshold: 2 // Standard 2-of-3 operational layer [5]
+    };
+  }
+
+  // Fallback: Fetch from a central registry or specific organizational defaults
+  // For now, ensure we aren't restricted to hardcoded .env variables
+  throw new Error('Multi-sig signers must be specified for departmental plan creation.');
+}
+
+// --------------------------------------------------------------------------------
+// Main API Handler - THIS IS WHAT INDEX.TS CALLS
+// --------------------------------------------------------------------------------
+
+/**
+ * Creates a Departmental Plan NFT with Hybrid Metadata.
+ * Endpoint: POST /api/plans/mint
+ */
+export async function createPayrollPlan(req: Request, res: Response) {
+  const requestId = crypto.randomBytes(4).toString('hex');
+  
+  console.log(`\n[PLANS API:${requestId}] ===== START createPayrollPlan =====`);
   
   try {
-    // 1. Destructure with safe defaults and validation
-    console.log('[DEBUG] === Destructuring request body ===');
+    // ----------------------------------------------------------------------------
+    // Step 1: Validate request body
+    // ----------------------------------------------------------------------------
+    console.log(`[PLANS API:${requestId}] Validating request body...`);
     
-    const { 
+    if (!req.body || Object.keys(req.body).length === 0) {
+      console.error(`[PLANS API:${requestId}] ❌ Empty request body`);
+      return res.status(400).json({ error: 'Request body is required' });
+    }
+    
+    // Log sanitized request
+    console.log(`[PLANS API:${requestId}] Request summary:`, {
+      department: req.body.department,
+      role: req.body.role,
+      compensationSats: req.body.compensationSats,
+      payPeriodSeconds: req.body.payPeriodSeconds,
+      scrollPolicy: req.body.scrollPolicy,
+      multiSigRequired: req.body.multiSigRequired,
+      multiSigSignersCount: req.body.multiSigSigners?.length || 0,
+      hasEncryptionEntropy: !!req.body.encryptionEntropy
+    });
+    
+    // Validate required fields (now includes encryptionEntropy)
+    validatePayrollPlanRequest(req.body);
+    
+    const {
       anchorUtxo,
-      anchorValue, 
-      fundingUtxo, 
-      fundingValue, 
-      anchorTxHex, 
-      feeTxHex, 
-      merchantAddress, 
-      metadata 
+      anchorTxHex,
+      anchorValue,
+      fundingUtxo,
+      fundingValue,
+      employerAddress,
+      department,
+      role,
+      compensationSats,
+      payPeriodSeconds,
+      scrollPolicy,
+      encryptionEntropy, // From wallet signature [3]
+      multiSigRequired,
+      multiSigSigners
     } = req.body;
     
-    // Log each destructured value
-    console.log('[DEBUG] Destructured values:');
-    console.log('  anchorUtxo:', anchorUtxo);
-    console.log('  anchorUtxo type:', typeof anchorUtxo);
-    console.log('  fundingUtxo:', fundingUtxo);
-    console.log('  fundingUtxo type:', typeof fundingUtxo);
-    console.log('  fundingValue:', fundingValue);
-    console.log('  fundingValue type:', typeof fundingValue);
-    console.log('  anchorTxHex exists:', !!anchorTxHex);
-    console.log('  anchorTxHex type:', typeof anchorTxHex);
-    console.log('  anchorTxHex length:', anchorTxHex?.length || 'N/A');
-    console.log('  anchorTxHex preview:', anchorTxHex ? `${anchorTxHex.substring(0, 50)}...` : 'undefined');
-    console.log('  feeTxHex exists:', !!feeTxHex);
-    console.log('  feeTxHex type:', typeof feeTxHex);
-    console.log('  feeTxHex length:', feeTxHex?.length || 'N/A');
-    console.log('  feeTxHex preview:', feeTxHex ? `${feeTxHex.substring(0, 50)}...` : 'undefined');
-    console.log('  merchantAddress:', merchantAddress);
-    console.log('  merchantAddress type:', typeof merchantAddress);
-    console.log('  metadata:', metadata);
-    console.log('  metadata type:', typeof metadata);
-
-    console.log('  anchorValue:', anchorValue);
-console.log('  anchorValue type:', typeof anchorValue);
-if (typeof anchorValue !== 'number' || isNaN(anchorValue)) {
-  console.error('[ERROR] anchorValue must be a valid number:', anchorValue);
-  return res.status(400).json({ 
-    error: 'anchorValue must be a valid number',
-    receivedValue: anchorValue,
-    receivedType: typeof anchorValue
-  });
-}
+    // Clean hex
+    const cleanAnchorTxHex = anchorTxHex.replace(/\s/g, '');
     
-    // 2. Validate required fields
-    console.log('[DEBUG] === Validating required fields ===');
+    console.log(`[PLANS API:${requestId}] ✅ Validation passed`);
     
-    const requiredFields = [
-      { key: 'anchorUtxo', value: anchorUtxo },
-      { key: 'anchorValue', value: anchorValue },
-      { key: 'fundingUtxo', value: fundingUtxo },
-      { key: 'fundingValue', value: fundingValue },
-      { key: 'anchorTxHex', value: anchorTxHex },
-      { key: 'feeTxHex', value: feeTxHex },
-      { key: 'merchantAddress', value: merchantAddress },
-      { key: 'metadata', value: metadata }
-    ];
+    // ----------------------------------------------------------------------------
+    // Step 2: Encrypt using wallet-provided entropy (Backend acts as a blind relay) [7]
+    // ----------------------------------------------------------------------------
+    console.log(`[PLANS API:${requestId}] 🔐 Encrypting payroll data with wallet entropy...`);
     
-    const missingFields = requiredFields.filter(field => {
-      const isEmpty = field.value === undefined || field.value === null || 
-                     (typeof field.value === 'string' && field.value.trim() === '');
-      if (isEmpty) {
-        console.error(`[ERROR] Missing or empty field: ${field.key}`);
-      }
-      return isEmpty;
-    }).map(field => field.key);
+    // No environment key needed - using encryptionEntropy from wallet
+    const encryptedBlob = encryptPayrollData({
+      department,
+      role,
+      baseSalarySats: compensationSats,
+      created: new Date().toISOString(),
+      scrollPolicy,
+      payPeriodSeconds,
+      uiTemplate: scrollPolicy === 0 ? 'employee' : 'freelancer'
+    }, encryptionEntropy); // Use entropy from signature instead of .env [3]
     
-    if (missingFields.length > 0) {
-      console.error('[ERROR] Missing required fields:', missingFields);
-      console.error('[ERROR] Full request body for debugging:', JSON.stringify(req.body, null, 2));
-      
-      return res.status(400).json({ 
-        error: `Missing required fields: ${missingFields.join(', ')}`,
-        missingFields: missingFields,
-        receivedBody: req.body 
-      });
-    }
+    console.log(`[PLANS API:${requestId}] ✅ Data encrypted with wallet entropy`);
     
-    // 3. Additional validation for hex values
-    console.log('[DEBUG] === Validating hex values ===');
+    // ----------------------------------------------------------------------------
+    // Step 3: Pin encrypted data to IPFS
+    // ----------------------------------------------------------------------------
+    console.log(`[PLANS API:${requestId}] 📦 Pinning to IPFS...`);
     
-    if (typeof anchorTxHex !== 'string') {
-      console.error('[ERROR] anchorTxHex is not a string:', typeof anchorTxHex);
-      return res.status(400).json({ 
-        error: 'anchorTxHex must be a string',
-        receivedType: typeof anchorTxHex,
-        receivedValue: anchorTxHex
-      });
-    }
+    const { cid, metadataHash } = await pinToIPFS(encryptedBlob);
     
-    if (typeof feeTxHex !== 'string') {
-      console.error('[ERROR] feeTxHex is not a string:', typeof feeTxHex);
-      return res.status(400).json({ 
-        error: 'feeTxHex must be a string',
-        receivedType: typeof feeTxHex,
-        receivedValue: feeTxHex
-      });
-    }
+    console.log(`[PLANS API:${requestId}] ✅ IPFS pin successful`);
+    console.log(`    CID: ${cid}`);
+    console.log(`    Hash: ${metadataHash.substring(0, 16)}...`);
     
-    // Clean hex values
-    const cleanAnchorTxHex = anchorTxHex.replace(/[^0-9a-fA-F]/g, '');
-    const cleanFeeTxHex = feeTxHex.replace(/[^0-9a-fA-F]/g, '');
+    // ----------------------------------------------------------------------------
+    // Step 4: Persist CID mapping so the indexer can find it later
+    // ----------------------------------------------------------------------------
+    await new Promise((resolve, reject) => {
+      db.run(
+        'INSERT OR IGNORE INTO ipfs_mappings (metadataHash, cid, createdAt) VALUES (?, ?, ?)',
+        [metadataHash, cid, new Date().toISOString()],
+        (err: Error | null) => err ? reject(err) : resolve(null)
+      );
+    });
     
-    console.log('[DEBUG] Cleaned hex values:');
-    console.log('  Clean anchorTxHex length:', cleanAnchorTxHex.length);
-    console.log('  Clean feeTxHex length:', cleanFeeTxHex.length);
+    console.log(`[PLANS API:${requestId}] ✅ CID Mapping saved: ${metadataHash.substring(0, 16)}... -> ${cid}`);
     
-    if (cleanAnchorTxHex.length === 0) {
-      console.error('[ERROR] anchorTxHex is empty after cleaning');
-      return res.status(400).json({ 
-        error: 'anchorTxHex contains no valid hex characters',
-        originalLength: anchorTxHex.length
-      });
-    }
-    
-    if (cleanFeeTxHex.length === 0) {
-      console.error('[ERROR] feeTxHex is empty after cleaning');
-      return res.status(400).json({ 
-        error: 'feeTxHex contains no valid hex characters',
-        originalLength: feeTxHex.length
-      });
-    }
-    
-    // 4. Validate metadata structure
-    console.log('[DEBUG] === Validating metadata ===');
-    
-    if (!metadata.serviceName || typeof metadata.serviceName !== 'string') {
-      console.error('[ERROR] Invalid metadata.serviceName:', metadata.serviceName);
-      return res.status(400).json({ 
-        error: 'metadata.serviceName is required and must be a string',
-        receivedMetadata: metadata
-      });
-    }
-    
-    // 5. Construct the SpellRequest
-    console.log('[DEBUG] === Constructing SpellRequest ===');
+    // ----------------------------------------------------------------------------
+    // Step 5: Construct SpellRequest with flexible signers [4, 9]
+    // ----------------------------------------------------------------------------
+    console.log(`[PLANS API:${requestId}] 🔧 Building SpellRequest...`);
     
     const request: SpellRequest = {
       type: 'mint-nft',
-      anchorUtxo: anchorUtxo,
-      anchorValue: anchorValue,
-      fundingUtxo: fundingUtxo,
+      anchorUtxo,
+      anchorValue,
+      fundingUtxo,
       fundingUtxoValue: fundingValue,
-      changeAddress: merchantAddress,
+      changeAddress: employerAddress,
       feeRate: constants.DEFAULT_FEE_RATE,
-      outputs: [
-        {
-          address: merchantAddress,
-          nftMetadata: {
-            serviceName: metadata.serviceName,
-            ticker: metadata.ticker || constants.HARDCODED_NFT_TICKER,
-            remaining: metadata.remaining || 100000,
-            iconUrl: metadata.iconUrl || 'https://charmbills.dev/pro.svg'
-          }
+      outputs: [{
+        address: employerAddress,
+        nftMetadata: {
+          ticker: constants.PAYROLL_NFT_TICKER,
+          remaining: 1,
+          metadataHash: metadataHash,
+          scrollPolicy: scrollPolicy,
+          payPeriodSeconds: payPeriodSeconds,
+          compensationSats: compensationSats
         }
-      ]
+      }],
+      ...getMultiSigConfig(multiSigRequired, multiSigSigners) // Uses dynamic signers
     };
     
-    console.log('[DEBUG] SpellRequest constructed:');
-    console.log('  Request type:', request.type);
-    console.log('  anchorUtxo:', request.anchorUtxo);
-    console.log('  anchorValue:', request.anchorValue);
-    console.log('  fundingUtxo:', request.fundingUtxo);
-    console.log('  fundingUtxoValue:', request.fundingUtxoValue);
-    console.log('  changeAddress:', request.changeAddress);
-    console.log('  outputs count:', request.outputs.length);
+    // ----------------------------------------------------------------------------
+    // Step 6: Generate unsigned transactions via prover
+    // ----------------------------------------------------------------------------
+    console.log(`[PLANS API:${requestId}] ⏳ Calling proverClient...`);
     
-    // 6. Prepare hex array for prover client
-    console.log('[DEBUG] === Preparing hex array for prover client ===');
+    const result = await generateUnsignedTransactions(request, [cleanAnchorTxHex]);
     
-    const hexArray = [anchorTxHex];
-    console.log('[DEBUG] Hex array to pass:', {
-      length: hexArray.length,
-      elements: hexArray.map((hex, index) => ({
-        index,
-        type: typeof hex,
-        length: hex.length,
-        preview: hex.substring(0, 30) + '...'
-      }))
-    });
+    console.log(`[PLANS API:${requestId}] ✅ Transactions generated`);
     
-    // 7. Call the prover client
-    console.log('[DEBUG] === Calling generateUnsignedTransactions ===');
+    // ----------------------------------------------------------------------------
+    // Step 7: Derive App ID
+    // ----------------------------------------------------------------------------
+    const appId = crypto.createHash('sha256').update(anchorUtxo).digest('hex');
     
-    const { commitTxHex, spellTxHex } = await generateUnsignedTransactions(
-      request, 
-      hexArray
-    );
-    
-    console.log('[DEBUG] === Prover client returned successfully ===');
-    console.log('[DEBUG] Response from generateUnsignedTransactions:');
-    console.log('  commitTxHex exists:', !!commitTxHex);
-    console.log('  commitTxHex type:', typeof commitTxHex);
-    console.log('  commitTxHex length:', commitTxHex?.length || 'N/A');
-    console.log('  spellTxHex exists:', !!spellTxHex);
-    console.log('  spellTxHex type:', typeof spellTxHex);
-    console.log('  spellTxHex length:', spellTxHex?.length || 'N/A');
-    
-    // Validate prover response
-    if (!commitTxHex || !spellTxHex) {
-      console.error('[ERROR] Prover returned empty transactions');
-      console.error('  commitTxHex:', commitTxHex);
-      console.error('  spellTxHex:', spellTxHex);
-      
-      return res.status(500).json({ 
-        error: 'Prover API returned empty transaction hexes',
-        commitTxHex: !!commitTxHex,
-        spellTxHex: !!spellTxHex
-      });
-    }
-    
-    const result: ProverResult = {
-      commitTxHex,
-      spellTxHex
+    // ----------------------------------------------------------------------------
+    // Step 8: Return success response
+    // ----------------------------------------------------------------------------
+    const response: PayrollPlanResponse = {
+      ...result,
+      ipfsCid: cid,
+      appId,
+      metadataHash,
+      department
     };
     
-    console.log('[DEBUG] === Sending successful response ===');
-    console.log('[DEBUG] Response payload size:', JSON.stringify(result).length, 'bytes');
-    console.log('[DEBUG] ===== END createPlanNFT API (SUCCESS) =====\n');
+    console.log(`[PLANS API:${requestId}] ✅ Success - App ID: ${appId.substring(0, 16)}...`);
+    console.log(`[PLANS API:${requestId}] ===== END =====\n`);
     
-    // 8. Return unsigned hexes to frontend for Leather wallet signing
-    return res.status(200).json(result);
-
+    return res.status(200).json(response);
+    
   } catch (error: any) {
-    console.error('\n[DEBUG] ===== createPlanNFT API ERROR =====');
-    console.error("Plan NFT Generation Failed:", error.message);
-    console.error("Error stack:", error.stack);
-    console.error("Error name:", error.name);
-    console.error("Error code:", error.code);
+    console.error(`\n[PLANS API:${requestId}] ❌ ERROR =====`);
+    console.error(`Error: ${error.message}`);
+    console.error(`Stack: ${error.stack}`);
+    console.error(`[PLANS API:${requestId}] ===== END =====\n`);
     
-    // Determine appropriate status code
     let statusCode = 500;
-    let errorMessage = error.message;
-    
-    if (error.message.includes('Missing required') || 
-        error.message.includes('must be a string') ||
-        error.message.includes('contains no valid hex')) {
-      statusCode = 400; // Bad Request
-    } else if (error.message.includes('HARDCODED_APP_VK') || 
-               error.message.includes('APP_BINARY_BASE64')) {
-      statusCode = 500; // Server configuration error
-    } else if (error.message.includes('Prover API failed')) {
-      statusCode = 502; // Bad Gateway
+    if (error.message.includes('Missing required') || error.message.includes('must be')) {
+      statusCode = 400;
+    } else if (error.message.includes('Prover')) {
+      statusCode = 502;
+    } else if (error.message.includes('IPFS')) {
+      statusCode = 503;
+    } else if (error.message.includes('Multi-sig signers must be specified')) {
+      statusCode = 400;
     }
     
-    console.error(`[DEBUG] Returning HTTP ${statusCode}: ${errorMessage}`);
-    console.error('[DEBUG] ===== END createPlanNFT API (ERROR) =====\n');
-    
-    return res.status(statusCode).json({ 
-      error: errorMessage,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined 
+    return res.status(statusCode).json({
+      error: error.message,
+      requestId
     });
   }
+}
+
+// --------------------------------------------------------------------------------
+// Plan Query API - Added for frontend dashboard
+// --------------------------------------------------------------------------------
+
+/**
+ * Retrieves plans from the database, optionally filtered by department.
+ * Endpoint: GET /api/plans
+ */
+export async function getPlans(req: Request, res: Response) {
+    const { department } = req.query;
+    const query = department ? 'SELECT * FROM plans WHERE ticker = ?' : 'SELECT * FROM plans';
+    const params = department ? [department] : [];
+
+    db.all(query, params, (err: Error | null, rows: any[]) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
 }

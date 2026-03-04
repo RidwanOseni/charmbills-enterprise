@@ -1,22 +1,33 @@
 import express from 'express';
 import cors from 'cors';
-import { createPlanNFT } from './api/plans';
-import { mintSubscriptionToken } from './api/subscriptions';
+import { createPayrollPlan } from './api/plans';        // ← NEW payroll version
+import { mintPayrollToken } from './api/payrollhiring'; // ← NEW payroll version
+import { getWorkers, getDashboardStats, getWorkerMetadata } from './api/workers';
 import { broadcastPackage } from './api/broadcast-package';
+import { getPendingApprovals, terminateWorker, approveTermination } from './api/treasury';
 
 const app = express();
 const PORT = 3002;
 
-app.use(cors()); // Allow frontend communication [19]
+app.use(cors());
 app.use(express.json());
 
-// Merchant Route: Create the Plan NFT (Authority) [19]
-app.post('/api/plans/mint', createPlanNFT);
+// Payroll Route: Create Department Plan NFT
+app.post('/api/plans/mint', createPayrollPlan);  
 
-// Subscriber Route: Mint a Subscription Token [2]
-app.post('/api/subscriptions/mint', mintSubscriptionToken);
+// Payroll Route: Mint Worker Tokens (Batch hire)
+app.post('/api/payrollhiring/mint', mintPayrollToken);  
 
-// Global Route: Broadcast signed transaction packages [2]
-app.post('/api/broadcast-package', broadcastPackage);
+// Broadcast Route: Submit signed packages
+app.post('/api/broadcast-package', broadcastPackage);  
 
-app.listen(PORT, () => console.log(`CharmBills Backend running on port ${PORT}`));
+// NEW: Data Retrieval routes for Phase 4 Dashboard
+app.get('/api/workers', getWorkers);
+app.get('/api/dashboard/stats', getDashboardStats);
+app.get('/api/worker-metadata/:address', getWorkerMetadata);
+
+app.get('/api/treasury/pending', getPendingApprovals);
+app.post('/api/workers/terminate', terminateWorker);
+app.post('/api/treasury/approve', approveTermination);
+
+app.listen(PORT, () => console.log(`CharmBills Payroll Backend running on port ${PORT}`));

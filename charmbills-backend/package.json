@@ -5,25 +5,37 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts",
+    "dev:plan": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts",
+    "dev:hiring": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts --phase2-only",
+    "dev:freelancer": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts --freelancer",
     "start:backend": "ts-node -r dotenv/config -r tsconfig-paths/register src/index.ts",
     "start": "npm run start:backend",
-    "build": "tsc"
+    "build": "tsc",
+    "clean": "rm -rf dist transactions/*.json",
+    "prover:test": "ts-node -r dotenv/config src/test-prover.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "CharmBills Payroll Backend - Bitcoin subscription engine for enterprise payroll",
   "dependencies": {
     "@types/express": "^5.0.6",
     "axios": "^1.13.2",
+    "bitcoinjs-lib": "^7.0.1",
+    "cbor-x": "^1.6.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
-    "tsconfig-paths": "^4.2.0"
+    "sqlite3": "^5.1.7",
+    "tsconfig-paths": "^4.2.0",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
+    "@types/bitcoinjs-lib": "^4.0.1",
     "@types/cors": "^2.8.19",
     "@types/node": "^25.0.2",
+    "@types/sqlite3": "^5.1.0",
+    "@types/uuid": "^10.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

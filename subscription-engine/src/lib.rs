@@ -3,369 +3,275 @@ use charms_sdk::data::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 
-// Define the NFT content structure with flexible field naming
-#[derive(Debug, Clone, Deserialize)]
+// --------------------------------------------------------------------------------
+// NFT Content Structure for Payroll
+// --------------------------------------------------------------------------------
+// This struct defines what lives ON-CHAIN in the Plan NFT.
+// Only fields that affect ENFORCEMENT logic go here.
+// Human-readable data (name, role, salary) goes in encrypted IPFS.
+//
+// #[serde(rename_all = "camelCase")] ensures JSON uses camelCase
+// for compatibility with WASM module and frontend dashboard
+//
+// FIX #1: Using u8 for scroll_policy instead of enum to ensure CBOR parsing succeeds
+// FIX #2: Using String for metadata_hash to match TypeScript hex string format
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct NftContent {
-    pub ticker: String,
-    pub remaining: u64,
-    
-    // Accept both camelCase and snake_case for service name
-    #[serde(alias = "serviceName")]
-    #[serde(alias = "service_name")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_name: Option<String>,
-    
-    // Accept both camelCase and snake_case for icon URL
-    #[serde(alias = "iconUrl")]
-    #[serde(alias = "icon_url")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon_url: Option<String>,
+    pub ticker: String,              // "CHARMS-PAY"
+    pub remaining: u64,               // Supply remaining (usually 1 per period)
+    pub metadata_hash: String,         // SHA256 of encrypted IPFS JSON as hex string
+    pub scroll_policy: u8,             // 0=time, 1=proof (using u8 for CBOR compatibility)
+    pub pay_period_seconds: u64,       // e.g., 1209600 for 2 weeks
+    pub compensation_sats: u64,         // Per period in satoshis
 }
 
-// Manual Serialize implementation to output camelCase
-impl Serialize for NftContent {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        
-        let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("ticker", &self.ticker)?;
-        map.serialize_entry("remaining", &self.remaining)?;
-        
-        if let Some(ref service_name) = self.service_name {
-            map.serialize_entry("serviceName", service_name)?;
+impl NftContent {
+    pub fn validate(&self) -> bool {
+        // Basic validation rules enforced on-chain
+        if self.ticker.is_empty() {
+            return false;
         }
         
-        if let Some(ref icon_url) = self.icon_url {
-            map.serialize_entry("iconUrl", icon_url)?;
+        // metadata_hash must be non-empty (64-char hex validation happens off-chain)
+        if self.metadata_hash.is_empty() {
+            return false;
         }
         
-        map.end()
+        if self.pay_period_seconds == 0 {
+            return false;
+        }
+        
+        // Validate scroll_policy range (must be 0 or 1)
+        if self.scroll_policy > 1 {
+            return false;
+        }
+        
+        if self.compensation_sats < 1000 { // Below dust limit
+            return false;
+        }
+        
+        true
+    }
+    
+    // Helper method to interpret scroll_policy semantically
+    pub fn is_time_based(&self) -> bool {
+        self.scroll_policy == 0
+    }
+    
+    pub fn is_proof_based(&self) -> bool {
+        self.scroll_policy == 1
     }
 }
 
-impl Default for NftContent {
-    fn default() -> Self {
-        Self {
-            ticker: String::new(),
-            remaining: 0,
-            service_name: None,
-            icon_url: None,
-        }
-    }
-}
-
+// --------------------------------------------------------------------------------
+// Main App Contract Entry Point
+// --------------------------------------------------------------------------------
 pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
-    eprintln!("\n=== app_contract ENTER ===");
-    eprintln!("App: tag={}, identity={}", app.tag, app.identity);
-    eprintln!("Transaction inputs: {}", tx.ins.len());
-    eprintln!("Transaction outputs: {}", tx.outs.len());
+    // Force compiler to recognize the argument exists (prevents optimization trap)
+    let _ = _x.bytes();
     
-    // Debug: Print all app references in the transaction
-    eprintln!("\n=== ALL APP REFERENCES IN TRANSACTION ===");
-    eprintln!("Inputs:");
-    for (i, (utxo_id, charms)) in tx.ins.iter().enumerate() {
-        eprintln!("  Input {} (UTXO: {}):", i, utxo_id);
-        for (app_ref, data) in charms {
-            let app_ref_str = app_ref.to_string();
-            eprintln!("    App ref: {}", app_ref_str);
-            match data.value::<serde_json::Value>() {
-                Ok(val) => eprintln!("      Data: {}", serde_json::to_string(&val).unwrap_or_default()),
-                Err(_) => eprintln!("      Data: [binary or unparsable]"),
-            }
-        }
+    match app.tag {
+        NFT => nft_contract_satisfied(app, tx, w),
+        TOKEN => token_contract_satisfied(app, tx),
+        _ => false,
     }
-    
-    eprintln!("\nOutputs (using charm_values):");
-    for (i, _) in tx.outs.iter().enumerate() {
-        eprintln!("  Output {}:", i);
-        // Use charm_values to see what's in outputs for this app
-        let output_charms: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
-        eprintln!("    Found {} charms for app", output_charms.len());
-        for (j, data) in output_charms.iter().enumerate() {
-            eprintln!("    Charm {}:", j);
-            match data.value::<serde_json::Value>() {
-                Ok(val) => eprintln!("      Data: {}", serde_json::to_string(&val).unwrap_or_default()),
-                Err(_) => eprintln!("      Data: [binary or unparsable]"),
-            }
-        }
-    }
-    
-    let result = match app.tag {
-        NFT => {
-            eprintln!("\nCalling nft_contract_satisfied");
-            nft_contract_satisfied(app, tx, w)
-        }
-        TOKEN => {
-            eprintln!("\nCalling token_contract_satisfied");
-            token_contract_satisfied(app, tx)
-        }
-        _ => {
-            eprintln!("ERROR: Unknown app tag: {}", app.tag);
-            false
-        }
+}
+
+// --------------------------------------------------------------------------------
+// NFT Contract Logic
+// --------------------------------------------------------------------------------
+fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
+    // ----------------------------------------------------------------------------
+    // Step 1: Safely extract witness data - NO UNWRAP()
+    // ----------------------------------------------------------------------------
+    let w_str = match w.value::<String>() {
+        Ok(val) => val,
+        Err(_) => return false,
     };
     
-    eprintln!("=== app_contract EXIT: {} ===", if result { "SUCCESS" } else { "FAILURE" });
-    result
-}
-
-// NFT contract logic
-fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
-    eprintln!("\n=== nft_contract_satisfied ENTER ===");
-    
-    let w_str: Option<String> = w.value().ok();
-    eprintln!("Private input w: {:?}", w_str);
-    
-    if w_str.is_none() {
-        eprintln!("ERROR: Private input w is missing or malformed");
+    // ----------------------------------------------------------------------------
+    // Step 2: Verify hash(w) == app.identity (establishes authority)
+    // ----------------------------------------------------------------------------
+    if hash(&w_str) != app.identity {
         return false;
     }
     
-    let w_str = w_str.unwrap();
-    eprintln!("w string: {}", w_str);
-    
-    // Verify hash(w) == app.identity
-    let hash_w = hash(&w_str);
-    eprintln!("Hash of w: {}", hash_w);
-    eprintln!("App identity: {}", app.identity);
-    
-    if hash_w != app.identity {
-        eprintln!("ERROR: Hash of w does not match app identity");
-        return false;
-    }
-    
-    // Parse UTXO ID from w
+    // ----------------------------------------------------------------------------
+    // Step 3: Parse UTXO ID from witness
+    // ----------------------------------------------------------------------------
     let w_utxo_id = match UtxoId::from_str(&w_str) {
         Ok(id) => id,
-        Err(e) => {
-            eprintln!("ERROR: Failed to parse UTXO ID from w: {}", e);
-            return false;
-        }
+        Err(_) => return false,
     };
-    eprintln!("Parsed UTXO ID from w: {}", w_utxo_id);
     
-    // Check if this is NFT minting (w_utxo_id is in inputs) or token minting
+    // ----------------------------------------------------------------------------
+    // Step 4: Determine transaction type
+    // ----------------------------------------------------------------------------
     let is_nft_minting = tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id);
-    eprintln!("Is NFT minting transaction: {}", is_nft_minting);
     
     if is_nft_minting {
-        // NFT MINTING: Original UTXO should be in inputs
-        let has_input_utxo = tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id);
-        eprintln!("NFT minting - checking if input contains UTXO {}: {}", w_utxo_id, has_input_utxo);
-        
-        if !has_input_utxo {
-            eprintln!("ERROR: NFT minting requires original UTXO {} in inputs", w_utxo_id);
-            return false;
-        }
-        
-        // For NFT minting, we expect exactly 1 NFT output
-        let nft_charms: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
-        eprintln!("Found {} NFT charms in outputs", nft_charms.len());
-        
-        if nft_charms.len() != 1 {
-            eprintln!("ERROR: NFT minting requires exactly 1 NFT charm in outputs, found {}", nft_charms.len());
-            return false;
-        }
-    } else {
-        // TOKEN MINTING or NFT TRANSFER: Original UTXO is NOT in inputs (it was already spent)
-        eprintln!("Token minting/NFT transfer - original UTXO {} was already spent", w_utxo_id);
-        eprintln!("Proceeding with NFT validation...");
-        
-        // For token minting, we need at least 1 NFT output (could be returning NFT to merchant)
-        let nft_charms: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
-        eprintln!("Found {} NFT charms in outputs", nft_charms.len());
-        
-        if nft_charms.is_empty() {
-            eprintln!("ERROR: Need at least 1 NFT charm in outputs for token minting");
+        // NFT MINTING: Original UTXO must be in inputs
+        if !tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id) {
             return false;
         }
     }
     
-    // Verify NFT structure in outputs
-    let nft_charms: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
-    for (i, data) in nft_charms.iter().enumerate() {
-        eprintln!("Verifying NFT charm {}:", i);
-        match data.value::<NftContent>() {
-            Ok(content) => {
-                eprintln!("✅ NFT content valid: ticker={}, remaining={}", 
-                         content.ticker, content.remaining);
-                if content.service_name.is_some() {
-                    eprintln!("   service_name: {:?}", content.service_name);
-                }
-                if content.icon_url.is_some() {
-                    eprintln!("   icon_url: {:?}", content.icon_url);
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ ERROR: Failed to parse NFT content: {:?}", e);
-                if let Ok(json_val) = data.value::<serde_json::Value>() {
-                    eprintln!("   Raw JSON data: {}", serde_json::to_string_pretty(&json_val).unwrap_or_default());
-                }
+    // ----------------------------------------------------------------------------
+    // Step 5: Validate NFT outputs
+    // ----------------------------------------------------------------------------
+    let nft_outputs: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
+    
+    if nft_outputs.is_empty() {
+        return false;
+    }
+    
+    // For NFT minting, expect exactly 1 NFT output
+    if is_nft_minting && nft_outputs.len() != 1 {
+        return false;
+    }
+    
+    // ----------------------------------------------------------------------------
+    // Step 6: Validate each NFT content structure - SAFE PARSING
+    // ----------------------------------------------------------------------------
+    for (i, data) in nft_outputs.iter().enumerate() {
+        let content: NftContent = match data.value() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        
+        // Validate content
+        if !content.validate() {
+            return false;
+        }
+        
+        // Additional cross-check for NFT minting
+        if is_nft_minting && i == 0 {
+            // For the primary NFT being minted, verify it has a non-empty ticker
+            if content.ticker.is_empty() {
                 return false;
             }
         }
     }
     
-    eprintln!("=== nft_contract_satisfied EXIT: SUCCESS ===");
     true
 }
 
-pub(crate) fn hash(data: &str) -> B32 {
-    let hash = Sha256::digest(data);
-    B32(hash.into())
-}
-
-// Token contract logic
+// --------------------------------------------------------------------------------
+// Token Contract Logic
+// --------------------------------------------------------------------------------
 fn token_contract_satisfied(token_app: &App, tx: &Transaction) -> bool {
-    eprintln!("\n=== token_contract_satisfied ENTER ===");
-    eprintln!("Token app identity: {}", token_app.identity);
-    
-    let result = can_mint_token(token_app, tx);
-    eprintln!("=== token_contract_satisfied EXIT: {} ===", if result { "SUCCESS" } else { "FAILURE" });
-    result
+    can_mint_token(token_app, tx)
 }
 
+// --------------------------------------------------------------------------------
+// Token Minting Validation - UPDATED WITH DEBUG LOGGING
+// --------------------------------------------------------------------------------
 fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
-    eprintln!("\n=== can_mint_token ENTER ===");
+    eprintln!("\n--- [ZK-DEBUG] Token Mint Start ---");
     
-    // Create corresponding NFT app
+    // Create corresponding NFT app (same identity, different tag)
     let nft_app = App {
         tag: NFT,
         identity: token_app.identity.clone(),
         vk: token_app.vk.clone(),
     };
-    
-    eprintln!("Corresponding NFT app identity: {}", nft_app.identity);
-    
-    // Helper to parse NFT content with robust error handling
-    let parse_nft_content = |data: &Data| -> Option<NftContent> {
-        match data.value::<NftContent>() {
-            Ok(content) => {
-                eprintln!("  ✅ Successfully parsed NFT:");
-                eprintln!("     ticker={}", content.ticker);
-                eprintln!("     remaining={}", content.remaining);
-                if content.service_name.is_some() {
-                    eprintln!("     service_name={:?}", content.service_name);
-                }
-                if content.icon_url.is_some() {
-                    eprintln!("     icon_url={:?}", content.icon_url);
-                }
-                Some(content)
-            }
-            Err(e) => {
-                eprintln!("  ❌ ERROR parsing NFT content: {:?}", e);
-                match data.value::<serde_json::Value>() {
-                    Ok(val) => {
-                        eprintln!("  Raw JSON value type: {:?}", val);
-                        eprintln!("  Raw JSON string: {}", serde_json::to_string(&val).unwrap_or_default());
-                    }
-                    Err(_) => eprintln!("  Could not extract raw data"),
-                }
-                None
-            }
-        }
-    };
-    
-    // Find NFT content in INPUTS
-    eprintln!("\nSearching for NFT charms in inputs...");
+
+    // ----------------------------------------------------------------------------
+    // Step 1: Find NFT content in inputs - SAFE PARSING with debug logging
+    // ----------------------------------------------------------------------------
     let nft_inputs: Vec<NftContent> = charm_values(&nft_app, tx.ins.iter().map(|(_, v)| v))
-        .filter_map(|data| parse_nft_content(data))
+        .filter_map(|data| {
+            match data.value::<NftContent>() {
+                Ok(content) => Some(content),
+                Err(_) => None,
+            }
+        })
         .collect();
-    
-    eprintln!("Found {} NFT charms in inputs", nft_inputs.len());
-    
+
     if nft_inputs.is_empty() {
-        eprintln!("❌ ERROR: No NFT found in inputs for app {}", nft_app.identity);
-        eprintln!("=== can_mint_token EXIT: FAILURE ===");
-        return false;
+        eprintln!("❌ Error: No NFT found in inputs for ID: {}", nft_app.identity);
+        return false; 
     }
     
-    if nft_inputs.len() > 1 {
-        eprintln!("⚠️  WARNING: Found {} NFTs in inputs, using first one", nft_inputs.len());
-    }
-    
-    let nft_content_in = &nft_inputs[0];
-    let incoming_supply = nft_content_in.remaining;
-    eprintln!("📊 Incoming NFT supply: {}", incoming_supply);
-    
-    // Find NFT content in OUTPUTS
-    eprintln!("\nSearching for NFT charms in outputs...");
+    let nft_in = &nft_inputs[0];
+    let incoming_supply = nft_in.remaining;
+    eprintln!("✅ Incoming Supply: {}", incoming_supply);
+
+    // ----------------------------------------------------------------------------
+    // Step 2: Find NFT content in outputs - SAFE PARSING with debug logging
+    // ----------------------------------------------------------------------------
     let nft_outputs: Vec<NftContent> = charm_values(&nft_app, tx.outs.iter())
-        .filter_map(|data| parse_nft_content(data))
+        .filter_map(|data| {
+            match data.value::<NftContent>() {
+                Ok(content) => Some(content),
+                Err(_) => None,
+            }
+        })
         .collect();
-    
-    eprintln!("Found {} NFT charms in outputs", nft_outputs.len());
-    
+
     if nft_outputs.is_empty() {
-        eprintln!("❌ ERROR: No NFT found in outputs for app {}", nft_app.identity);
-        eprintln!("=== can_mint_token EXIT: FAILURE ===");
+        eprintln!("❌ Error: No NFT found in outputs");
         return false;
     }
     
-    if nft_outputs.len() > 1 {
-        eprintln!("⚠️  WARNING: Found {} NFTs in outputs, using first one", nft_outputs.len());
-    }
-    
-    let nft_content_out = &nft_outputs[0];
-    let outgoing_supply = nft_content_out.remaining;
-    eprintln!("📊 Outgoing NFT supply: {}", outgoing_supply);
-    
-    // Validate supply doesn't increase
+    let nft_out = &nft_outputs[0];
+    let outgoing_supply = nft_out.remaining;
+    eprintln!("✅ Outgoing Supply: {}", outgoing_supply);
+
+    // ----------------------------------------------------------------------------
+    // Step 3: Validate supply constraints with debug logging
+    // ----------------------------------------------------------------------------
     if incoming_supply < outgoing_supply {
-        eprintln!("❌ ERROR: Supply cannot increase ({} < {})", incoming_supply, outgoing_supply);
-        eprintln!("=== can_mint_token EXIT: FAILURE ===");
+        eprintln!("❌ Error: Supply increased ({} < {})", incoming_supply, outgoing_supply);
         return false;
     }
     
-    let tokens_minted = incoming_supply - outgoing_supply;
-    eprintln!("🪙 Tokens to mint (supply reduction): {}", tokens_minted);
-    
-    // Calculate input token amount
-    let input_token_amount = match sum_token_amount(token_app, tx.ins.iter().map(|(_, v)| v)) {
-        Ok(amount) => {
-            eprintln!("📥 Input token amount: {}", amount);
-            amount
-        }
-        Err(e) => {
-            eprintln!("💡 No tokens in inputs (or error): {:?}", e);
-            0
-        }
+    let tokens_to_mint = incoming_supply - outgoing_supply;
+
+    // ----------------------------------------------------------------------------
+    // Step 4: Validate token amounts - SAFE WITH unwrap_or and debug logging
+    // ----------------------------------------------------------------------------
+    let input_tokens = match sum_token_amount(token_app, tx.ins.iter().map(|(_, v)| v)) {
+        Ok(amount) => amount,
+        Err(_) => 0,
     };
     
-    // Calculate output token amount
-    let output_token_amount = match sum_token_amount(token_app, tx.outs.iter()) {
-        Ok(amount) => {
-            eprintln!("📤 Output token amount: {}", amount);
-            amount
-        }
-        Err(e) => {
-            eprintln!("❌ ERROR calculating output tokens: {:?}", e);
-            eprintln!("=== can_mint_token EXIT: FAILURE ===");
+    let output_tokens = match sum_token_amount(token_app, tx.outs.iter()) {
+        Ok(amount) => amount,
+        Err(_) => {
+            eprintln!("❌ Error: Failed to calculate output tokens");
             return false;
         }
     };
     
-    let tokens_created = output_token_amount - input_token_amount;
-    eprintln!("➕ Tokens created (output - input): {} - {} = {}", 
-             output_token_amount, input_token_amount, tokens_created);
-    
-    // Validate tokens created equals supply reduction
-    if tokens_created != tokens_minted {
-        eprintln!("❌ ERROR: Tokens created ({}) must equal supply reduction ({})", 
-                 tokens_created, tokens_minted);
-        eprintln!("=== can_mint_token EXIT: FAILURE ===");
+    let tokens_created = output_tokens - input_tokens;
+
+    eprintln!("📊 Created: {}, Expected: {}", tokens_created, tokens_to_mint);
+
+    if tokens_created != tokens_to_mint {
+        eprintln!("❌ Error: Supply math mismatch (created={}, expected={})", 
+                  tokens_created, tokens_to_mint);
         return false;
     }
-    
-    eprintln!("✅ All checks passed!");
-    eprintln!("=== can_mint_token EXIT: SUCCESS ===");
+
+    eprintln!("✅ Token Mint Satisfied!");
     true
 }
 
+// --------------------------------------------------------------------------------
+// Hash Function (SHA256)
+// --------------------------------------------------------------------------------
+pub(crate) fn hash(data: &str) -> B32 {
+    let hash = Sha256::digest(data);
+    B32(hash.into())
+}
+
+// --------------------------------------------------------------------------------
+// Tests
+// --------------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,64 +286,96 @@ mod tests {
         let expected = "f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa";
         assert_eq!(&hash(&data).to_string(), expected);
     }
-    
+
     #[test]
-    fn test_nft_content_deserialize_camelcase() {
-        let json_data = r#"{"ticker":"PROPLAN","remaining":100000,"serviceName":"Test","iconUrl":"http://example.com"}"#;
-        let data = Data::from_json(json_data).unwrap();
-        let content: NftContent = data.value().unwrap();
-        assert_eq!(content.ticker, "PROPLAN");
-        assert_eq!(content.remaining, 100000);
-        assert_eq!(content.service_name, Some("Test".to_string()));
-        assert_eq!(content.icon_url, Some("http://example.com".to_string()));
-    }
-    
-    #[test]
-    fn test_nft_content_deserialize_snakecase() {
-        let json_data = r#"{"ticker":"PROPLAN","remaining":100000,"service_name":"Test","icon_url":"http://example.com"}"#;
-        let data = Data::from_json(json_data).unwrap();
-        let content: NftContent = data.value().unwrap();
-        assert_eq!(content.ticker, "PROPLAN");
-        assert_eq!(content.remaining, 100000);
-        assert_eq!(content.service_name, Some("Test".to_string()));
-        assert_eq!(content.icon_url, Some("http://example.com".to_string()));
-    }
-    
-    #[test]
-    fn test_nft_content_deserialize_mixed() {
-        let json_data = r#"{"ticker":"PROPLAN","remaining":100000,"serviceName":"Test","icon_url":"http://example.com"}"#;
-        let data = Data::from_json(json_data).unwrap();
-        let content: NftContent = data.value().unwrap();
-        assert_eq!(content.ticker, "PROPLAN");
-        assert_eq!(content.remaining, 100000);
-        assert_eq!(content.service_name, Some("Test".to_string()));
-        assert_eq!(content.icon_url, Some("http://example.com".to_string()));
-    }
-    
-    #[test]
-    fn test_nft_content_deserialize_minimal() {
-        let json_data = r#"{"ticker":"PROPLAN","remaining":100000}"#;
-        let data = Data::from_json(json_data).unwrap();
-        let content: NftContent = data.value().unwrap();
-        assert_eq!(content.ticker, "PROPLAN");
-        assert_eq!(content.remaining, 100000);
-        assert!(content.service_name.is_none());
-        assert!(content.icon_url.is_none());
-    }
-    
-    #[test]
-    fn test_nft_content_serialize_camelcase() {
-        let content = NftContent {
-            ticker: "PROPLAN".to_string(),
-            remaining: 100000,
-            service_name: Some("Test".to_string()),
-            icon_url: Some("http://example.com".to_string()),
-        };
+    fn test_nft_content_validation() {
+        // Create a test hash string (64 hex chars)
+        let test_hash = "f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa";
         
-        let json = serde_json::to_string(&content).unwrap();
-        assert!(json.contains("\"serviceName\""));
-        assert!(json.contains("\"iconUrl\""));
-        assert!(json.contains("\"ticker\""));
-        assert!(json.contains("\"remaining\""));
+        let valid = NftContent {
+            ticker: "CHARMS-PAY".to_string(),
+            remaining: 1,
+            metadata_hash: test_hash.to_string(),
+            scroll_policy: 0, // Time-based
+            pay_period_seconds: 1209600,
+            compensation_sats: 5000000,
+        };
+        assert!(valid.validate());
+        assert!(valid.is_time_based());
+        assert!(!valid.is_proof_based());
+
+        let valid_proof = NftContent {
+            scroll_policy: 1, // Proof-based
+            ..valid.clone()
+        };
+        assert!(valid_proof.validate());
+        assert!(!valid_proof.is_time_based());
+        assert!(valid_proof.is_proof_based());
+
+        let invalid_ticker = NftContent {
+            ticker: "".to_string(),
+            ..valid.clone()
+        };
+        assert!(!invalid_ticker.validate());
+
+        let invalid_hash = NftContent {
+            metadata_hash: "".to_string(),
+            ..valid.clone()
+        };
+        assert!(!invalid_hash.validate());
+
+        let invalid_period = NftContent {
+            pay_period_seconds: 0,
+            ..valid.clone()
+        };
+        assert!(!invalid_period.validate());
+
+        let invalid_policy = NftContent {
+            scroll_policy: 2, // Invalid (must be 0 or 1)
+            ..valid.clone()
+        };
+        assert!(!invalid_policy.validate());
+
+        let invalid_compensation = NftContent {
+            compensation_sats: 500, // Below dust
+            ..valid
+        };
+        assert!(!invalid_compensation.validate());
+    }
+
+    #[test]
+    fn test_nft_content_serialization() {
+        let test_hash = "f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa";
+        
+        let content = NftContent {
+            ticker: "CHARMS-PAY".to_string(),
+            remaining: 1,
+            metadata_hash: test_hash.to_string(),
+            scroll_policy: 1, // Proof-based
+            pay_period_seconds: 604800,
+            compensation_sats: 2500000,
+        };
+
+        let serialized = serde_json::to_string(&content).unwrap();
+        
+        let deserialized: NftContent = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(content, deserialized);
+        
+        // Verify field names are camelCase (for WASM/frontend compatibility)
+        assert!(serialized.contains("\"metadataHash\""));
+        assert!(serialized.contains("\"scrollPolicy\""));
+        assert!(serialized.contains("\"payPeriodSeconds\""));
+        assert!(serialized.contains("\"compensationSats\""));
+        
+        // Verify snake_case is NOT present
+        assert!(!serialized.contains("\"metadata_hash\""));
+        assert!(!serialized.contains("\"scroll_policy\""));
+        assert!(!serialized.contains("\"pay_period_seconds\""));
+        assert!(!serialized.contains("\"compensation_sats\""));
+        
+        // Verify scroll_policy is serialized as number, not string
+        assert!(serialized.contains("\"scrollPolicy\":1"));
+        // Verify metadataHash is serialized as string
+        assert!(serialized.contains("\"metadataHash\":\"f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa\""));
     }
 }

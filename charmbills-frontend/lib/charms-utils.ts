@@ -1,168 +1,120 @@
-import * as wasm from "./wasm/charms_lib";
+import initWasm, { extractAndVerifySpell } from "./wasm/charms_lib";
 import axios from 'axios';
+import * as constants from '../shared/constants';
 
 const MEMPOOL_API = "https://mempool.space/testnet4/api";
-
-// UTXO tracking system to prevent double-spending
+const PROTOCOL_VERSION = 8; 
 const USED_UTXO_KEY = 'charm_used_utxos';
 
 /**
- * Marks a UTXO as used in localStorage to prevent double-spending
+ * ADDITION: Calculates required fees for Scroll-enabled transactions.
+ * Essential for providing "Transaction Fee Information" in the worker dashboard [3].
  */
-function markUtxoAsUsed(utxoId: string): void {
-  const used = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
-  if (!used.includes(utxoId)) {
-    used.push(utxoId);
-    localStorage.setItem(USED_UTXO_KEY, JSON.stringify(used));
-    console.log(`📝 Marked ${utxoId} as used`);
-  }
+export function calculateScrollFee(numInputs: number, totalSats: number): number {
+    const fixed = constants.SCROLL_FIXED_COST || 895;
+    const perInput = constants.SCROLL_FEE_PER_INPUT || 64;
+    const basisPoints = constants.SCROLL_BASIS_POINTS || 10; // 0.1%
+
+    const dynamicFee = Math.ceil((basisPoints / 10000) * totalSats);
+    return fixed + (perInput * numInputs) + dynamicFee;
 }
 
 /**
- * Checks if a UTXO has been marked as used
+ * KEPT FOR FRONTEND: Marks a UTXO as used in localStorage.
+ * Enables Optimistic UI so worker tokens don't appear "spendable" during block latency [1, 2].
  */
-function isUtxoUsed(utxoId: string): boolean {
-  const used = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
-  return used.includes(utxoId);
+export function markUtxoAsUsed(utxoId: string): void {
+    const used = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
+    if (!used.includes(utxoId)) {
+        used.push(utxoId);
+        localStorage.setItem(USED_UTXO_KEY, JSON.stringify(used));
+        console.log(`📝 Marked ${utxoId} as used (Optimistic Update)`);
+    }
 }
 
-/**
- * Clears all tracked UTXOs (use for debugging only - not automatically called)
- */
+export function isUtxoUsed(utxoId: string): boolean {
+    const used = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
+    return used.includes(utxoId);
+}
+
 export function clearUsedUtxos(): void {
-  localStorage.removeItem(USED_UTXO_KEY);
-  console.log('🧹 Cleared UTXO tracking');
+    localStorage.removeItem(USED_UTXO_KEY);
+    console.log('🧹 Cleared local UTXO tracking');
 }
 
 /**
- * Fetches UTXOs and identifies a suitable one for funding or App ID derivation.
- * Uses "Smallest Sufficient" strategy to preserve larger UTXOs for more expensive transactions.
- * WITH ROBUST DOUBLE-SPEND PROTECTION AND USER GUIDANCE
+ * MODIFIED: Scans addresses for "Proof of Hire" tokens and includes on-chain timestamps.
+ * Uses trustless verification to provide worker sovereignty [8, 9].
  */
-export async function getFundingUtxo(address: string, minAmount: number = 10000) {
-  const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
-  const utxos = response.data;
+export async function scanAddressForCharms(address: string) {
+    try {
+        // PROFESSIONAL FIX: Initialize the v12 WASM module correctly [6, 7]
+        await initWasm();
 
-  console.log('🔍 Available UTXOs:', utxos.length);
-  
-  // Get locally tracked used UTXOs
-  const usedUtxos = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
-  console.log('📋 Locally tracked used UTXOs:', usedUtxos.length);
+        const utxoResponse = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
+        const utxos = utxoResponse.data;
+        const charmsAssets = [];
 
-  // Filter out UTXOs that we've already marked as used
-  const freshUtxos = utxos.filter((u: any) => {
-    const utxoId = `${u.txid}:${u.vout}`;
-    return !usedUtxos.includes(utxoId);
-  });
+        for (const utxo of utxos) {
+            const utxoId = `${utxo.txid}:${utxo.vout}`;
+            
+            // Skip if already spent or in-flight in the UI
+            if (isUtxoUsed(utxoId)) continue;
 
-  console.log('✅ Fresh UTXOs (not used locally):', freshUtxos.length);
+            try {
+                const txHexResponse = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/hex`);
+                const txJson = { bitcoin: txHexResponse.data };
 
-  // PROFESSIONAL ERROR HANDLING: NO AUTO-CLEARING
-  if (freshUtxos.length === 0) {
-    // Get some additional info for the error message
-    const pendingCount = utxos.filter((u: any) => !u.status?.confirmed).length;
-    const totalBalance = utxos.reduce((sum: number, u: any) => sum + u.value, 0);
-    
-    throw new Error(
-      `No fresh UTXOs available for spending.\n\n` +
-      `Possible reasons:\n` +
-      `• All UTXOs have been used in pending transactions\n` +
-      `• Waiting for confirmations (${pendingCount} unconfirmed)\n` +
-      `• Wallet needs more funds\n\n` +
-      `Available options:\n` +
-      `1. Wait for pending transactions to confirm\n` +
-      `2. Top up wallet with more Testnet BTC (current balance: ${totalBalance} sats)\n` +
-      `3. If tracking is incorrect, use clearUsedUtxos() in console\n\n` +
-      `Debug info:\n` +
-      `• Total UTXOs: ${utxos.length}\n` +
-      `• Used (tracked): ${usedUtxos.length}\n` +
-      `• Fresh available: 0`
-    );
-  }
+                // Extract spell data from the transaction hex using v12 WASM [9]
+                const spellData = extractAndVerifySpell(txJson, false);
 
-  // PRODUCTION GRADE: Sort FRESH UTXOs by value (ascending)
-  // This allows us to find the SMALLEST FRESH UTXO that is still larger than our requirement
-  const sortedFreshUtxos = freshUtxos.sort((a: any, b: any) => a.value - b.value);
-
-  // Find the first FRESH UTXO in the sorted list that meets the requirement
-  const fundingUtxo = sortedFreshUtxos.find((u: any) => u.value >= minAmount);
-
-  if (!fundingUtxo) {
-    const largestFresh = sortedFreshUtxos[sortedFreshUtxos.length - 1]?.value || 0;
-    const smallestFresh = sortedFreshUtxos[0]?.value || 0;
-    
-    throw new Error(
-      `No fresh UTXO with ≥ ${minAmount} sats.\n\n` +
-      `Available fresh UTXO range: ${smallestFresh} - ${largestFresh} sats\n` +
-      `Please send more Testnet Bitcoin (at least ${minAmount} sats) to ${address}\n\n` +
-      `To manually clear tracking, run in console:\n` +
-      `import('./charm-utils').then(m => m.clearUsedUtxos())`
-    );
-  }
-
-  // Fetch the raw transaction hex for this UTXO
-  const txHexResponse = await axios.get(`${MEMPOOL_API}/tx/${fundingUtxo.txid}/hex`);
-  
-  const result = {
-    utxoId: `${fundingUtxo.txid}:${fundingUtxo.vout}`,
-    value: fundingUtxo.value,
-    hex: txHexResponse.data
-  };
-
-  console.log('🎯 Selected fresh funding UTXO:', {
-    utxoId: result.utxoId,
-    value: result.value,
-    confirmed: fundingUtxo.status?.confirmed || false,
-    confirmations: fundingUtxo.status?.confirmations || 0,
-    previouslyUsed: isUtxoUsed(result.utxoId)
-  });
-
-  // CRITICAL: Mark as used IMMEDIATELY to prevent another process from selecting it
-  markUtxoAsUsed(result.utxoId);
-  
-  return result;
+                if (spellData && spellData.tx) {
+                    const outputCharms = spellData.tx.outs[utxo.vout];
+                    
+                    // Robust check for Maps or Objects (CHIP-420 support) [10]
+                    if (outputCharms && (typeof outputCharms.size === 'number' || Object.keys(outputCharms).length > 0)) {
+                        charmsAssets.push({
+                            utxoId,
+                            amount: utxo.value,
+                            spell: spellData,
+                            charms: outputCharms,
+                            // PRODUCTION FIX: Capture the block_time (Unix seconds) [1]
+                            timestamp: utxo.status?.block_time 
+                        });
+                    }
+                }
+            } catch (e: any) {
+                // Ignore non-charm UTXOs to keep the console clean
+                continue;
+            }
+        }
+        return charmsAssets;
+    } catch (error) {
+        console.error("Trustless scan failed:", error);
+        return [];
+    }
 }
 
 /**
- * Manual verification of UTXO status using mempool.space API
- * Useful for debugging
+ * Manual verification of UTXO status - Kept for debugging worker claims.
  */
 export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean, details: any }> {
-  const [txid, vout] = utxoId.split(':');
-  try {
-    // Try the outspend endpoint first (most accurate)
-    const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`);
-    const spentStatus = outspendResponse.data;
-    
-    // Also get the full transaction to see confirmations
-    const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`);
-    const txDetails = txResponse.data;
-    
-    const isUsed = isUtxoUsed(utxoId);
-    const locallyTrackedButNotSpent = isUsed && !spentStatus.spent;
-    
-    console.log(`🔍 UTXO ${utxoId} verification:`, {
-      spent: spentStatus.spent,
-      spentBy: spentStatus.txid || 'Not spent yet',
-      confirmed: txDetails.status?.confirmed || false,
-      blockHeight: txDetails.status?.block_height,
-      confirmations: txDetails.status?.confirmations || 0,
-      locallyTracked: isUsed,
-      locallyTrackedButNotSpent: locallyTrackedButNotSpent
-    });
-    
-    return {
-      spent: spentStatus.spent,
-      details: { ...spentStatus, txDetails }
-    };
-  } catch (error) {
-    console.error(`Failed to verify UTXO ${utxoId}:`, error);
-    return { spent: true, details: { error: 'Verification failed' } };
-  }
+    const [txid, vout] = utxoId.split(':');
+    try {
+        const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`);
+        const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`);
+        
+        return {
+            spent: outspendResponse.data.spent,
+            details: { ...outspendResponse.data, txDetails: txResponse.data }
+        };
+    } catch (error) {
+        return { spent: true, details: { error: 'Verification failed' } };
+    }
 }
 
 /**
- * Helper function to provide user-friendly wallet status
+ * Helper function to provide user-friendly wallet status - Kept for frontend dashboard
  */
 export async function getWalletStatus(address: string): Promise<{
   totalBalance: number;
@@ -195,59 +147,8 @@ export async function getWalletStatus(address: string): Promise<{
   }
 }
 
-export async function scanAddressForCharms(address: string) {
-  try {
-    // 1. PROFESSIONAL FIX: Initialize the WASM module
-    // This populates the internal 'wasm' variable needed for extraction
-    await wasm.default('/charms_lib_bg.wasm'); 
-
-    const utxoResponse = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
-    const utxos = utxoResponse.data;
-    const charmsAssets = [];
-
-    for (const utxo of utxos) {
-      try {
-        const txHexResponse = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/hex`);
-        const txJson = { bitcoin: txHexResponse.data };
-
-        // This call will now succeed because wasm.default() was called above
-        const spellData = wasm.extractAndVerifySpell(txJson, false);
-
-        if (spellData && spellData.tx) {
-          const outputCharms = spellData.tx.outs[utxo.vout];
-
-          // 2. PROFESSIONAL FIX: Use a more robust check for Maps
-          // Check for the '.size' property instead of 'instanceof Map'
-          const isMap = outputCharms && typeof outputCharms.size === 'number';
-          const isObject = outputCharms && !isMap && Object.keys(outputCharms).length > 0;
-
-          if (isMap || isObject) {
-            charmsAssets.push({
-              utxoId: `${utxo.txid}:${utxo.vout}`,
-              amount: utxo.value,
-              spell: spellData,
-              charms: outputCharms
-            });
-          }
-        }
-      } catch (e: any) {
-        // PRODUCTION FIX: Only log actual network or system errors.
-        // Ignore "no control block" or "invalid" errors as they just mean the UTXO isn't a Charm.
-        if (!e.message?.includes("no control block") && !e.message?.includes("invalid length")) {
-          console.warn(`System error scanning UTXO ${utxo.txid}:`, e.message);
-        }
-        continue; 
-      }
-    }
-    return charmsAssets;
-  } catch (error) {
-    console.error("Scan failed:", error);
-    return [];
-  }
-}
-
 /**
- * DEBUG: Check all UTXOs for an address with spent status
+ * DEBUG: Check all UTXOs for an address with spent status - Kept for frontend debugging
  */
 export async function debugUtxos(address: string): Promise<any> {
   try {
@@ -277,7 +178,8 @@ export async function debugUtxos(address: string): Promise<any> {
             spent: outspend.data.spent,
             spentByTxid: outspend.data.txid,
             locallyTracked: isUsed,
-            status: status
+            status: status,
+            timestamp: utxo.status?.block_time // Also add timestamp here for debug
           };
         } catch (error) {
           return {
@@ -285,7 +187,8 @@ export async function debugUtxos(address: string): Promise<any> {
             utxoId,
             spent: 'unknown',
             locallyTracked: isUtxoUsed(utxoId),
-            status: '❌ Verification failed'
+            status: '❌ Verification failed',
+            timestamp: utxo.status?.block_time
           };
         }
       })
@@ -297,6 +200,7 @@ export async function debugUtxos(address: string): Promise<any> {
       'Spent?': u.spent,
       'Spent By TXID': u.spentByTxid?.substring(0, 16) + '...' || 'N/A',
       'Locally Tracked': u.locallyTracked,
+      'Timestamp': u.timestamp ? new Date(u.timestamp * 1000).toLocaleDateString() : 'N/A',
       'Status': u.status
     })));
     

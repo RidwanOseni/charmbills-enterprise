@@ -1,15 +1,24 @@
 [package]
 name = "subscription-engine"
 description = "A simple Charms app"
-version = "0.1.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+wasm = ["wasm-bindgen", "serde-wasm-bindgen"]
+
 [dependencies]
-charms-sdk = { version = "0.10.0" }
+charms-sdk = "0.12.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.145"
-sha2 = { version = "0.10.9" }
+sha2 = "0.10.9"
+# REQUIRED FOR WASM: These only install if you use the --features wasm flag
+wasm-bindgen = { version = "0.2.100", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
 
 [profile.release]
 lto = "fat"
