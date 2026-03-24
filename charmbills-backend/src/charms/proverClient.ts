@@ -2,12 +2,15 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
-import { encode } from 'cbor-x';
+import { execSync } from 'child_process';
 import { SpellRequest, ProverResult } from '@shared/types';
 import * as constants from '@shared/constants';
 import { buildMintNFT } from './buildMintNFT';
 import { buildMintToken } from './buildMintToken';
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from 'tiny-secp256k1';
 
+bitcoin.initEccLib(ecc);
 dotenv.config();
 
 // --------------------------------------------------------------------------------
@@ -15,41 +18,18 @@ dotenv.config();
 // --------------------------------------------------------------------------------
 const PROVER_URL = process.env.PROVER_API_URL || constants.PROVER_API_URL;
 const APP_VK = process.env.HARDCODED_APP_VK || constants.HARDCODED_APP_VK;
-const BINARY_PATH = path.resolve(process.cwd(), 'src/app-binary.b64');
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2000;
 const MAX_DELAY_MS = 30000;
-const PROVER_TIMEOUT_MS = 600000; // 10 minutes for ZK proof generation
+const PROVER_TIMEOUT_MS = 180000;
 
-// Load app binary once (cached for performance)
-let APP_BINARY_CACHE: string | null = null;
+const CHARMS_EXECUTABLE = path.join(process.env.HOME || '/home/ubuntu', '.cargo/bin/charms');
+const WASM_PATH = path.resolve(process.cwd(), 'src/charms/wasm/subscription-engine.wasm');
+const SPELL_TEMPLATES_DIR = path.resolve(process.cwd(), '../subscription-engine/spells');
 
-/**
- * Loads the ZK-app binary with caching for performance
- */
-function loadAppBinary(): string {
-  if (APP_BINARY_CACHE) {
-    return APP_BINARY_CACHE;
-  }
-  
-  try {
-    APP_BINARY_CACHE = fs.readFileSync(BINARY_PATH, 'utf-8').trim();
-    
-    if (!APP_BINARY_CACHE) {
-      throw new Error('App binary is empty');
-    }
-    
-    console.log(`[INFO] App binary loaded: ${APP_BINARY_CACHE.length} bytes`);
-    return APP_BINARY_CACHE;
-  } catch (error) {
-    console.error('[ERROR] Failed to load app binary:', error);
-    throw new Error(`APP_BINARY missing: Could not read file at ${BINARY_PATH}`);
-  }
-}
+const TEMP_PREV_TXS_FILE = path.join(process.env.HOME || '/home/ubuntu', 'charms-prev-txs.txt');
+const TEMP_SCRIPT_FILE = path.join(process.env.HOME || '/home/ubuntu', 'charms-run-spell.sh');
 
-/**
- * Exponential backoff with jitter for retry logic
- */
 async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -60,38 +40,10 @@ function calculateBackoff(retryCount: number): number {
   return Math.min(exponentialDelay + jitter, MAX_DELAY_MS);
 }
 
-/**
- * Validates and formats prev_txs for Prover API
- */
-function formatPrevTxs(prevTxHexes: string[]): string[] {
-    if (!Array.isArray(prevTxHexes)) {
-        throw new Error('prevTxHexes must be an array');
-    }
-
-    return prevTxHexes.map((hex, index) => {
-        if (!hex || typeof hex !== 'string') {
-            throw new Error(`prevTxHexes[${index}] is invalid: must be non-empty string`);
-        }
-
-        // Clean hex string (remove whitespace, ensure lowercase)
-        const cleanedHex = hex.replace(/[^0-9a-fA-F]/g, '').toLowerCase();
-
-        if (cleanedHex.length === 0) {
-            throw new Error(`prevTxHexes[${index}] is empty after cleaning`);
-        }
-
-        return cleanedHex; 
-    });
-}
-
-/**
- * Formats multi-signature public inputs for Scroll integration
- */
 function formatMultiSigInputs(request: SpellRequest): Record<string, any> | undefined {
   if (!request.multiSigSigners || request.multiSigSigners.length === 0) {
     return undefined;
   }
-  
   return {
     public_inputs: {
       "$00": {
@@ -102,44 +54,41 @@ function formatMultiSigInputs(request: SpellRequest): Record<string, any> | unde
   };
 }
 
-/**
- * Extracts transaction hex from Prover response
- */
-function extractTxHex(response: any, index: number): string {
-  let hex = response[index];
-  
-  if (!hex) {
-    throw new Error(`Prover response missing transaction at index ${index}`);
+function extractTxHexFromJson(responseData: any, index: number): string {
+  try {
+    console.log(`[DEBUG] Parsing index ${index}. Data type: ${typeof responseData}. Array length: ${Array.isArray(responseData) ? responseData.length : 'not array'}`);
+    
+    if (!Array.isArray(responseData)) {
+      throw new Error('Prover API returned invalid response: expected array');
+    }
+
+    const tx = responseData.length === 1 ? responseData[0] : responseData[index];
+    
+    if (!tx) {
+      throw new Error(`Prover response missing transaction at index ${index}`);
+    }
+
+    console.log(`[DEBUG] tx type: ${typeof tx}, has bitcoin property: ${typeof tx === 'object' && 'bitcoin' in tx}`);
+
+    if (typeof tx === 'object' && tx !== null && tx.bitcoin && typeof tx.bitcoin === 'string') {
+      return tx.bitcoin;
+    }
+    
+    if (typeof tx === 'string') {
+      return tx;
+    }
+    
+    throw new Error(`Unexpected transaction shape: ${JSON.stringify(tx).substring(0, 100)}`);
+  } catch (error) {
+    console.error('[PAYROLL PROVER] Failed to decode JSON response:', error);
+    throw new Error(`Failed to decode prover response: ${error}`);
   }
-  
-  // Handle both { bitcoin: "hex" } object and direct string formats
-  if (typeof hex === 'object' && hex.bitcoin) {
-    hex = hex.bitcoin;
-  }
-  
-  if (typeof hex !== 'string') {
-    throw new Error(`Invalid hex format at index ${index}: expected string, got ${typeof hex}`);
-  }
-  
-  if (hex.length === 0) {
-    throw new Error(`Empty hex at index ${index}`);
-  }
-  
-  return hex;
 }
 
 // --------------------------------------------------------------------------------
 // Main Prover Function
 // --------------------------------------------------------------------------------
 
-/**
- * Generates unsigned transactions for payroll operations with batching and multi-sig support
- * 
- * @param request - Spell request containing payroll action details
- * @param prevTxHexes - Previous transaction hexes for provenance (Anchor + Authority UTXOs)
- * @param appId - Optional appId required for token minting operations
- * @returns ProverResult with commit and spell transaction hexes
- */
 export async function generateUnsignedTransactions(
   request: SpellRequest,
   prevTxHexes: string[],
@@ -149,288 +98,293 @@ export async function generateUnsignedTransactions(
   console.log(`[PAYROLL PROVER] Type: ${request.type}`);
   console.log(`[PAYROLL PROVER] Outputs: ${request.outputs?.length || 0}`);
   console.log(`[PAYROLL PROVER] Multi-sig: ${request.multiSigSigners ? 'yes' : 'no'}`);
-  
+
   // ----------------------------------------------------------------------------
   // Step 1: Validate inputs
   // ----------------------------------------------------------------------------
-  if (!PROVER_URL) {
-    throw new Error('PROVER_API_URL not configured in environment');
-  }
-  
-  if (!request.fundingUtxo || !request.fundingUtxoValue) {
-    throw new Error('Funding UTXO required for payroll transaction');
-  }
-  
-  if (!request.changeAddress) {
-    throw new Error('Change address required for payroll transaction');
-  }
-  
+  if (!PROVER_URL) throw new Error('PROVER_API_URL not configured');
+  if (!request.fundingUtxo || !request.fundingUtxoValue) throw new Error('Funding UTXO required');
+  if (!request.changeAddress) throw new Error('Change address required');
+  if (prevTxHexes.length !== 2) throw new Error(`v0.12 requires exactly 2 prev_txs, got ${prevTxHexes.length}`);
+
   // ----------------------------------------------------------------------------
-  // Step 2: Load app binary (cached)
+  // Step 2: Build spell and capture template variables from builders
   // ----------------------------------------------------------------------------
-  const appBinary = loadAppBinary();
-  
-  // ----------------------------------------------------------------------------
-  // Step 3: Build spell JSON based on action type
-  // ----------------------------------------------------------------------------
-  let spellJson: any;
-  
+  let builtAppId: string | undefined;
+  let spellVars: Record<string, string> = {};
+
   try {
     if (request.type === 'mint-nft') {
-      // Create new employment Plan NFT
       const result = buildMintNFT(request);
-      spellJson = result.spell;
-      console.log('[PAYROLL PROVER] Built mint-nft spell for new employment plan');
-      
+      builtAppId = result.appId;
+      spellVars = result.spellVars;
+      console.log('[PAYROLL PROVER] Built mint-nft spell');
+      console.log(`[PAYROLL PROVER] Captured ${Object.keys(spellVars).length} template variables from mint-nft`);
     } else if (request.type === 'mint-token') {
-      // CRITICAL FIX: appId is required for token minting
-      if (!appId) {
-        throw new Error("appId is required for hiring (mint-token)");
-      }
-      
-      // Batch mint tokens for multiple workers (1:M:N model) - pass appId
-      spellJson = buildMintToken(request, appId);
-      console.log('[PAYROLL PROVER] Built mint-token spell with batch outputs');
-      
-    } else if (request.type === 'scroll-freeze') {
-      // PRODUCTION FIX: Support vault-freeze spells for termination [3]
-      if (!request.authorityUtxo) {
-        throw new Error("Vault UTXO (authorityUtxo) is required for freeze operations");
-      }
-      
-      spellJson = {
-        version: 8, // Protocol version 8 [5]
-        apps: {
-          "$00": `n/${appId}/${APP_VK}` // Authority app
-        },
-        ins: [
-          {
-            utxo_id: request.authorityUtxo, // The vault/token being frozen [6]
-            charms: {} 
-          },
-          {
-            utxo_id: request.fundingUtxo, // Treasury sponsorship [7]
-            charms: {}
-          }
-        ],
-        outs: [], // Freeze operations typically have no outputs [6]
-        public_inputs: {
-          "$00": {
-            action: "freeze",
-            threshold: 3 // Board-level 3-of-5 threshold [8]
-          }
-        }
-      };
-      console.log('[PAYROLL PROVER] Built scroll-freeze spell for termination');
-      
+      if (!appId) throw new Error("appId required for mint-token");
+      spellVars = buildMintToken(request, appId);
+      builtAppId = appId;
+      console.log('[PAYROLL PROVER] Built mint-token spell');
+      console.log(`[PAYROLL PROVER] Captured ${Object.keys(spellVars).length} template variables from mint-token`);
     } else {
-      throw new Error(`Unsupported payroll action: ${request.type}`);
+      throw new Error(`Unsupported action: ${request.type}`);
     }
   } catch (error: any) {
     console.error('[PAYROLL PROVER] Spell building failed:', error);
     throw new Error(`Failed to build spell: ${error.message}`);
   }
+
+  // ----------------------------------------------------------------------------
+  // Step 3: Clean prev_txs hex strings
+  // ----------------------------------------------------------------------------
+  const cleanedPrevTxs = prevTxHexes.map(hex => hex.replace(/\s/g, '').toLowerCase());
+  console.log(`[PAYROLL PROVER] Cleaned ${cleanedPrevTxs.length} prev_txs`);
+
+  // ----------------------------------------------------------------------------
+  // Step 4: Determine spell template paths
+  // ----------------------------------------------------------------------------
+  let spellTemplatePath: string;
+  let privateTemplatePath: string | undefined;
+
+  if (request.type === 'mint-nft') {
+    spellTemplatePath = path.join(SPELL_TEMPLATES_DIR, 'mint-nft.yaml');
+    privateTemplatePath = path.join(SPELL_TEMPLATES_DIR, 'mint-nft-private.yaml');
+  } else if (request.type === 'mint-token') {
+    spellTemplatePath = path.join(SPELL_TEMPLATES_DIR, 'mint-token.yaml');
+    privateTemplatePath = path.join(SPELL_TEMPLATES_DIR, 'mint-nft-private.yaml');
+  } else {
+    spellTemplatePath = path.join(SPELL_TEMPLATES_DIR, 'send.yaml');
+    privateTemplatePath = path.join(SPELL_TEMPLATES_DIR, 'mint-nft-private.yaml');
+  }
+
+  console.log(`[PAYROLL PROVER] Template path: ${spellTemplatePath}`);
   
-  // ----------------------------------------------------------------------------
-  // Step 4: Format prev_txs with validation
-  // ----------------------------------------------------------------------------
-  const formattedPrevTxs = formatPrevTxs(prevTxHexes);
-  console.log(`[PAYROLL PROVER] Formatted ${formattedPrevTxs.length} prev_txs (as raw strings)`);
-  
-  // ----------------------------------------------------------------------------
-  // Step 5: Add multi-sig to spell if required
-  // ----------------------------------------------------------------------------
-  const multiSigInputs = formatMultiSigInputs(request);
-  if (multiSigInputs) {
-    Object.assign(spellJson, multiSigInputs);
-    console.log('[PAYROLL PROVER] Integrated multi-sig into spell object');
+  if (!fs.existsSync(spellTemplatePath)) {
+    throw new Error(`Spell template not found at: ${spellTemplatePath}`);
   }
 
   // ----------------------------------------------------------------------------
-  // Step 6: Construct Prover API request body (v0.12 Tuple-Compliant) - FIX APPLIED
+  // Step 5: Extract metadata and calculate values (fallback only)
+  // ----------------------------------------------------------------------------
+  const metadata = request.outputs?.[0]?.nftMetadata;
+  
+  const ticker = metadata?.ticker || constants.PAYROLL_NFT_TICKER;
+  const metadataHash = metadata?.metadataHash || '';
+  const scrollPolicy = (metadata?.scrollPolicy ?? 0).toString();
+  const payPeriodSeconds = (metadata?.payPeriodSeconds ?? 0).toString();
+  const compensationSats = (metadata?.compensationSats ?? 0).toString();
+  
+  let remaining = '100';
+  let currentSupply = '100';
+  let newRemaining = '97';
+  
+  if (request.type === 'mint-nft') {
+    remaining = (metadata?.remaining ?? 100).toString();
+  } else if (request.type === 'mint-token') {
+    currentSupply = (metadata?.remaining ?? 100).toString();
+    const totalTokensToMint = request.outputs?.filter(o => o.tokenAmount).reduce((sum, o) => sum + (o.tokenAmount || 0), 0) || 0;
+    newRemaining = (parseInt(currentSupply) - totalTokensToMint).toString();
+  }
+
+  // ----------------------------------------------------------------------------
+  // Step 6: VERIFY CHARMS EXECUTABLE AND WASM EXIST
+  // ----------------------------------------------------------------------------
+  if (!fs.existsSync(CHARMS_EXECUTABLE)) {
+    console.error(`[PAYROLL PROVER] ❌ Charms executable not found at: ${CHARMS_EXECUTABLE}`);
+    throw new Error(`Charms executable not found at ${CHARMS_EXECUTABLE}`);
+  }
+
+  if (!fs.existsSync(WASM_PATH)) {
+    console.error(`[PAYROLL PROVER] ❌ WASM file not found at: ${WASM_PATH}`);
+    throw new Error(`WASM file not found at ${WASM_PATH}`);
+  }
+
+  // ----------------------------------------------------------------------------
+  // Step 7: DYNAMIC EXPORTS & SCRIPT EXECUTION
+  // CRITICAL FIX: Place fallback values FIRST, then spread spellVars to overwrite
+  // This ensures builder values (the source of truth) take precedence
   // ----------------------------------------------------------------------------
 
-  // 1. NORMALIZE SPELL (Mandatory for v0.12 "tx" field requirement)
-  const normalizedSpell = {
-    version: spellJson.version,
-    mock: false,
-    // v0.12 Requirement: ins, outs, and coins must be inside the 'tx' object
-    tx: {
-      ins: spellJson.ins.map((i: any) => i.utxo_id), // Just the IDs
-      outs: spellJson.outs.map((o: any) => {
-        // Map the app tags ($00) to their charm data objects
-        const keyedCharms: any = {};
-        if (o.charms) {
-          Object.keys(o.charms).forEach(tag => {
-            keyedCharms[tag] = o.charms[tag];
-          });
+  try {
+    const vars: Record<string, string> = {
+      // 1. FALLBACK VALUES (place these FIRST)
+      ticker: ticker,
+      metadataHash: metadataHash,
+      scrollPolicy: scrollPolicy,
+      payPeriodSeconds: payPeriodSeconds,
+      compensationSats: compensationSats,
+      remaining: remaining,
+      current_supply: currentSupply,
+      new_remaining: newRemaining,
+      
+      // 2. BUILDER RESULTS (place these SECOND to overwrite defaults)
+      ...spellVars,
+
+      // 3. Core Identity (always overwrite with request values)
+      app_id: builtAppId || appId || '',
+      app_vk: APP_VK,
+      
+      // 4. Authority Witnesses
+      anchor_utxo: request.anchorUtxo || '', 
+      in_utxo_0: request.anchorUtxo || '',   
+
+      // 5. Input UTXOs
+      plan_utxo: request.authorityUtxo || '',
+      funding_utxo: request.fundingUtxo,
+      in_utxo_token: request.authorityUtxo || '',
+
+      // 6. Bitcoin Networking
+      change_address: request.changeAddress
+    };
+
+    if (request.type === 'mint-token' && !spellVars.worker_address_1 && !spellVars.worker_hex_dest_1) {
+      const workerOutputs = request.outputs?.filter(o => o.tokenAmount) || [];
+      if (workerOutputs.length > 0) vars.worker_address_1 = workerOutputs[0].address;
+      if (workerOutputs.length > 1) vars.worker_address_2 = workerOutputs[1].address;
+      if (workerOutputs.length > 2) vars.worker_address_3 = workerOutputs[2].address;
+      console.log(`[PAYROLL PROVER] Adding ${workerOutputs.length} workers via fallback`);
+    }
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[PAYROLL PROVER] Environment variables prepared:');
+      const varKeys = Object.keys(vars);
+      console.log(`  Total variables: ${varKeys.length}`);
+      
+      const importantVars = ['app_id', 'anchor_utxo', 'plan_utxo', 'funding_utxo', 'worker_count', 'change_amount', 'treasury_hex_dest', 'current_supply', 'new_remaining'];
+      importantVars.forEach(key => {
+        if (vars[key]) {
+          const value = vars[key].length > 50 ? vars[key].substring(0, 50) + '...' : vars[key];
+          console.log(`  ${key}: ${value}`);
         }
-        return keyedCharms;
-      }),
-      // Map BTC outputs for fee verification
-      coins: spellJson.outs.map((o: any) => ({
-        amount: o.sats || 1000,
-        dest: o.address
-      }))
-    },
-    // Required even if empty
-    app_public_inputs: spellJson.public_inputs || {} 
-  };
+      });
+    }
 
-  // 1. Spell: Hex-encoded CBOR string (satisfies Rule #1 - worked in error_2.txt)
-  const spellCbor = encode(normalizedSpell);
-  const spellHex = Buffer.from(spellCbor).toString('hex');
+    const exportCommands = Object.entries(vars)
+      .map(([k, v]) => `export ${k}="${v.replace(/"/g, '\\"')}"`)
+      .join('\n');
 
-  // 2. Binaries: Convert to an Array of Pairs [[key_bytes, value_bytes]]
-  // This solves the "expected bytes" error for the VK key at Column 945
-  const vkBytes = Array.from(Buffer.from(APP_VK, 'hex'));
-  const appBinaryBytes = Array.from(Buffer.from(appBinary, 'base64'));
-  const binariesTupleArray = [ [vkBytes, appBinaryBytes] ];
+    fs.writeFileSync(TEMP_PREV_TXS_FILE, cleanedPrevTxs.join('\n'));
 
-  // 3. PrevTxs: Wrap each byte array in the 'bitcoin' enum variant object
-  // The Rust type is Vec<Tx>, where Tx is an enum [1, 2]
-  const prevTxsObjects = formattedPrevTxs.map(hex => ({
-      bitcoin: Array.from(Buffer.from(hex, 'hex'))
-  }));
-
-  const requestBody: any = {
-    chain: 'bitcoin',
-    spell: spellHex, // Rule 1: Hex-CBOR string
+    const appBinsArg = `--app-bins=${WASM_PATH}`;
     
-    // Rule 2 Fix: Use Array of Tuples to provide byte-keys for BTreeMap
-    binaries: binariesTupleArray, 
-    prev_txs: prevTxsObjects, 
+    let privateInputsArg = '';
+    if (privateTemplatePath && fs.existsSync(privateTemplatePath)) {
+      const privateTemplateContent = fs.readFileSync(privateTemplatePath, 'utf8');
+      let substitutedPrivate = privateTemplateContent;
+      Object.entries(vars).forEach(([k, v]) => {
+        const placeholder = `\${${k}}`;
+        substitutedPrivate = substitutedPrivate.replace(new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), v);
+      });
+      const tempPrivateFile = path.join(process.env.HOME || '/home/ubuntu', `charms-private-${Date.now()}.yaml`);
+      fs.writeFileSync(tempPrivateFile, substitutedPrivate);
+      privateInputsArg = `--private-inputs="${tempPrivateFile}"`;
+      setTimeout(() => {
+        try { fs.unlinkSync(tempPrivateFile); } catch(e) {}
+      }, 10000);
+    }
     
-    change_address: request.changeAddress,
-    fee_rate: request.feeRate || 2.0,
+    const scriptContent = `#!/bin/bash
+set -e
+${exportCommands}
+cat "${spellTemplatePath}" | envsubst | "${CHARMS_EXECUTABLE}" spell prove --payload -o json \\
+  ${appBinsArg} \\
+  $(cat "${TEMP_PREV_TXS_FILE}" | xargs -I {} echo --prev-txs={}) \\
+  ${privateInputsArg} \\
+  --change-address="${request.changeAddress}"`;
 
-    // MANDATORY v0.12 FIELDS (Tuple format for empty Maps)
-    app_private_inputs: [], 
-    tx_ins_beamed_source_utxos: [],
-    collateral_utxo: null 
-  };
+    fs.writeFileSync(TEMP_SCRIPT_FILE, scriptContent);
+    fs.chmodSync(TEMP_SCRIPT_FILE, '755');
 
-  // CANARY LOG: Verifies the structural shift to Tuple Arrays
-  console.log('[TUPLE-V12-FIX] Binaries is Tuple Array:', Array.isArray(requestBody.binaries));
-  console.log('[TUPLE-V12-FIX] Binaries first key bytes length:', requestBody.binaries[0][0].length);
-  console.log('[TUPLE-V12-FIX] Binaries first value bytes length:', requestBody.binaries[0][1].length);
-  console.log('[TUPLE-V12-FIX] PrevTxs first object has bitcoin field:', !!requestBody.prev_txs[0]?.bitcoin);
-  console.log('[TUPLE-V12-FIX] PrevTxs first bitcoin bytes length:', requestBody.prev_txs[0]?.bitcoin?.length);
+    console.log(`[PAYROLL PROVER] 🚀 Executing Script Proxy: ${TEMP_SCRIPT_FILE}`);
+    console.log(`[PAYROLL PROVER] Script contains ${Object.keys(vars).length} environment variables`);
 
-  // Debug log
-  console.log('[PAYROLL PROVER] Request body prepared (v0.12):', {
-    spellType: request.type,
-    spellHexLength: requestBody.spell.length,
-    binariesIsTupleArray: Array.isArray(requestBody.binaries) && Array.isArray(requestBody.binaries[0]),
-    binariesKeyLength: requestBody.binaries[0]?.[0]?.length,
-    binariesValueLength: requestBody.binaries[0]?.[1]?.length,
-    prevTxsCount: requestBody.prev_txs.length,
-    prevTxsFirstIsObject: typeof requestBody.prev_txs[0] === 'object',
-    prevTxsFirstHasBitcoin: !!requestBody.prev_txs[0]?.bitcoin,
-    feeRate: request.feeRate || 2.0,
-    multiSig: !!multiSigInputs,
-    appIdProvided: !!appId
-  });
-  
-  // ----------------------------------------------------------------------------
-  // Step 7: Execute with retry logic
-  // ----------------------------------------------------------------------------
-  let lastError: Error | null = null;
-  
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const stdout = execSync(TEMP_SCRIPT_FILE, { encoding: 'utf8', shell: '/bin/bash' });
+    const requestBody = JSON.parse(stdout);
+
+    console.log('[PAYROLL PROVER] ✅ Successfully generated API payload.');
+
+    // ----------------------------------------------------------------------------
+    // Step 8: SEND TO PROVER API WITH RETRIES
+    // ----------------------------------------------------------------------------
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(`\n[PAYROLL PROVER] Attempt ${attempt + 1}/${MAX_RETRIES + 1}`);
+
+        const startTime = Date.now();
+        const response = await axios.post(PROVER_URL, requestBody, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: PROVER_TIMEOUT_MS,
+        });
+        const elapsed = Date.now() - startTime;
+        
+        console.log('[PAYROLL PROVER] ✅ Response received:', {
+          status: response.status,
+          elapsedSec: (elapsed/1000).toFixed(1),
+          responseLength: Array.isArray(response.data) ? response.data.length : 'not array'
+        });
+        
+        const commitTxHex = extractTxHexFromJson(response.data, 0);
+        const spellTxHex = response.data.length > 1 
+            ? extractTxHexFromJson(response.data, 1) 
+            : commitTxHex;
+
+        console.log('[PAYROLL PROVER] Successfully extracted hexes:', {
+            commit: commitTxHex.substring(0, 10) + '...',
+            spell: spellTxHex.substring(0, 10) + '...',
+            isSingle: response.data.length === 1
+        });
+
+        console.log('[PAYROLL PROVER] ===== SUCCESS =====\n');
+
+        try {
+          fs.unlinkSync(TEMP_PREV_TXS_FILE);
+          fs.unlinkSync(TEMP_SCRIPT_FILE);
+        } catch (e) { /* ignore */ }
+
+        return { commitTxHex, spellTxHex };
+        
+      } catch (error: any) {
+        lastError = error;
+        console.error(`\n[PAYROLL PROVER] ❌ Attempt ${attempt + 1} failed:`, error.message);
+        
+        if (error.response?.status >= 400 && error.response?.status < 500) break;
+        
+        if (attempt < MAX_RETRIES) {
+          const delay = calculateBackoff(attempt);
+          console.log(`Retrying in ${Math.round(delay/1000)}s...`);
+          await sleep(delay);
+        }
+      }
+    }
+    
+    throw lastError || new Error('All retries failed');
+    
+  } catch (cliError: any) {
+    console.error('[PAYROLL PROVER] ❌ CLI Payload Generation Failed:', cliError.message);
+    console.error('[PAYROLL PROVER] Debug files saved at:');
+    console.error(`  - Prev-txs: ${TEMP_PREV_TXS_FILE}`);
+    console.error(`  - Script: ${TEMP_SCRIPT_FILE}`);
+    
     try {
-      console.log(`[PAYROLL PROVER] Attempt ${attempt + 1}/${MAX_RETRIES + 1}`);
-
-      const response = await axios.post(PROVER_URL, requestBody, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: PROVER_TIMEOUT_MS
+      const scriptContent = fs.readFileSync(TEMP_SCRIPT_FILE, 'utf8');
+      console.error('[PAYROLL PROVER] Script content preview (first 10 lines):');
+      scriptContent.split('\n').slice(0, 10).forEach((line, i) => {
+        console.error(`  ${i+1}: ${line}`);
       });
-      
-      console.log('[PAYROLL PROVER] Prover response received:', {
-        status: response.status,
-        dataType: Array.isArray(response.data) ? 'array' : typeof response.data
-      });
-      
-      // ------------------------------------------------------------------------
-      // Step 8: Extract and validate response
-      // ------------------------------------------------------------------------
-      if (!Array.isArray(response.data) || response.data.length < 2) {
-        throw new Error('Prover API returned invalid response: expected array of 2 transactions');
-      }
-      
-      const commitTxHex = extractTxHex(response.data, 0);
-      const spellTxHex = extractTxHex(response.data, 1);
-      
-      console.log('[PAYROLL PROVER] Transaction hexes extracted:', {
-        commitLength: commitTxHex.length,
-        spellLength: spellTxHex.length
-      });
-      
-      console.log('[PAYROLL PROVER] ===== SUCCESS =====\n');
-      
-      return { commitTxHex, spellTxHex };
-      
-    } catch (error: any) {
-      lastError = error;
-      
-      console.error(`[PAYROLL PROVER] Attempt ${attempt + 1} failed:`, {
-        message: error.message,
-        status: error.response?.status,
-        data: error.response?.data
-      });
-      
-      // Don't retry on client errors (4xx)
-      if (error.response?.status >= 400 && error.response?.status < 500) {
-        console.error('[PAYROLL PROVER] Client error, aborting retries');
-        break;
-      }
-      
-      // Retry on server errors, network issues, timeouts
-      if (attempt < MAX_RETRIES) {
-        const delay = calculateBackoff(attempt);
-        console.log(`[PAYROLL PROVER] Retrying in ${Math.round(delay)}ms...`);
-        await sleep(delay);
-      }
+    } catch (e) {
+      // Ignore read errors
     }
+    
+    throw new Error(`Failed to generate payload: ${cliError.message}`);
   }
-  
-  // ----------------------------------------------------------------------------
-  // Step 9: All retries failed
-  // ----------------------------------------------------------------------------
-  console.error('[PAYROLL PROVER] ===== ALL RETRIES FAILED =====\n');
-  
-  let errorMessage = 'Prover API failed after all retry attempts. ';
-  
-  if (lastError) {
-    if (axios.isAxiosError(lastError)) {
-      if (lastError.code === 'ECONNABORTED' || lastError.message.includes('timeout')) {
-        errorMessage += 'Request timed out. ZK proof generation may be slow.';
-      } else if (lastError.response) {
-        errorMessage += `HTTP ${lastError.response.status}: ${JSON.stringify(lastError.response.data)}`;
-      } else if (lastError.request) {
-        errorMessage += 'Network error: No response received.';
-      } else {
-        errorMessage += lastError.message;
-      }
-    } else {
-      errorMessage += lastError.message;
-    }
-  }
-  
-  throw new Error(errorMessage);
 }
 
-/**
- * Batch payroll helper - creates multiple worker tokens in one transaction
- * 
- * @param planUtxo - Plan NFT UTXO
- * @param workers - Array of worker addresses and amounts
- * @param fundingUtxo - UTXO for fees
- * @param changeAddress - Address for change
- * @param appId - The appId from the saved plan (required for token minting)
- * @param multiSigSigners - Optional multi-signature signers
- * @returns ProverResult with batched transaction
- */
+// --------------------------------------------------------------------------------
+// Helper Functions
+// --------------------------------------------------------------------------------
+
 export async function batchPayroll(
   planUtxo: string,
   workers: Array<{ address: string; amount: number }>,
@@ -442,25 +396,18 @@ export async function batchPayroll(
   const request: SpellRequest = {
     type: 'mint-token',
     authorityUtxo: planUtxo,
+    anchorUtxo: process.env.PAYROLL_ANCHOR_UTXO,
     fundingUtxo: fundingUtxo.utxo,
     fundingUtxoValue: fundingUtxo.value,
     changeAddress: changeAddress,
     feeRate: constants.DEFAULT_FEE_RATE,
-    outputs: workers.map(w => ({
-      address: w.address,
-      tokenAmount: w.amount
-    })),
+    outputs: workers.map(w => ({ address: w.address, tokenAmount: w.amount })),
     ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
   };
-  
-  // For token minting, prevTxHexes should contain the Plan NFT authority UTXO
-  // Pass the appId as the third argument
-  return generateUnsignedTransactions(request, [planUtxo], appId);
+
+  return generateUnsignedTransactions(request, [planUtxo, fundingUtxo.utxo], appId);
 }
 
-/**
- * Create new employment plan (Plan NFT)
- */
 export async function createEmploymentPlan(
   planDetails: {
     ticker: string;
@@ -482,10 +429,10 @@ export async function createEmploymentPlan(
     changeAddress: changeAddress,
     feeRate: constants.DEFAULT_FEE_RATE,
     outputs: [{
-      address: changeAddress, // NFT goes to employer's change address
+      address: changeAddress,
       nftMetadata: {
         ticker: planDetails.ticker,
-        remaining: 1, // Single employment contract
+        remaining: 1,
         metadataHash: planDetails.metadataHash,
         scrollPolicy: planDetails.scrollPolicy,
         payPeriodSeconds: planDetails.payPeriodSeconds,
@@ -495,7 +442,5 @@ export async function createEmploymentPlan(
     ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
   };
   
-  // For NFT minting, prevTxHexes should contain the anchor UTXO
-  // No appId needed for mint-nft
-  return generateUnsignedTransactions(request, [anchorUtxo]);
+  return generateUnsignedTransactions(request, [anchorUtxo, fundingUtxo.utxo]);
 }

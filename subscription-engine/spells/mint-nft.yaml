@@ -1,18 +1,18 @@
-version: 8
-
-apps:
-  $00: n/${app_id}/${app_vk}
-
-private_inputs:
-  $00: "${in_utxo_0}"
-
-ins:
-  - utxo_id: ${in_utxo_0}
-    charms: {}
-
-outs:
-  - address: ${addr_0}
-    charms:
-      $00:
-        ticker: SUBSCRIPTION-ENGINE
-        remaining: 100000
+version: 11
+tx:
+  ins:
+    - ${in_utxo_0}
+    - ${funding_utxo}
+  outs:
+    - 0:
+        ticker: ${ticker}
+        remaining: ${remaining}
+        metadataHash: ${metadataHash}
+        scrollPolicy: ${scrollPolicy}
+        payPeriodSeconds: ${payPeriodSeconds}
+        compensationSats: ${compensationSats}
+  coins:
+    - amount: 1000
+      dest: ${dest_0} # MUST be Hex-encoded
+app_public_inputs:
+  n/${app_id}/${app_vk}: ~

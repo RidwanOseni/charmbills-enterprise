@@ -23,14 +23,17 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
-import { Wallet, Users, CheckCircle } from 'lucide-react'
+import { Wallet, Users, CheckCircle, Building2 } from 'lucide-react'
 import { useWallet } from '@/lib/WalletContext';
 import { getWalletStatus } from '@/lib/charms-utils';
 import { WorkerStatus, ProverResult } from '../../shared/types';
 import * as constants from '../../shared/constants';
 
+// Import for company onboarding hex derivation
+import * as btc from '@scure/btc-signer';
+import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
+
 export default function EmployerDashboard() {
-  // FIX 1: Add connect/disconnect to destructuring [3, 4]
   const { 
     address, 
     walletConnected, 
@@ -44,6 +47,8 @@ export default function EmployerDashboard() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [nextRunDate, setNextRunDate] = useState<string>('Calculating...');
   const [hasActiveWorkers, setHasActiveWorkers] = useState<boolean>(false);
+  const [isOnboarding, setIsOnboarding] = useState<boolean>(false);
+  const [companyRegistered, setCompanyRegistered] = useState<boolean>(false);
   
   const [fullName, setFullName] = useState('')
   const [role, setRole] = useState('')
@@ -53,16 +58,103 @@ export default function EmployerDashboard() {
   const [payFrequency, setPayFrequency] = useState('monthly')
   const [workerType, setWorkerType] = useState('employee')
   
-  // FIX 2: Explicitly type Set as string to fix "never" errors [1, 2]
   const [selectedWorkers, setSelectedWorkers] = useState<Set<string>>(new Set());
   const [selectedDept, setSelectedDept] = useState('engineering')
   const [selectedPeriods, setSelectedPeriods] = useState('1')
   const [statusFilter, setStatusFilter] = useState('all')
   const [toast, setToast] = useState('')
   
-  // State for the active Plan NFT (Authority) needed for batch minting
   const [currentPlanNftUtxo, setCurrentPlanNftUtxo] = useState('');
   const [currentPlanMetadata, setCurrentPlanMetadata] = useState<any>(null);
+
+  // ============================================================
+  // COMPANY ONBOARDING: Auto-register when wallet connects
+  // ============================================================
+  useEffect(() => {
+    const checkAndRegisterCompany = async () => {
+      if (!walletConnected || !address || companyRegistered) return;
+      
+      setIsOnboarding(true);
+      try {
+        console.log("[ONBOARDING] Checking if company exists for:", address);
+        
+        // Check if company already registered
+        const checkResponse = await axios.get(`/api/companies/${address}`);
+        
+        if (checkResponse.data?.success) {
+          console.log("[ONBOARDING] Company already registered");
+          setCompanyRegistered(true);
+          setIsOnboarding(false);
+          return;
+        }
+      } catch (error: any) {
+        // 404 means company not found - proceed with registration
+        if (error.response?.status !== 404) {
+          console.error("[ONBOARDING] Error checking company:", error.message);
+          setIsOnboarding(false);
+          return;
+        }
+      }
+      
+      // Company not found - register new company
+      try {
+        console.log("[ONBOARDING] Registering new company...");
+        
+        // 1. Get Taproot address from Leather wallet
+        const response = await (window as any).LeatherProvider.request("getAddresses");
+        const p2tr = response.result.addresses.find((a: any) => a.type === 'p2tr');
+        
+        if (!p2tr) {
+          throw new Error("Taproot address (p2tr) not found in wallet. Please ensure your wallet has a Taproot address.");
+        }
+        
+        console.log("[ONBOARDING] Found Taproot address:", p2tr.address);
+        
+        // 2. AUTOMATICALLY derive the Hex Destination
+        // Slices 33-byte key to 32-byte X-only Schnorr key
+        const fullKey = hexToBytes(p2tr.publicKey);
+        const schnorrKey = fullKey.length === 33 ? fullKey.slice(1) : fullKey;
+        
+        // Testnet4 parameters
+        const network = { 
+          bech32: 'tb', 
+          pubKeyHash: 0x6f, 
+          scriptHash: 0xc4, 
+          wif: 0xef 
+        };
+        
+        const payment = btc.p2tr(schnorrKey, undefined, network);
+        const derivedHex = bytesToHex(payment.script);
+        
+        console.log("[ONBOARDING] Derived hex destination:", derivedHex.substring(0, 40) + "...");
+        
+        // 3. Save to Database via API
+        const registerResponse = await axios.post('/api/companies/register', {
+          employerAddress: p2tr.address,
+          treasuryAddress: p2tr.address, // Usually the same during setup
+          treasuryHexDest: derivedHex
+        });
+        
+        if (registerResponse.data?.success) {
+          console.log("[ONBOARDING] ✅ Company registered successfully");
+          setCompanyRegistered(true);
+          setToast("✅ Company infrastructure registered! You can now hire workers.");
+          setTimeout(() => setToast(''), 4000);
+        } else {
+          throw new Error(registerResponse.data?.error || "Registration failed");
+        }
+        
+      } catch (error: any) {
+        console.error("[ONBOARDING] Registration failed:", error.message);
+        setToast(`❌ Company registration failed: ${error.message}`);
+        setTimeout(() => setToast(''), 5000);
+      } finally {
+        setIsOnboarding(false);
+      }
+    };
+    
+    checkAndRegisterCompany();
+  }, [walletConnected, address, companyRegistered]);
 
   // DYNAMIC DATA FETCHING (Overview Cards)
   useEffect(() => {
@@ -74,7 +166,7 @@ export default function EmployerDashboard() {
           setNextRunDate(date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }));
           setHasActiveWorkers(true);
         } else {
-          setNextRunDate("Waiting for first hire"); // Fix for hardcoded oversight [4]
+          setNextRunDate("Waiting for first hire");
           setHasActiveWorkers(false);
         }
       } catch (err) {
@@ -116,12 +208,12 @@ export default function EmployerDashboard() {
     const fetchPlanForDepartment = async () => {
       if (!walletConnected || selectedDept === 'all') return;
       try {
-        // Fetch the Plan NFT governing this department from the Derivable Indexer cache [7]
+        // Fetch the Plan NFT governing this department from the Derivable Indexer cache
         const response = await axios.get(`/api/plans?department=${selectedDept}`);
         if (response.data && response.data.length > 0) {
           const plan = response.data;
           setCurrentPlanNftUtxo(plan.nftUtxoId);
-          // Metadata is required for supply math in the ZK-proof [8, 9]
+          // Metadata is required for supply math in the ZK-proof
           setCurrentPlanMetadata({
             ticker: plan.ticker,
             remaining: plan.remaining,
@@ -138,10 +230,7 @@ export default function EmployerDashboard() {
     fetchPlanForDepartment();
   }, [walletConnected, selectedDept]);
 
-  // Card Helper: Dynamic Team Count
   const totalWorkers = workers.length;
-
-  // FIX 3: Department filter with type assertion to access metadata [10, 12]
   const deptWorkers = selectedDept === 'all' 
     ? workers 
     : workers.filter((w: any) => w.department === selectedDept);
@@ -168,7 +257,6 @@ export default function EmployerDashboard() {
     if (selectedWorkers.size === deptWorkers.length && deptWorkers.length > 0) {
       setSelectedWorkers(new Set());
     } else {
-      // Map to unique wallet addresses [14, 15]
       setSelectedWorkers(new Set(deptWorkers.map((w: any) => w.wallet)));
     }
   };
@@ -185,10 +273,15 @@ export default function EmployerDashboard() {
   // PRODUCTION ENCRYPTION (Hire Logic)
   const handleHire = async () => {
     if (!fullName || !role || !salary || !bitcoinAddress) return;
+    if (!companyRegistered) {
+      setToast("⚠️ Please wait for company registration to complete before hiring.");
+      setTimeout(() => setToast(''), 4000);
+      return;
+    }
     setIsProcessing(true);
 
     try {
-      // Request wallet signature for non-custodial entropy [5]
+      // Request wallet signature for non-custodial entropy
       console.log("🔐 Requesting encryption authority from wallet...");
       const signatureResponse = await (window as any).LeatherProvider.request("signMessage", {
         message: "CharmBills Payroll Encryption Authority v1",
@@ -203,7 +296,7 @@ export default function EmployerDashboard() {
         payPeriodSeconds: constants.SECONDS_PER_BIWEEK,
         scrollPolicy: workerType === 'employee' ? 0 : 1,
         employerAddress: address,
-        encryptionEntropy: signatureResponse.result.signature, // Non-custodial fix
+        encryptionEntropy: signatureResponse.result.signature,
         multiSigRequired: true
       };
 
@@ -211,7 +304,6 @@ export default function EmployerDashboard() {
       const proverResult: ProverResult = response.data;
 
       // Step 2: Trigger Phase 3 Dual-Signing (Commit + Spell)
-      // FIX: Use optional chaining to prevent crashes if user closes wallet without signing
       const signingResult = await signAndBroadcastPackage(proverResult, response.data.dualUtxoContext);
       const txids = signingResult?.txids;
 
@@ -239,7 +331,6 @@ export default function EmployerDashboard() {
         setPayFrequency('monthly');
         setWorkerType('employee');
       } else {
-        // Handle case where user cancelled signing
         console.log('User cancelled signing or no transaction IDs returned');
         setToast('⚠️ Signing was cancelled or failed');
       }
@@ -261,22 +352,21 @@ export default function EmployerDashboard() {
     setIsProcessing(true);
 
     try {
-      // Filter the workforce to only the selected wallets [17, 19]
+      // Filter the workforce to only the selected wallets
       const workerList = workers.filter(w => selectedWorkers.has(w.wallet));
       const periods = parseInt(selectedPeriods);
 
-      // Construct payload for /api/payrollhiring/mint [8]
+      // Construct payload for /api/payrollhiring/mint
       const payload = {
-        authorityUtxo: currentPlanNftUtxo, // The Plan NFT found by the indexer
+        authorityUtxo: currentPlanNftUtxo,
         workers: workerList.map(w => ({ address: w.wallet, periods })),
         employerAddress: address,
-        planMetadata: currentPlanMetadata // Necessary for ZK-supply math [9]
+        planMetadata: currentPlanMetadata
       };
 
       const response = await axios.post('/api/payrollhiring/mint', payload);
       
-      // Execute the Dual-Signing Flow (Commit + Spell) [16, 20]
-      // FIX: Use optional chaining to prevent crashes if user closes wallet without signing
+      // Execute the Dual-Signing Flow (Commit + Spell)
       const signingResult = await signAndBroadcastPackage(response.data, response.data.dualUtxoContext);
       const txids = signingResult?.txids;
       
@@ -285,7 +375,6 @@ export default function EmployerDashboard() {
         await refreshWorkers();
         setSelectedWorkers(new Set());
       } else {
-        // Handle case where user cancelled signing
         console.log('User cancelled signing or no transaction IDs returned');
         setToast('⚠️ Signing was cancelled or failed');
       }
@@ -298,14 +387,13 @@ export default function EmployerDashboard() {
     }
   };
 
-  // PRODUCTION TERMINATION HANDLER: Triggers 3-of-5 Board override to freeze vault funds
   const handleTerminate = async (workerWallet: string) => {
     if (!confirm("Are you sure? This triggers a 3-of-5 Board override to freeze vault funds.")) return;
     
     try {
       await axios.post('/api/workers/terminate', { walletAddress: workerWallet });
       setToast("✅ Termination initiated. Check Treasury for Board approval.");
-      await refreshWorkers(); // Refresh workers list
+      await refreshWorkers();
     } catch (err) {
       console.error("Termination failed:", err);
       setToast("❌ Failed to initiate termination.");
@@ -313,8 +401,63 @@ export default function EmployerDashboard() {
     }
   };
 
+  // If wallet not connected, show connection prompt
+  if (!walletConnected) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Card className="max-w-md w-full p-8 text-center">
+          <div className="flex justify-center mb-6">
+            <div className="p-4 bg-primary/10 rounded-full">
+              <Wallet className="w-12 h-12 text-primary" />
+            </div>
+          </div>
+          <h1 className="text-2xl font-bold text-primary mb-2">Connect Your Wallet</h1>
+          <p className="text-foreground mb-6">Connect your Leather wallet to manage your team and payroll</p>
+          <Button onClick={connectWallet} className="w-full">
+            Connect Wallet
+          </Button>
+        </Card>
+      </div>
+    );
+  }
+
+  // If onboarding in progress, show loading state
+  if (isOnboarding) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Card className="max-w-md w-full p-8 text-center">
+          <div className="flex justify-center mb-6">
+            <div className="p-4 bg-primary/10 rounded-full animate-pulse">
+              <Building2 className="w-12 h-12 text-primary" />
+            </div>
+          </div>
+          <h1 className="text-2xl font-bold text-primary mb-2">Setting Up Your Company</h1>
+          <p className="text-foreground mb-6">We're automatically configuring your treasury infrastructure...</p>
+          <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
+            <div className="bg-primary h-full w-2/3 animate-pulse rounded-full"></div>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-background">
+      {/* Company Status Banner */}
+      {companyRegistered && (
+        <div className="bg-secondary/10 border-b border-secondary/20 px-6 py-2">
+          <div className="max-w-7xl mx-auto flex items-center justify-between">
+            <p className="text-sm text-secondary flex items-center gap-2">
+              <CheckCircle className="w-4 h-4" />
+              Company infrastructure registered ✓
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Treasury: {address?.substring(0, 16)}...
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-6 py-12">
         {/* Toast Notification */}
@@ -354,6 +497,7 @@ export default function EmployerDashboard() {
           <p className="text-foreground">Add workers and issue tokens for payroll</p>
         </div>
 
+        {/* Rest of the component remains the same */}
         {/* Action Cards Grid */}
         <div className="grid lg:grid-cols-3 gap-8 mb-12">
           {/* Card A: New Hire */}
@@ -475,7 +619,7 @@ export default function EmployerDashboard() {
 
               <Button 
                 onClick={handleHire} 
-                disabled={isProcessing}
+                disabled={isProcessing || !companyRegistered}
                 className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-2 rounded-lg disabled:opacity-50"
               >
                 {isProcessing ? 'Processing...' : 'Hire'}
@@ -483,7 +627,7 @@ export default function EmployerDashboard() {
             </div>
           </Card>
 
-          {/* Card B: Batch Minting */}
+          {/* Card B: Batch Minting - Keep existing implementation */}
           <Card className="p-8 bg-card border border-border rounded-xl flex flex-col md:col-span-2">
             <div>
               <h2 className="text-2xl font-bold text-primary mb-1">Pay Your Team — All at Once</h2>
@@ -530,7 +674,6 @@ export default function EmployerDashboard() {
                             <TableCell className="py-2 pl-0 w-6">
                               <input
                                 type="checkbox"
-                                // Correctly checks the wallet against the explicitly typed Set [23, 24]
                                 checked={selectedWorkers.has(worker.wallet)}
                                 onChange={() => toggleWorkerSelection(worker.wallet)}
                                 className="w-4 h-4 rounded border-border"

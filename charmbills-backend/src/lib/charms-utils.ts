@@ -3,7 +3,7 @@ import axios from 'axios';
 import * as constants from '@shared/constants';
 
 const MEMPOOL_API = "https://mempool.space/testnet4/api";
-const PROTOCOL_VERSION = 8; 
+const PROTOCOL_VERSION = 11; 
 
 /**
  * ADDITION: Calculates required fees for Scroll-enabled transactions.

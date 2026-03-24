@@ -19,14 +19,18 @@
   "license": "ISC",
   "description": "CharmBills Payroll Backend - Bitcoin subscription engine for enterprise payroll",
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "@scure/btc-signer": "^2.0.1",
     "@types/express": "^5.0.6",
     "axios": "^1.13.2",
     "bitcoinjs-lib": "^7.0.1",
     "cbor-x": "^1.6.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
+    "ecpair": "^3.0.1",
     "express": "^5.2.1",
     "sqlite3": "^5.1.7",
+    "tiny-secp256k1": "^2.2.4",
     "tsconfig-paths": "^4.2.0",
     "uuid": "^13.0.0"
   },

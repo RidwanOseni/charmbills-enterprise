@@ -1,6 +1,7 @@
 import { SpellRequest } from '@shared/types';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 
 // --------------------------------------------------------------------------------
 // Constants
@@ -8,7 +9,6 @@ import * as crypto from 'crypto';
 const APP_VK = process.env.HARDCODED_APP_VK || constants.HARDCODED_APP_VK;
 const DEFAULT_TICKER = constants.PAYROLL_NFT_TICKER || "CHARMS-PAY";
 const MIN_OUTPUT_SATS = constants.MIN_OUTPUT_SATS || 1000;
-const PROTOCOL_VERSION = 8;
 
 // --------------------------------------------------------------------------------
 // Custom Error Class
@@ -64,7 +64,7 @@ function validateBatchMintRequest(request: SpellRequest): void {
     throw new ValidationError('authorityUtxo is required for batch token minting');
   }
 
-  // Check funding UTXO (now required for v0.12)
+  // v0.12 FIX: Check funding UTXO (now required and must be in spell inputs)
   if (!request.fundingUtxo) {
     throw new ValidationError('fundingUtxo is required for batch token minting in v0.12');
   }
@@ -178,23 +178,24 @@ function calculateBatchMetrics(
 }
 
 // --------------------------------------------------------------------------------
-// Spell Builder (UPDATED with v0.12 funding UTXO fix)
+// Spell Builder (Template Variables Version)
 // --------------------------------------------------------------------------------
 
 /**
- * Builds a Batched Mint-Token Spell for Charms Inc. Payroll.
+ * Builds template variables for a Batched Mint-Token Spell for Charms Inc. Payroll.
  * Implements the 1:M:N Scaling Model: 1 NFT Authority -> M Workers -> N Periods.
  * 
- * This function creates a single transaction that:
+ * This function prepares template variables that will be substituted into YAML templates
+ * via envsubst in proverClient.ts. The resulting transaction:
  * 1. Consumes the Plan NFT (authority) as input
  * 2. Creates M worker tokens (one per employee/freelancer)
  * 3. Returns the Plan NFT to employer with updated remaining supply
  * 
  * @param request - Validated spell request with worker outputs and NFT return metadata
  * @param appId - The existing appId from the saved plan (passed, not derived)
- * @returns Spell JSON for Prover API
+ * @returns Template variables object for envsubst
  */
-export function buildMintToken(request: SpellRequest, appId: string): any {
+export function buildMintToken(request: SpellRequest, appId: string): Record<string, string> {
   // ----------------------------------------------------------------------------
   // Step 1: Validate request
   // ----------------------------------------------------------------------------
@@ -204,16 +205,31 @@ export function buildMintToken(request: SpellRequest, appId: string): any {
   // Step 2: Separate and validate outputs
   // ----------------------------------------------------------------------------
   const { workerOutputs, nftReturnOutput } = separateOutputs(request);
+  const metadata = nftReturnOutput.nftMetadata;
 
   // ----------------------------------------------------------------------------
-  // Step 3: Use passed appId (DO NOT derive)
+  // Step 3: Calculate batch metrics
   // ----------------------------------------------------------------------------
-  const currentSupply = Number(nftReturnOutput.nftMetadata.remaining);
-  const totalTokensToMint = workerOutputs.reduce((sum, w) => sum + w.tokenAmount, 0);
-  const newRemainingSupply = currentSupply - totalTokensToMint;
+  const currentSupply = Number(metadata.remaining);
+  const { totalTokensToMint, newRemainingSupply } = calculateBatchMetrics(
+    workerOutputs,
+    currentSupply
+  );
 
   // ----------------------------------------------------------------------------
-  // Step 4: Log batch details (debug only)
+  // Step 4: Validate environment variables
+  // ----------------------------------------------------------------------------
+  if (!process.env.PAYROLL_ANCHOR_UTXO) {
+    throw new ValidationError('PAYROLL_ANCHOR_UTXO environment variable is required for private_inputs');
+  }
+
+  const treasuryHexDest = process.env.PAYROLL_TREASURY_HEX_DEST;
+  if (!treasuryHexDest) {
+    throw new ValidationError('PAYROLL_TREASURY_HEX_DEST environment variable is required');
+  }
+
+  // ----------------------------------------------------------------------------
+  // Step 5: Log batch details (debug only)
   // ----------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
     console.log('[buildMintToken.payroll] 📦 Batch mint details:', {
@@ -222,80 +238,144 @@ export function buildMintToken(request: SpellRequest, appId: string): any {
       totalTokens: totalTokensToMint,
       currentSupply,
       newRemainingSupply,
-      scrollPolicy: nftReturnOutput.nftMetadata.scrollPolicy === 0 ? 'Time' : 'Proof',
+      scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       authorityUtxo: request.authorityUtxo,
-      fundingUtxo: request.fundingUtxo
+      fundingUtxo: request.fundingUtxo,
+      anchorUtxo: process.env.PAYROLL_ANCHOR_UTXO?.substring(0, 32) + '...'
     });
   }
 
   // ----------------------------------------------------------------------------
-  // Step 5: Construct spell JSON with v0.12 changes
+  // Step 6: Initialize spellVars object
   // ----------------------------------------------------------------------------
-  return {
-    version: PROTOCOL_VERSION,
+  const spellVars: Record<string, string> = {
+    // App identifiers
+    app_id: appId,
+    app_vk: APP_VK,
     
-    // Define apps: $00 = NFT Authority, $01 = Fungible Token
-    apps: {
-      "$00": `n/${appId}/${APP_VK}`,
-      "$01": `t/${appId}/${APP_VK}`
-    },
+    // Anchor UTXO for private inputs
+    anchor_utxo: process.env.PAYROLL_ANCHOR_UTXO,
     
-    // CRITICAL FIX: Add private_inputs block to satisfy Rust authority check
-    // This must contain the original Anchor UTXO ID string that hashes to appId
-    private_inputs: {
-      "$00": process.env.PAYROLL_ANCHOR_UTXO // The string that hashes to appId
-    },
-    
-    // FIX v0.12: Both authority UTXO and funding UTXO must be in the ins array
-    ins: [
-      {
-        utxo_id: request.authorityUtxo,
-        charms: {
-          "$00": {
-            ticker: nftReturnOutput.nftMetadata.ticker || DEFAULT_TICKER,
-            remaining: currentSupply,
-            metadataHash: nftReturnOutput.nftMetadata.metadataHash,
-            scrollPolicy: Number(nftReturnOutput.nftMetadata.scrollPolicy),
-            payPeriodSeconds: Number(nftReturnOutput.nftMetadata.payPeriodSeconds),
-            compensationSats: Number(nftReturnOutput.nftMetadata.compensationSats)
-          }
-        }
-      },
-      {
-        utxo_id: request.fundingUtxo, // FIX: Move funding UTXO into the spell inputs
-        charms: {} // Plain BTC inputs have empty charms
-      }
-    ],
-    
-    // Outputs: Worker tokens + NFT return
-    outs: [
-      // WORKER OUTPUTS: Create M fungible tokens for M workers
-      // Each token represents 1 pay period authorization
-      ...workerOutputs.map(worker => ({
-        address: worker.address,
-        charms: {
-          "$01": Number(worker.tokenAmount) // 1 token = 1 pay period
-        },
-        sats: MIN_OUTPUT_SATS // Dust limit compliance
-      })),
-      
-      // EMPLOYER RETURN: Return the Authority NFT with updated supply
-      {
-        address: nftReturnOutput.address,
-        charms: {
-          "$00": {
-            ticker: nftReturnOutput.nftMetadata.ticker || DEFAULT_TICKER,
-            remaining: newRemainingSupply,
-            metadataHash: nftReturnOutput.nftMetadata.metadataHash,
-            scrollPolicy: Number(nftReturnOutput.nftMetadata.scrollPolicy),
-            payPeriodSeconds: Number(nftReturnOutput.nftMetadata.payPeriodSeconds),
-            compensationSats: Number(nftReturnOutput.nftMetadata.compensationSats)
-          }
-        },
-        sats: MIN_OUTPUT_SATS // Employer liquidity preservation
-      }
-    ]
+    // Change address
+    change_address: request.changeAddress
   };
+  
+  // ----------------------------------------------------------------------------
+  // Step 7: ADD ALL REQUIRED MAPPINGS FOR THE YAML TEMPLATE
+  // These variables are required by mint-token.yaml for the ins block
+  // ----------------------------------------------------------------------------
+  
+  // UTXO inputs - Required for the ins block
+  spellVars.plan_utxo = request.authorityUtxo!;
+  spellVars.funding_utxo = request.fundingUtxo!;
+  
+  // NFT metadata - Required to describe the input NFT's state
+  spellVars.ticker = metadata.ticker || DEFAULT_TICKER;
+  spellVars.current_supply = currentSupply.toString();
+  spellVars.new_remaining = newRemainingSupply.toString();
+  spellVars.metadataHash = metadata.metadataHash;
+  spellVars.scrollPolicy = metadata.scrollPolicy.toString();
+  spellVars.payPeriodSeconds = metadata.payPeriodSeconds.toString();
+  spellVars.compensationSats = metadata.compensationSats.toString();
+  
+  // Treasury change variables - Required for the Bitcoin output
+  spellVars.change_amount = MIN_OUTPUT_SATS.toString();
+  spellVars.treasury_hex_dest = treasuryHexDest;
+  spellVars.amount_0 = MIN_OUTPUT_SATS.toString(); // For backward compatibility
+  
+  // ----------------------------------------------------------------------------
+  // Step 8: Add worker outputs with HEX destination conversion (FIXED)
+  // CRITICAL FIX: Use Buffer.from() to avoid TypeScript error and convert address to hex
+  // ----------------------------------------------------------------------------
+  workerOutputs.forEach((worker, index) => {
+    const workerNum = index + 1;
+    
+    try {
+      // 1. Convert address to ScriptPubKey
+      const script = bitcoin.address.toOutputScript(worker.address, bitcoin.networks.testnet);
+      
+      // 2. FIX: Use Buffer.from() to avoid the "Expected 0 arguments" TS error
+      // This converts the 'tb1p...' address to a hex string for the YAML
+      spellVars[`worker_hex_dest_${workerNum}`] = Buffer.from(script).toString('hex');
+      
+      // 3. Add the token amount (1 token = 1 pay period)
+      spellVars[`worker_amount_${workerNum}`] = worker.tokenAmount.toString();
+      
+      // Log the conversion for debugging
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[buildMintToken.payroll] Converted worker ${workerNum} address to hex:`, {
+          address: worker.address.substring(0, 20) + '...',
+          hex: spellVars[`worker_hex_dest_${workerNum}`].substring(0, 40) + '...'
+        });
+      }
+    } catch (error: any) {
+      throw new ValidationError(`Invalid worker address at index ${index}: ${worker.address} - ${error.message}`);
+    }
+  });
+  
+  // Add total worker count for template loops
+  spellVars.worker_count = workerOutputs.length.toString();
+  
+  // ----------------------------------------------------------------------------
+  // Step 9: Add multi-sig support if present
+  // ----------------------------------------------------------------------------
+  if (request.multiSigSigners && request.multiSigSigners.length > 0) {
+    spellVars.multi_sig_signers = request.multiSigSigners.join(',');
+    spellVars.multi_sig_threshold = (request.multiSigThreshold || 2).toString();
+  }
+  
+  // ----------------------------------------------------------------------------
+  // Step 10: Verify all critical variables are present before returning
+  // ----------------------------------------------------------------------------
+  const requiredVars = [
+    'app_id', 'app_vk', 'plan_utxo', 'funding_utxo', 'anchor_utxo',
+    'ticker', 'current_supply', 'new_remaining', 'metadataHash',
+    'scrollPolicy', 'payPeriodSeconds', 'compensationSats',
+    'change_amount', 'treasury_hex_dest', 'worker_count'
+  ];
+  
+  const missingVars = requiredVars.filter(varName => !spellVars[varName]);
+  if (missingVars.length > 0) {
+    throw new ValidationError(
+      `Missing required variables for YAML template: ${missingVars.join(', ')}`
+    );
+  }
+  
+  // Also verify that worker hex destinations are actually hex (no 't' characters)
+  for (let i = 1; i <= workerOutputs.length; i++) {
+    const hexDest = spellVars[`worker_hex_dest_${i}`];
+    if (hexDest && /[^0-9a-f]/i.test(hexDest)) {
+      throw new ValidationError(
+        `worker_hex_dest_${i} contains non-hex characters. Value: ${hexDest.substring(0, 30)}...`
+      );
+    }
+  }
+  
+  // ----------------------------------------------------------------------------
+  // Step 11: Log variable summary (debug only)
+  // ----------------------------------------------------------------------------
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[buildMintToken.payroll] ✅ Template variables built:', {
+      appId: appId.substring(0, 16) + '...',
+      variableCount: Object.keys(spellVars).length,
+      workerCount: workerOutputs.length,
+      hasMultiSig: !!request.multiSigSigners,
+      requiredVariablesPresent: requiredVars.every(v => spellVars[v]),
+      sampleVariables: {
+        plan_utxo: spellVars.plan_utxo,
+        funding_utxo: spellVars.funding_utxo,
+        ticker: spellVars.ticker,
+        current_supply: spellVars.current_supply,
+        new_remaining: spellVars.new_remaining,
+        change_amount: spellVars.change_amount,
+        treasury_hex_dest: spellVars.treasury_hex_dest?.substring(0, 16) + '...',
+        worker_amount_1: spellVars.worker_amount_1,
+        worker_hex_dest_1: spellVars.worker_hex_dest_1?.substring(0, 40) + '...'
+      }
+    });
+  }
+  
+  return spellVars;
 }
 
 // --------------------------------------------------------------------------------

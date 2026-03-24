@@ -1,0 +1,375 @@
+// src/api/companies.ts
+import { Request, Response } from 'express';
+import { Database } from 'sqlite3';
+import * as crypto from 'crypto';
+
+const db = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
+
+// --------------------------------------------------------------------------------
+// Types
+// --------------------------------------------------------------------------------
+
+interface RegisterCompanyRequest {
+  employerAddress: string;   // HR manager's wallet address (primary key)
+  treasuryAddress: string;   // Wallet used for gas sponsorship
+  treasuryHexDest: string;   // Derived Taproot script hex (from wallet)
+}
+
+interface CompanyResponse {
+  employerAddress: string;
+  treasuryAddress: string;
+  treasuryHexDest: string;
+  createdAt: string;
+}
+
+// --------------------------------------------------------------------------------
+// Validation
+// --------------------------------------------------------------------------------
+
+function validateCompanyRequest(body: any): asserts body is RegisterCompanyRequest {
+  const required = ['employerAddress', 'treasuryAddress', 'treasuryHexDest'];
+  const missing = required.filter(field => !body[field]);
+  
+  if (missing.length > 0) {
+    throw new Error(`Missing required fields: ${missing.join(', ')}`);
+  }
+  
+  // Validate Bech32 address format (testnet or mainnet)
+  const addressRegex = /^(tb1|bc1)[a-zA-HJ-NP-Z0-9]{25,90}$/;
+  if (!addressRegex.test(body.employerAddress)) {
+    throw new Error('employerAddress must be a valid Bech32 address (tb1... or bc1...)');
+  }
+  
+  if (!addressRegex.test(body.treasuryAddress)) {
+    throw new Error('treasuryAddress must be a valid Bech32 address (tb1... or bc1...)');
+  }
+  
+  // Validate hex destination (should be hex string, even length, no 't' characters)
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(body.treasuryHexDest) || body.treasuryHexDest.length % 2 !== 0) {
+    throw new Error('treasuryHexDest must be a valid hex string (even number of hex characters)');
+  }
+  
+  // Taproot scriptPubKey should start with '5120' (P2TR)
+  if (!body.treasuryHexDest.startsWith('5120')) {
+    console.warn(`[WARNING] treasuryHexDest does not start with '5120' (Taproot prefix). Got: ${body.treasuryHexDest.substring(0, 4)}`);
+  }
+}
+
+// --------------------------------------------------------------------------------
+// API Handlers
+// --------------------------------------------------------------------------------
+
+/**
+ * Register a new company's infrastructure details
+ * POST /api/companies/register
+ */
+export async function registerCompany(req: Request, res: Response) {
+  const requestId = crypto.randomBytes(4).toString('hex');
+  console.log(`\n[COMPANY API:${requestId}] ===== START registerCompany =====`);
+  
+  try {
+    // Validate request body
+    validateCompanyRequest(req.body);
+    
+    const { employerAddress, treasuryAddress, treasuryHexDest } = req.body;
+    
+    console.log(`[COMPANY API:${requestId}] Registering company:`, {
+      employerAddress: `${employerAddress.substring(0, 20)}...`,
+      treasuryAddress: `${treasuryAddress.substring(0, 20)}...`,
+      treasuryHexDest: `${treasuryHexDest.substring(0, 30)}...`
+    });
+    
+    // Check if company already exists
+    const existing = await new Promise<boolean>((resolve, reject) => {
+      db.get(
+        'SELECT employerAddress FROM companies WHERE employerAddress = ?',
+        [employerAddress],
+        (err: Error | null, row: any) => {
+          if (err) reject(err);
+          else resolve(!!row);
+        }
+      );
+    });
+    
+    const now = new Date().toISOString();
+    
+    // Insert or replace company record
+    await new Promise<void>((resolve, reject) => {
+      const query = `
+        INSERT OR REPLACE INTO companies 
+        (employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt) 
+        VALUES (?, ?, ?, ?, ?)
+      `;
+      db.run(
+        query,
+        [employerAddress, treasuryAddress, treasuryHexDest, now, now],
+        (err: Error | null) => err ? reject(err) : resolve()
+      );
+    });
+    
+    console.log(`[COMPANY API:${requestId}] ✅ Company registered successfully`);
+    if (existing) {
+      console.log(`[COMPANY API:${requestId}] Updated existing company record`);
+    }
+    console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(200).json({
+      success: true,
+      message: existing ? 'Company infrastructure updated' : 'Company infrastructure registered',
+      data: {
+        employerAddress,
+        treasuryAddress,
+        treasuryHexDest: `${treasuryHexDest.substring(0, 20)}...`,
+        createdAt: now
+      }
+    });
+    
+  } catch (error: any) {
+    console.error(`[COMPANY API:${requestId}] ❌ ERROR:`, error.message);
+    console.error(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    const statusCode = error.message.includes('Missing') || error.message.includes('must be') ? 400 : 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.message,
+      requestId
+    });
+  }
+}
+
+/**
+ * Get company details by employer address
+ * GET /api/companies/:employerAddress
+ */
+export async function getCompany(req: Request, res: Response) {
+  const requestId = crypto.randomBytes(4).toString('hex');
+  const { employerAddress } = req.params;
+  
+  console.log(`\n[COMPANY API:${requestId}] ===== START getCompany =====`);
+  
+  try {
+    if (!employerAddress) {
+      throw new Error('employerAddress is required');
+    }
+    
+    console.log(`[COMPANY API:${requestId}] Fetching company: ${employerAddress.substring(0, 20)}...`);
+    
+    const company = await new Promise<CompanyResponse | null>((resolve, reject) => {
+      db.get(
+        'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt FROM companies WHERE employerAddress = ?',
+        [employerAddress],
+        (err: Error | null, row: any) => {
+          if (err) reject(err);
+          else resolve(row || null);
+        }
+      );
+    });
+    
+    if (!company) {
+      console.log(`[COMPANY API:${requestId}] Company not found`);
+      console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+      return res.status(404).json({
+        success: false,
+        error: 'Company not found',
+        employerAddress
+      });
+    }
+    
+    console.log(`[COMPANY API:${requestId}] ✅ Company found`);
+    console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(200).json({
+      success: true,
+      data: {
+        ...company,
+        treasuryHexDest: `${company.treasuryHexDest.substring(0, 20)}...` // Truncate for response
+      }
+    });
+    
+  } catch (error: any) {
+    console.error(`[COMPANY API:${requestId}] ❌ ERROR:`, error.message);
+    console.error(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      requestId
+    });
+  }
+}
+
+/**
+ * Get all companies (for admin dashboard)
+ * GET /api/companies
+ */
+export async function listCompanies(req: Request, res: Response) {
+  const requestId = crypto.randomBytes(4).toString('hex');
+  const { limit = '50', offset = '0' } = req.query;
+  
+  console.log(`\n[COMPANY API:${requestId}] ===== START listCompanies =====`);
+  
+  try {
+    const companies = await new Promise<CompanyResponse[]>((resolve, reject) => {
+      db.all(
+        'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
+        [parseInt(limit as string), parseInt(offset as string)],
+        (err: Error | null, rows: any[]) => {
+          if (err) reject(err);
+          else resolve(rows || []);
+        }
+      );
+    });
+    
+    console.log(`[COMPANY API:${requestId}] Found ${companies.length} companies`);
+    console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    // Truncate hex destinations for response
+    const sanitized = companies.map(c => ({
+      ...c,
+      treasuryHexDest: `${c.treasuryHexDest.substring(0, 20)}...`
+    }));
+    
+    return res.status(200).json({
+      success: true,
+      count: companies.length,
+      data: sanitized
+    });
+    
+  } catch (error: any) {
+    console.error(`[COMPANY API:${requestId}] ❌ ERROR:`, error.message);
+    console.error(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      requestId
+    });
+  }
+}
+
+/**
+ * Delete a company (admin only - use with caution)
+ * DELETE /api/companies/:employerAddress
+ */
+export async function deleteCompany(req: Request, res: Response) {
+  const requestId = crypto.randomBytes(4).toString('hex');
+  const { employerAddress } = req.params;
+  
+  console.log(`\n[COMPANY API:${requestId}] ===== START deleteCompany =====`);
+  console.log(`[COMPANY API:${requestId}] Deleting: ${employerAddress?.substring(0, 20)}...`);
+  
+  try {
+    if (!employerAddress) {
+      throw new Error('employerAddress is required');
+    }
+    
+    // Check if company exists
+    const exists = await new Promise<boolean>((resolve, reject) => {
+      db.get(
+        'SELECT employerAddress FROM companies WHERE employerAddress = ?',
+        [employerAddress],
+        (err: Error | null, row: any) => {
+          if (err) reject(err);
+          else resolve(!!row);
+        }
+      );
+    });
+    
+    if (!exists) {
+      console.log(`[COMPANY API:${requestId}] Company not found`);
+      console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+      return res.status(404).json({
+        success: false,
+        error: 'Company not found'
+      });
+    }
+    
+    // Delete company
+    await new Promise<void>((resolve, reject) => {
+      db.run(
+        'DELETE FROM companies WHERE employerAddress = ?',
+        [employerAddress],
+        (err: Error | null) => err ? reject(err) : resolve()
+      );
+    });
+    
+    console.log(`[COMPANY API:${requestId}] ✅ Company deleted`);
+    console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(200).json({
+      success: true,
+      message: 'Company deleted successfully',
+      employerAddress
+    });
+    
+  } catch (error: any) {
+    console.error(`[COMPANY API:${requestId}] ❌ ERROR:`, error.message);
+    console.error(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      requestId
+    });
+  }
+}
+
+/**
+ * Update company's treasury hex destination
+ * PATCH /api/companies/:employerAddress/treasury
+ */
+export async function updateTreasuryHex(req: Request, res: Response) {
+  const requestId = crypto.randomBytes(4).toString('hex');
+  const { employerAddress } = req.params;
+  const { treasuryHexDest } = req.body;
+  
+  console.log(`\n[COMPANY API:${requestId}] ===== START updateTreasuryHex =====`);
+  
+  try {
+    if (!employerAddress) {
+      throw new Error('employerAddress is required');
+    }
+    
+    if (!treasuryHexDest) {
+      throw new Error('treasuryHexDest is required');
+    }
+    
+    // Validate hex
+    const hexRegex = /^[0-9a-fA-F]+$/;
+    if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+      throw new Error('treasuryHexDest must be a valid hex string (even number of hex characters)');
+    }
+    
+    const now = new Date().toISOString();
+    
+    await new Promise<void>((resolve, reject) => {
+      db.run(
+        'UPDATE companies SET treasuryHexDest = ?, updatedAt = ? WHERE employerAddress = ?',
+        [treasuryHexDest, now, employerAddress],
+        (err: Error | null) => err ? reject(err) : resolve()
+      );
+    });
+    
+    console.log(`[COMPANY API:${requestId}] ✅ Treasury hex updated`);
+    console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    return res.status(200).json({
+      success: true,
+      message: 'Treasury hex destination updated',
+      employerAddress,
+      treasuryHexDest: `${treasuryHexDest.substring(0, 20)}...`
+    });
+    
+  } catch (error: any) {
+    console.error(`[COMPANY API:${requestId}] ❌ ERROR:`, error.message);
+    console.error(`[COMPANY API:${requestId}] ===== END =====\n`);
+    
+    const statusCode = error.message.includes('required') ? 400 : 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.message,
+      requestId
+    });
+  }
+}

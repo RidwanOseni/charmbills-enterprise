@@ -1,0 +1,2 @@
+n/${app_id}/${app_vk}: "${anchor_utxo}"
+t/${app_id}/${app_vk}: "${anchor_utxo}"

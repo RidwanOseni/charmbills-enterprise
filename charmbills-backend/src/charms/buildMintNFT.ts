@@ -8,7 +8,6 @@ import * as crypto from 'crypto';
 const APP_VK = process.env.HARDCODED_APP_VK || constants.HARDCODED_APP_VK;
 const DEFAULT_TICKER = constants.PAYROLL_NFT_TICKER || "CHARMS-PAY";
 const MIN_OUTPUT_SATS = constants.MIN_OUTPUT_SATS || 1000;
-const PROTOCOL_VERSION = 8;
 
 // --------------------------------------------------------------------------------
 // Validation Errors
@@ -68,7 +67,7 @@ function validatePayrollRequest(request: SpellRequest): void {
     );
   }
   
-  // Check funding UTXO (now required for v0.12)
+  // v0.12 FIX: Check funding UTXO (now required and must be in spell inputs)
   if (!request.fundingUtxo) {
     throw new ValidationError('fundingUtxo is required for payroll NFT minting in v0.12');
   }
@@ -125,17 +124,20 @@ function validatePayrollRequest(request: SpellRequest): void {
 }
 
 // --------------------------------------------------------------------------------
-// Spell Builder
+// Spell Builder (Template Variables Version)
 // --------------------------------------------------------------------------------
 
 /**
- * Builds the Spell JSON for creating a Charms Inc. Plan NFT (Authority Object).
+ * Builds the template variables for creating a Charms Inc. Plan NFT (Authority Object).
+ * Instead of building the complete JSON, this returns variables that will be substituted
+ * into YAML templates via envsubst in proverClient.ts.
+ * 
  * Implements the Hybrid Metadata model for privacy and enforcement [1].
  * 
  * @param request - Validated spell request with payroll metadata
- * @returns Object containing the spell JSON and derived appId
+ * @returns Object containing template variables and derived appId
  */
-export function buildMintNFT(request: SpellRequest): { spell: any; appId: string } {
+export function buildMintNFT(request: SpellRequest): { spellVars: Record<string, string>; appId: string } {
   // ----------------------------------------------------------------------------
   // Step 1: Validate input
   // ----------------------------------------------------------------------------
@@ -152,80 +154,73 @@ export function buildMintNFT(request: SpellRequest): { spell: any; appId: string
   const output = request.outputs[0];
   const metadata = output.nftMetadata!;
   
-  // Use provided ticker or default (ensure it's a string)
+  // Use provided ticker or default
   const ticker = metadata.ticker || DEFAULT_TICKER;
   
-  // Remaining supply (default 1 for single authority NFT)
+  // Remaining supply (default to 1 unless specified)
   const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
   
+  // Get treasury hex destination from environment
+  const treasuryHexDest = process.env.PAYROLL_TREASURY_HEX_DEST;
+  if (!treasuryHexDest) {
+    throw new ValidationError('PAYROLL_TREASURY_HEX_DEST environment variable is required');
+  }
+  
   // ----------------------------------------------------------------------------
-  // Step 4: Build spell JSON with v0.12 changes
+  // Step 4: Build template variables for envsubst
+  // These variables will replace placeholders in the YAML templates
   // ----------------------------------------------------------------------------
-  const spell = {
-    version: PROTOCOL_VERSION,
+  const spellVars: Record<string, string> = {
+    // App identifiers
+    app_id: appId,
+    app_vk: APP_VK,
     
-    // Define the NFT app with tag 'n' (NFT) and derived identity [5]
-    apps: {
-      "$00": `n/${appId}/${APP_VK}`
-    },
+    // UTXO inputs
+    in_utxo_0: request.anchorUtxo!,
+    funding_utxo: request.fundingUtxo!,
     
-    // Private input links the app identity to the specific anchor UTXO [7, 8]
-    private_inputs: {
-      "$00": request.anchorUtxo
-    },
+    // NFT metadata fields
+    ticker: ticker,
+    remaining: remaining.toString(),
+    metadataHash: metadata.metadataHash,
+    scrollPolicy: metadata.scrollPolicy.toString(),
+    payPeriodSeconds: metadata.payPeriodSeconds.toString(),
+    compensationSats: metadata.compensationSats.toString(),
     
-    // FIX v0.12: Both anchor UTXO and funding UTXO must be in the ins array
-    ins: [
-      {
-        utxo_id: request.anchorUtxo,
-        charms: {} // Initial minting has no charms in input [6]
-      },
-      {
-        utxo_id: request.fundingUtxo, // FIX: Move funding UTXO into the spell inputs
-        charms: {} // Plain BTC inputs have empty charms
-      }
-    ],
+    // Native Bitcoin output (treasury)
+    dest_0: treasuryHexDest,
+    amount_0: MIN_OUTPUT_SATS.toString(),
     
-    // Outputs array: exactly one NFT output
-    outs: [
-      {
-        address: output.address,
-        charms: {
-          "$00": {
-            // Core identifiers
-            ticker: ticker,
-            remaining: remaining,
-            
-            // Enforcement fields (used by Rust contract)
-            metadataHash: metadata.metadataHash,   // SHA256 of encrypted IPFS JSON [1]
-            scrollPolicy: metadata.scrollPolicy,   // 0=Time, 1=Proof
-            payPeriodSeconds: metadata.payPeriodSeconds,
-            compensationSats: metadata.compensationSats
-          }
-        },
-        // NFT must meet dust limit [9]
-        sats: MIN_OUTPUT_SATS
-      }
-    ]
+    // Change address (for remaining BTC)
+    change_address: request.changeAddress
   };
+  
+  // Add optional multi-sig fields if present
+  if (request.multiSigSigners && request.multiSigSigners.length > 0) {
+    spellVars.multi_sig_signers = request.multiSigSigners.join(',');
+    spellVars.multi_sig_threshold = (request.multiSigThreshold || 2).toString();
+  }
   
   // ----------------------------------------------------------------------------
   // Step 5: Logging (debug only, remove in production)
   // ----------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
-    console.log('[buildMintNFT.payroll] ✅ Spell built successfully:', {
+    console.log('[buildMintNFT.payroll] ✅ Template variables built:', {
       appId,
       ticker,
+      remaining,
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       payPeriodSeconds: metadata.payPeriodSeconds,
       compensationSats: metadata.compensationSats,
       metadataHash: metadata.metadataHash.substring(0, 16) + '...',
       anchorUtxo: request.anchorUtxo,
-      fundingUtxo: request.fundingUtxo
+      fundingUtxo: request.fundingUtxo,
+      treasuryDest: treasuryHexDest.substring(0, 16) + '...',
+      hasMultiSig: !!request.multiSigSigners
     });
   }
   
-  return { spell, appId };
+  return { spellVars, appId };
 }
 
 // --------------------------------------------------------------------------------
@@ -337,6 +332,7 @@ export function createTestPayrollRequest(): SpellRequest {
     payPeriodSeconds: 1209600, // 2 weeks
     compensationSats: 5000000, // 5M sats
     ticker: 'PAY-TEST',
+    remaining: 1, // Single authority NFT
     multiSigSigners: ['key1', 'key2', 'key3'],
     multiSigThreshold: 2
   });

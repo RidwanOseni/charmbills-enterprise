@@ -101,4 +101,10 @@ coverage/
 # But ignore these specific JSON files
 package-lock.json
 yarn.lock
-pnpm-lock.yaml
+pnpm-lock.yamlrun_test.sh
+generate-hex.ts
+anchor_hex.txt
+debug/
+*.log
+transactions/*.json
+run_test.sh
