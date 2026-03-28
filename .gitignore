@@ -108,3 +108,4 @@ debug/
 *.log
 transactions/*.json
 run_test.sh
+*.db
