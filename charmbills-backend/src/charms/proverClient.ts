@@ -533,19 +533,25 @@ export async function batchPayroll(
     fundingUtxo: { utxo: string; value: number },
     changeAddress: string,
     appId: string,
-    anchorUtxo: string,
-    treasuryHexDest: string,
+    employerAddress: string,  // ✅ Added: Employer address for NFT return
+    planMetadata: any,         // ✅ Added: Plan NFT metadata for return output
+    treasuryHexDest: string,   // ✅ Added: Treasury hex destination
     multiSigSigners?: string[]
 ): Promise<ProverResult> {
     const request: SpellRequest = {
         type: 'mint-token',
         authorityUtxo: planUtxo,
-        anchorUtxo: anchorUtxo,
+        anchorUtxo: process.env.PAYROLL_ANCHOR_UTXO,
         fundingUtxo: fundingUtxo.utxo,
         fundingUtxoValue: fundingUtxo.value,
         changeAddress: changeAddress,
         feeRate: constants.DEFAULT_FEE_RATE,
-        outputs: workers.map(w => ({ address: w.address, tokenAmount: w.amount })),
+        outputs: [
+            // 1. Worker tokens (M employees)
+            ...workers.map(w => ({ address: w.address, tokenAmount: w.amount })),
+            // 2. NFT return to employer (Authority return) ✅
+            { address: employerAddress, nftMetadata: planMetadata }
+        ],
         ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
     };
 

@@ -64,7 +64,7 @@ export default function EmployerDashboard() {
   // ============================================================
   const [registeredDepts, setRegisteredDepts] = useState<any[]>([]);
   const [setupDeptName, setSetupDeptName] = useState('');
-  const [setupBudget, setSetupBudget] = useState('100'); // ADDED: Budget field
+  const [setupBudget, setSetupBudget] = useState('100');
   const [setupFrequency, setSetupFrequency] = useState('biweekly');
   const [setupType, setSetupType] = useState('employee');
   const [isSettingUpDept, setIsSettingUpDept] = useState(false);
@@ -104,27 +104,20 @@ export default function EmployerDashboard() {
   const [currentPlanMetadata, setCurrentPlanMetadata] = useState<any>(null);
 
   // ============================================================
-  // Helper: Scan wallet for UTXO context (Fixes "Cannot read properties of undefined (reading 'fee')")
-  // This provides the anchor and fee UTXOs needed for sequential signing
-  // FIX: Use txid/vout check instead of referential equality to ensure UTXOs are different
+  // Helper: Scan wallet for UTXO context
   // ============================================================
   const getBtcContext = async () => {
     if (!address) throw new Error("Wallet not connected");
     
     console.log("[DEPARTMENT SETUP] Scanning wallet for UTXOs...");
     
-    // 1. Fetch all UTXOs for the connected Taproot address
     const response = await axios.get(`https://mempool.space/testnet4/api/address/${address}/utxo`);
     const utxos = response.data;
     
     console.log(`[DEPARTMENT SETUP] Found ${utxos.length} UTXOs`);
     
-    // 2. Find a UTXO >= 10,000 sats to act as the Anchor (for NFT identity)
     const anchorUtxo = utxos.find((u: any) => u.value >= 10000 && u.status.confirmed);
     
-    // 3. Find a separate UTXO >= 5,000 sats to pay for fees (sponsorship/funding)
-    // CRITICAL FIX: Use txid/vout check instead of referential equality
-    // The Mempool API returns new objects for every call, so u !== anchorUtxo would always be true
     const feeUtxo = utxos.find((u: any) => 
       u.value >= 5000 && 
       u.status.confirmed && 
@@ -142,7 +135,6 @@ export default function EmployerDashboard() {
     console.log("[DEPARTMENT SETUP] Selected anchor UTXO:", anchorUtxo.txid, `value: ${anchorUtxo.value}`);
     console.log("[DEPARTMENT SETUP] Selected fee UTXO:", feeUtxo.txid, `value: ${feeUtxo.value}`);
     
-    // 4. Fetch the raw hex for these UTXOs (Required for provenance in Taproot signing)
     const [anchorHex, feeHex] = await Promise.all([
       axios.get(`https://mempool.space/testnet4/api/tx/${anchorUtxo.txid}/hex`),
       axios.get(`https://mempool.space/testnet4/api/tx/${feeUtxo.txid}/hex`)
@@ -274,14 +266,12 @@ export default function EmployerDashboard() {
       return;
     }
     
-    // CRITICAL: Set loading state at the beginning - stays true throughout the entire ZK-proof generation (60-105 seconds)
     setIsSettingUpDept(true);
     
     try {
       console.log("[DEPARTMENT SETUP] Creating department:", setupDeptName);
       console.log("[DEPARTMENT SETUP] Budget:", budgetValue, "pay periods");
       
-      // Get UTXO context from wallet scanner (returns anchor and fee UTXOs)
       const btcContext = await getBtcContext();
       
       console.log("[DEPARTMENT SETUP] BTC Context obtained:", {
@@ -289,7 +279,6 @@ export default function EmployerDashboard() {
         fee: btcContext.fee.utxoId
       });
       
-      // Request wallet signature for encryption authority
       if (!(window as any).LeatherProvider) {
         throw new Error("Leather wallet not detected");
       }
@@ -310,24 +299,21 @@ export default function EmployerDashboard() {
         department: setupDeptName.toLowerCase(),
         ticker: `${setupDeptName.substring(0, 3).toUpperCase()}-PAY`,
         role: "Department Authority",
-        compensationSats: 1000, // Placeholder - specific salaries handled at hiring layer
+        compensationSats: 1000,
         payPeriodSeconds: frequencyToSeconds(setupFrequency),
         scrollPolicy: setupType === 'employee' ? 0 : 1,
-        remaining: budgetValue, // This sets the 'remaining' supply [11]
+        remaining: budgetValue,
         encryptionEntropy: sigRes.result.signature,
-        multiSigRequired: false // WORKAROUND: Force single-signer for demo [11, 12]
+        multiSigRequired: false
       };
       
-      // CRITICAL: Use axios directly with explicit timeout to ensure ZK-proof generation completes
-      // The backend timeout is 180 seconds, frontend must match or exceed
       const response = await axios.post('/api/plans/mint', payload, {
-        timeout: 180000, // 3 minutes timeout for ZK-proof generation
+        timeout: 180000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
       const proverResult: ProverResult = response.data;
       
-      // Pass the UTXO context to the signing function (required for sequential signing)
       const signingResult = await signAndBroadcastPackage(proverResult, btcContext);
       const txids = signingResult?.txids;
       
@@ -335,7 +321,6 @@ export default function EmployerDashboard() {
         setToast(`✅ ${setupDeptName} Department created with ${budgetValue} pay periods budget!`);
         await fetchPlans();
         
-        // Reset form
         setSetupDeptName('');
         setSetupBudget('100');
         setSetupFrequency('biweekly');
@@ -348,7 +333,6 @@ export default function EmployerDashboard() {
       console.error("[DEPARTMENT SETUP] Failed:", err.message);
       setToast(`❌ Department setup failed: ${err.message}`);
     } finally {
-      // CRITICAL: Only reset loading state AFTER the entire operation (including ZK-proof and signing) completes
       setIsSettingUpDept(false);
       setTimeout(() => setToast(''), 4000);
     }
@@ -356,6 +340,7 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // STAGE 2: New Hire (Assign Worker to Existing Department NFT)
+  // CRITICAL FIX: Ensure employerAddress is passed correctly [Source 227]
   // ============================================================
   const handleHire = async () => {
     if (!fullName || !selectedDeptId) {
@@ -368,7 +353,6 @@ export default function EmployerDashboard() {
       return;
     }
     
-    // CRITICAL: Set processing state at the beginning - stays true throughout ZK-proof generation
     setIsProcessing(true);
     
     try {
@@ -379,7 +363,6 @@ export default function EmployerDashboard() {
       
       console.log("[HIRING] Hiring", fullName, "to", dept.department);
       
-      // Get UTXO context for fee payment (batch hiring needs funding UTXO)
       const btcContext = await getBtcContext();
       
       if (!(window as any).LeatherProvider) {
@@ -392,12 +375,13 @@ export default function EmployerDashboard() {
         network: "testnet"
       });
       
+      // CRITICAL FIX: Use the connected wallet address (address) as employerAddress [Source 227]
       const payload = {
         authorityUtxo: dept.nftUtxoId,
-        authorityTxHex: btcContext.anchor.hex, // Use anchor hex for authority provenance
+        authorityTxHex: btcContext.anchor.hex,
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
-        employerAddress: address,
+        employerAddress: address, // ✅ The connected wallet address
         workers: [{ 
           address: bitcoinAddress, 
           periods: 1,
@@ -411,9 +395,10 @@ export default function EmployerDashboard() {
         encryptionEntropy: sigRes.result.signature
       };
       
-      // CRITICAL: Use axios directly with explicit timeout for ZK-proof generation
+      console.log("[HIRING] Payload employerAddress:", payload.employerAddress);
+      
       const response = await axios.post('/api/payrollhiring/mint', payload, {
-        timeout: 180000, // 3 minutes timeout for ZK-proof generation
+        timeout: 180000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
@@ -426,7 +411,6 @@ export default function EmployerDashboard() {
         setToast(`✅ ${fullName} hired to ${dept.department}!`);
         await refreshWorkers();
         
-        // Reset form
         setFullName('');
         setRole('');
         setSalary('');
@@ -440,7 +424,6 @@ export default function EmployerDashboard() {
       console.error("[HIRING] Failed:", err.message);
       setToast(`❌ Hire failed: ${err.message}`);
     } finally {
-      // CRITICAL: Only reset processing state AFTER the entire operation completes
       setIsProcessing(false);
       setTimeout(() => setToast(''), 4000);
     }
@@ -448,6 +431,7 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // Batch Token Issuance (Pay Your Team - All at Once)
+  // CRITICAL FIX: Ensure employerAddress is passed correctly [Source 227]
   // ============================================================
   const handleIssueTokens = async () => {
     if (selectedWorkers.size === 0) {
@@ -465,34 +449,36 @@ export default function EmployerDashboard() {
       return;
     }  
     
-    // CRITICAL: Set processing state at the beginning - stays true throughout ZK-proof generation
     setIsProcessing(true);
 
     try {
       const workerList = workers.filter(w => selectedWorkers.has(w.wallet));
       const periods = parseInt(selectedPeriods);
       
-      // Get UTXO context for fee payment
       const btcContext = await getBtcContext();
 
+      // CRITICAL FIX: Use the connected wallet address (address) as employerAddress [Source 227]
       const payload = {
         authorityUtxo: currentPlanNftUtxo,
         authorityTxHex: btcContext.anchor.hex,
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
+        employerAddress: address, // ✅ The connected wallet address
         workers: workerList.map(w => ({ 
           address: w.wallet, 
           periods,
           salarySats: w.salarySats || 5000000,
           role: w.role || "Team Member"
         })),
-        employerAddress: address,
-        planMetadata: currentPlanMetadata
+        planMetadata: currentPlanMetadata,
+        encryptionEntropy: "placeholder" // Will be handled by backend
       };
 
-      // CRITICAL: Use axios directly with explicit timeout for ZK-proof generation
+      console.log("[BATCH MINT] Payload employerAddress:", payload.employerAddress);
+      console.log("[BATCH MINT] Workers count:", payload.workers.length);
+
       const response = await axios.post('/api/payrollhiring/mint', payload, {
-        timeout: 180000, // 3 minutes timeout for ZK-proof generation
+        timeout: 180000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
@@ -510,7 +496,6 @@ export default function EmployerDashboard() {
       console.error("Batch minting failed:", err.message);
       setToast(`❌ Batch minting failed: ${err.message}`);
     } finally {
-      // CRITICAL: Only reset processing state AFTER the entire operation completes
       setIsProcessing(false);
       setTimeout(() => setToast(''), 4000);
     }
@@ -1014,12 +999,12 @@ export default function EmployerDashboard() {
                   <Table>
                     <TableBody>
                       {deptWorkers.map((worker: any) => (
-                        <TableRow key={worker.wallet} className="border-b border-border/50 last:border-b-0 hover:bg-muted/20">
+                        <TableRow key={worker.walletAddress} className="border-b border-border/50 last:border-b-0 hover:bg-muted/20">
                           <TableCell className="py-2 pl-0 w-6">
                             <input
                               type="checkbox"
-                              checked={selectedWorkers.has(worker.wallet)}
-                              onChange={() => toggleWorkerSelection(worker.wallet)}
+                              checked={selectedWorkers.has(worker.walletAddress)}
+                              onChange={() => toggleWorkerSelection(worker.walletAddress)}
                               className="w-4 h-4 rounded border-border"
                               disabled={isProcessing}
                             />
@@ -1143,10 +1128,7 @@ export default function EmployerDashboard() {
               </TableHeader>
               <TableBody>
                 {filteredByStatus.map((worker: any) => (
-                  <TableRow
-                    key={worker.wallet}
-                    className="border-b border-border hover:bg-muted/30 transition"
-                  >
+                  <TableRow key={worker.walletAddress} className="border-b border-border hover:bg-muted/30 transition">
                     <TableCell className="font-medium text-foreground">{worker.name || 'Unnamed'}</TableCell>
                     <TableCell className="text-foreground">{worker.role}</TableCell>
                     <TableCell>
@@ -1183,7 +1165,7 @@ export default function EmployerDashboard() {
                         variant="ghost" 
                         size="sm" 
                         className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                        onClick={() => handleTerminate(worker.wallet)}
+                        onClick={() => handleTerminate(worker.walletAddress)}
                       >
                         Terminate
                       </Button>

@@ -237,6 +237,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     }
     
     console.log(`[HIRING API:${requestId}] ✅ Company found`);
+    console.log(`[HIRING API:${requestId}] Company treasuryHexDest: ${company.treasuryHexDest.substring(0, 30)}...`);
     
     // ----------------------------------------------------------------------------
     // Step 4: Verify Plan NFT is still unspent
@@ -267,11 +268,11 @@ export async function mintPayrollToken(req: Request, res: Response) {
       const worker = workers[i];
       console.log(`[HIRING API:${requestId}]   Worker ${i + 1}: ${worker.address.substring(0, 16)}... (${worker.role})`);
       
-      // Encrypt worker-specific data using wallet entropy
+      // Encrypt worker-specific data using wallet entropy (REAL SALARY is used here)
       const encryptedWorkerData = encryptPayrollData({
         walletAddress: worker.address,
         role: worker.role,
-        salarySats: worker.salarySats,
+        salarySats: worker.salarySats,  // REAL SALARY for IPFS encryption
         department: planMetadata.ticker?.replace('-PAY', '') || 'Unknown',
         hiredAt: new Date().toISOString(),
         periods: worker.periods || 1
@@ -296,7 +297,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
             null,
             new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString(),
             metadataHash,
-            worker.salarySats,
+            worker.salarySats,  // REAL SALARY stored in DB
             worker.role
           ],
           (err: Error | null) => err ? reject(err) : resolve(null)
@@ -396,35 +397,64 @@ export async function mintPayrollToken(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 13: Generate batch hiring transactions
-    // CRITICAL: Pass BOTH hex strings (authority + funding) to the prover
+    // Step 13: Create return metadata with placeholder compensationSats
+    // CRITICAL FIX: Use placeholder (>= 1000) for the Authority NFT return output [Source 269]
+    // The REAL salary is stored in IPFS and DB, but the on-chain NFT needs the placeholder
+    // to satisfy the Rust contract validation (compensation_sats >= 1000)
     // ----------------------------------------------------------------------------
-    console.log(`[HIRING API:${requestId}] Calling batchPayroll...`);
-    
-    // Create a temporary SpellRequest for batchPayroll that includes both UTXOs
-    const batchRequest: SpellRequest = {
-      type: 'mint-token',
-      authorityUtxo: authorityUtxo,
-      anchorUtxo: authorityUtxo,
-      fundingUtxo: funding.utxoId,
-      fundingUtxoValue: funding.value,
-      changeAddress: employerAddress,
-      feeRate: constants.DEFAULT_FEE_RATE,
-      outputs: workerAllocations.map(w => ({ address: w.address, tokenAmount: w.amount })),
+    const returnMetadata = {
+      ...planMetadata,
+      compensationSats: Math.max(planMetadata.compensationSats || 0, constants.MIN_OUTPUT_SATS || 1000)
     };
     
-    // Call generateUnsignedTransactions directly with both hexes
-    const result: ProverResult = await generateUnsignedTransactions(
-      batchRequest,
-      [cleanAuthorityTxHex, fundingTxHex], // BOTH must be raw hex strings
-      company.treasuryHexDest,
-      planMetadata.appId
+    console.log(`[HIRING API:${requestId}] Return metadata prepared:`, {
+      appId: returnMetadata.appId.substring(0, 16) + '...',
+      remaining: returnMetadata.remaining,
+      compensationSats: returnMetadata.compensationSats,
+      isPlaceholder: returnMetadata.compensationSats === (constants.MIN_OUTPUT_SATS || 1000)
+    });
+    
+    // ----------------------------------------------------------------------------
+    // Step 14: Generate batch hiring transactions
+    // CRITICAL: Pass ALL required parameters to batchPayroll
+    // The updated batchPayroll expects:
+    // - planUtxo: authorityUtxo
+    // - workers: workerAllocations
+    // - fundingUtxo: funding
+    // - changeAddress: employerAddress (or treasury address for change)
+    // - appId: planMetadata.appId
+    // - employerAddress: Where to return the Plan NFT
+    // - planMetadata: returnMetadata (with placeholder compensationSats)
+    // - treasuryHexDest: company.treasuryHexDest
+    // ----------------------------------------------------------------------------
+    console.log(`[HIRING API:${requestId}] Calling batchPayroll...`);
+    console.log(`[HIRING API:${requestId}] batchPayroll parameters:`, {
+      planUtxo: authorityUtxo.substring(0, 30) + '...',
+      workerCount: workerAllocations.length,
+      fundingUtxo: funding.utxoId,
+      changeAddress: employerAddress.substring(0, 20) + '...',
+      appId: planMetadata.appId.substring(0, 16) + '...',
+      employerAddress: employerAddress.substring(0, 20) + '...',
+      returnMetadataCompensation: returnMetadata.compensationSats,
+      treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...'
+    });
+    
+    const result = await batchPayroll(
+      authorityUtxo,                           // planUtxo
+      workerAllocations,                       // workers
+      { utxo: funding.utxoId, value: funding.value }, // fundingUtxo
+      employerAddress,                         // changeAddress (for Bitcoin change)
+      planMetadata.appId,                      // appId
+      employerAddress,                         // employerAddress (where NFT returns)
+      returnMetadata,                          // planMetadata (with placeholder compensationSats) ✅
+      company.treasuryHexDest,                 // treasuryHexDest
+      undefined                                // multiSigSigners
     );
     
     console.log(`[HIRING API:${requestId}] ✅ Transactions generated`);
     
     // ----------------------------------------------------------------------------
-    // Step 14: Return success response
+    // Step 15: Return success response
     // ----------------------------------------------------------------------------
     const response = {
       ...result,
@@ -438,13 +468,15 @@ export async function mintPayrollToken(req: Request, res: Response) {
       authorityUtxo: authorityUtxo,
       utxoVerification: { verified: true, unspent: true },
       workerMetadataHashes,
-      requestId
+      requestId,
+      returnMetadataCompensation: returnMetadata.compensationSats  // Include for debugging
     };
     
     console.log(`[HIRING API:${requestId}] ===== SUCCESS =====`);
     console.log(`  Workers: ${workers.length}`);
     console.log(`  Tokens: ${totalTokens}`);
     console.log(`  Remaining: ${newRemainingSupply}`);
+    console.log(`  Return NFT compensationSats: ${returnMetadata.compensationSats}`);
     console.log(`[HIRING API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json(response);

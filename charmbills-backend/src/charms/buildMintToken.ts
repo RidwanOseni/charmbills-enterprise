@@ -88,6 +88,7 @@ function validateBatchMintRequest(request: SpellRequest): void {
 
 /**
  * Separates worker outputs from NFT return output with validation
+ * FIX: Applies 1,000 sat placeholder for Unified Model if compensationSats is missing [Source 169, 269]
  */
 function separateOutputs(request: SpellRequest): {
   workerOutputs: Array<{ address: string; tokenAmount: number }>;
@@ -118,7 +119,13 @@ function separateOutputs(request: SpellRequest): {
 
   const metadata = nftReturnOutput.nftMetadata!;
   
-  // Validate required enforcement fields
+  // [FIXED VALIDATION] Apply 1,000 sat placeholder for Unified Model [Source 269]
+  if (metadata.compensationSats === undefined || metadata.compensationSats < MIN_OUTPUT_SATS) {
+    console.log('[buildMintToken.payroll] ℹ️ Applying 1,000 sat placeholder for Unified Model');
+    metadata.compensationSats = MIN_OUTPUT_SATS; // Set to 1,000 to satisfy contract
+  }
+  
+  // Validate required enforcement fields (now compensationSats is guaranteed to exist)
   if (!metadata.metadataHash) {
     throw new ValidationError('NFT return output missing metadataHash');
   }
@@ -129,10 +136,6 @@ function separateOutputs(request: SpellRequest): {
 
   if (!metadata.payPeriodSeconds || metadata.payPeriodSeconds <= 0) {
     throw new ValidationError('NFT return output missing valid payPeriodSeconds');
-  }
-
-  if (!metadata.compensationSats || metadata.compensationSats < MIN_OUTPUT_SATS) {
-    throw new ValidationError('NFT return output missing valid compensationSats');
   }
 
   // Validate remaining supply
@@ -231,7 +234,7 @@ export function buildMintToken(
   }
 
   // ----------------------------------------------------------------------------
-  // Step 3: Separate and validate outputs
+  // Step 3: Separate and validate outputs (with placeholder fix applied)
   // ----------------------------------------------------------------------------
   const { workerOutputs, nftReturnOutput } = separateOutputs(request);
   const metadata = nftReturnOutput.nftMetadata;
@@ -259,7 +262,8 @@ export function buildMintToken(
       authorityUtxo: request.authorityUtxo,
       fundingUtxo: request.fundingUtxo,
       anchorUtxo: anchorUtxo.substring(0, 32) + '...',
-      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...'
+      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
+      compensationSats: metadata.compensationSats
     });
   }
 
@@ -285,13 +289,14 @@ export function buildMintToken(
     payPeriodSeconds: (metadata.payPeriodSeconds ?? 0).toString(),
     
     // CRITICAL: Must be >= 1000 to satisfy Rust validation [Source 50]
-    compensationSats: Math.max(metadata.compensationSats || 0, 1000).toString(),
+    // Now guaranteed to be at least MIN_OUTPUT_SATS from separateOutputs fix
+    compensationSats: Math.max(metadata.compensationSats || 0, MIN_OUTPUT_SATS).toString(),
 
     // Treasury destinations [Source 231, 750]
     change_amount: MIN_OUTPUT_SATS.toString(),
     treasury_hex_dest: treasuryHexDest,
     amount_0: MIN_OUTPUT_SATS.toString() // Standard return amount for authority NFT 
-};
+  };
   
   // ----------------------------------------------------------------------------
   // Step 7: ADD ALL REQUIRED MAPPINGS FOR THE YAML TEMPLATE
@@ -402,6 +407,7 @@ export function buildMintToken(
         new_remaining: spellVars.new_remaining,
         change_amount: spellVars.change_amount,
         treasury_hex_dest: spellVars.treasury_hex_dest?.substring(0, 16) + '...',
+        compensationSats: spellVars.compensationSats,
         worker_amount_1: spellVars.worker_amount_1,
         worker_hex_dest_1: spellVars.worker_hex_dest_1?.substring(0, 40) + '...'
       }
