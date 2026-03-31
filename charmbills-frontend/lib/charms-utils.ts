@@ -51,6 +51,12 @@ export async function scanAddressForCharms(address: string) {
         // PROFESSIONAL FIX: Initialize the v12 WASM module correctly [6, 7]
         await initWasm();
 
+        // FIX: Validate address before API call [19]
+        if (!address || address === 'null' || address === 'undefined' || address.trim() === '') {
+            console.warn("[CHARMS SCAN] Scanner deferred: No valid address provided.");
+            return [];
+        }
+
         const utxoResponse = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
         const utxos = utxoResponse.data;
         const charmsAssets = [];
@@ -97,24 +103,43 @@ export async function scanAddressForCharms(address: string) {
 
 /**
  * Manual verification of UTXO status - Kept for debugging worker claims.
+ * FIX: Added address validation and proper error handling [19]
  */
 export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean, details: any }> {
+    // FIX: Validate UTXO ID before API call [19]
+    if (!utxoId || utxoId === 'null' || utxoId === 'undefined' || utxoId.trim() === '') {
+        console.warn("[UTXO VERIFY] Verification deferred: No valid UTXO ID provided.");
+        return { spent: true, details: { error: 'Invalid UTXO ID' } };
+    }
+    
     const [txid, vout] = utxoId.split(':');
+    
+    if (!txid || vout === undefined) {
+        console.warn(`[UTXO VERIFY] Invalid UTXO ID format: ${utxoId}`);
+        return { spent: true, details: { error: 'Invalid UTXO ID format' } };
+    }
+    
     try {
-        const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`);
-        const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`);
+        const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`, {
+            timeout: 10000
+        });
+        const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`, {
+            timeout: 10000
+        });
         
         return {
             spent: outspendResponse.data.spent,
             details: { ...outspendResponse.data, txDetails: txResponse.data }
         };
-    } catch (error) {
-        return { spent: true, details: { error: 'Verification failed' } };
+    } catch (error: any) {
+        console.error(`Failed to verify UTXO ${utxoId}:`, error.message);
+        return { spent: true, details: { error: `Verification failed: ${error.message}` } };
     }
 }
 
 /**
  * Helper function to provide user-friendly wallet status - Kept for frontend dashboard
+ * FIX: Added address validation to prevent invalid API calls [19]
  */
 export async function getWalletStatus(address: string): Promise<{
   totalBalance: number;
@@ -125,8 +150,24 @@ export async function getWalletStatus(address: string): Promise<{
   usedUtxos: number;
   unconfirmedUtxos: number;
 }> {
+  // FIX: Validate address before API call - prevents Axios 400 errors [19]
+  if (!address || address === 'null' || address === 'undefined' || address.trim() === '') {
+    console.warn("[WALLET] Scanner deferred: No valid address provided.");
+    return {
+      totalBalance: 0,
+      confirmedBalance: 0,
+      unconfirmedBalance: 0,
+      totalUtxos: 0,
+      freshUtxos: 0,
+      usedUtxos: 0,
+      unconfirmedUtxos: 0
+    };
+  }
+  
   try {
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
+    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
+      timeout: 10000
+    });
     const utxos = response.data;
     
     const usedUtxos = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
@@ -143,23 +184,43 @@ export async function getWalletStatus(address: string): Promise<{
     };
   } catch (error: any) {
     console.error('Failed to get wallet status:', error);
-    throw new Error(`Unable to fetch wallet status: ${error.message}`);
+    // Return zeroed stats instead of throwing to prevent UI crashes
+    return {
+      totalBalance: 0,
+      confirmedBalance: 0,
+      unconfirmedBalance: 0,
+      totalUtxos: 0,
+      freshUtxos: 0,
+      usedUtxos: 0,
+      unconfirmedUtxos: 0
+    };
   }
 }
 
 /**
  * DEBUG: Check all UTXOs for an address with spent status - Kept for frontend debugging
+ * FIX: Added address validation [19]
  */
 export async function debugUtxos(address: string): Promise<any> {
+  // FIX: Validate address before API call [19]
+  if (!address || address === 'null' || address === 'undefined' || address.trim() === '') {
+    console.warn("[DEBUG UTXO] Debug deferred: No valid address provided.");
+    return [];
+  }
+  
   try {
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
+    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
+      timeout: 10000
+    });
     const utxos = response.data;
     
     const detailedUtxos = await Promise.all(
       utxos.map(async (utxo: any) => {
         const utxoId = `${utxo.txid}:${utxo.vout}`;
         try {
-          const outspend = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/outspend/${utxo.vout}`);
+          const outspend = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/outspend/${utxo.vout}`, {
+            timeout: 5000
+          });
           const isUsed = isUtxoUsed(utxoId);
           
           // Determine status based on conditions
@@ -179,7 +240,7 @@ export async function debugUtxos(address: string): Promise<any> {
             spentByTxid: outspend.data.txid,
             locallyTracked: isUsed,
             status: status,
-            timestamp: utxo.status?.block_time // Also add timestamp here for debug
+            timestamp: utxo.status?.block_time
           };
         } catch (error) {
           return {

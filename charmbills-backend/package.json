@@ -4,12 +4,11 @@
   "main": "src/index.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts",
+    "dev": "ts-node -r dotenv/config -r tsconfig-paths/register src/index.ts",
     "dev:plan": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts",
     "dev:hiring": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts --phase2-only",
     "dev:freelancer": "ts-node -r dotenv/config -r tsconfig-paths/register src/runMintFlow.ts --freelancer",
-    "start:backend": "ts-node -r dotenv/config -r tsconfig-paths/register src/index.ts",
-    "start": "npm run start:backend",
+    "start": "ts-node -r dotenv/config -r tsconfig-paths/register src/index.ts",
     "build": "tsc",
     "clean": "rm -rf dist transactions/*.json",
     "prover:test": "ts-node -r dotenv/config src/test-prover.ts"
@@ -24,7 +23,7 @@
     "@types/express": "^5.0.6",
     "axios": "^1.13.2",
     "bitcoinjs-lib": "^7.0.1",
-    "cbor-x": "^1.6.0",
+    "cbor": "^10.0.12",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "ecpair": "^3.0.1",
@@ -36,6 +35,7 @@
   },
   "devDependencies": {
     "@types/bitcoinjs-lib": "^4.0.1",
+    "@types/cbor": "^5.0.1",
     "@types/cors": "^2.8.19",
     "@types/node": "^25.0.2",
     "@types/sqlite3": "^5.1.0",

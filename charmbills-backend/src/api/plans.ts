@@ -3,6 +3,7 @@ import { Database } from 'sqlite3';
 import { generateUnsignedTransactions } from '../charms/proverClient'; 
 import { encryptPayrollData } from '@shared/encryption';
 import { pinToIPFS } from '../lib/ipfs-pinner';
+import { fetchTransactionHex } from '../lib/utxo-manager';
 import { SpellRequest, ProverResult } from '@shared/types';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
@@ -22,19 +23,20 @@ interface CreatePayrollPlanRequest {
   fundingValue: number;         // Value of the funding UTXO in sats
   employerAddress: string;      // Where the Plan NFT will be sent
   
-  // Payroll configuration
-  department: string;
-  role: string;
+  // Payroll configuration (Unified Departmental NFT Model)
+  department: string;            // Department name (e.g., "Engineering")
   
-  // Enforcement fields
-  compensationSats: number;
-  payPeriodSeconds: number;
-  scrollPolicy: 0 | 1;
+  // Enforcement fields (salary removed - now in encrypted IPFS per worker)
+  payPeriodSeconds: number;      // Pay frequency (e.g., 1209600 for 2 weeks)
+  scrollPolicy: 0 | 1;           // 0=Time-based, 1=Proof-based
+  
+  // Department budget (total pay periods this department can issue)
+  remaining: number;             // Total pay periods budget (e.g., 100) [14]
   
   // PRODUCTION FIELDS - Non-custodial encryption [3, 4]
-  encryptionEntropy: string;    // From wallet signature - NO .env key
+  encryptionEntropy: string;     // From wallet signature - NO .env key
   
-  // Multi-sig support (optional)
+  // Multi-sig support (optional) [5, 6]
   multiSigRequired?: boolean;
   multiSigSigners?: string[];
   multiSigThreshold?: number;
@@ -56,10 +58,11 @@ interface CompanyRecord {
 }
 
 // --------------------------------------------------------------------------------
-// Validation Functions
+// Validation Functions - UPDATED for Unified Departmental NFT Model
 // --------------------------------------------------------------------------------
 
 function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPlanRequest {
+  // Updated required fields - includes 'remaining' for department budget [14]
   const required = [
     // Bitcoin UTXO data - MUST BE PROVIDED BY FRONTEND [1, 2]
     'anchorUtxo', 
@@ -69,14 +72,15 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
     'fundingValue',
     'employerAddress',
     
-    // Payroll configuration
-    'department', 
-    'role',
+    // Payroll configuration (Unified Departmental Model)
+    'department',
     
-    // Enforcement fields
-    'compensationSats', 
+    // Enforcement fields (salary removed)
     'payPeriodSeconds', 
     'scrollPolicy',
+    
+    // Department budget
+    'remaining',
     
     // Non-custodial encryption - REQUIRED, no .env fallback [3, 4]
     'encryptionEntropy'
@@ -100,16 +104,17 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
     throw new Error(`fundingValue must be a number >= ${constants.MIN_OUTPUT_SATS}`);
   }
   
-  if (typeof body.compensationSats !== 'number' || body.compensationSats < constants.MIN_OUTPUT_SATS) {
-    throw new Error(`compensationSats must be a number >= ${constants.MIN_OUTPUT_SATS}`);
-  }
-  
   if (typeof body.payPeriodSeconds !== 'number' || body.payPeriodSeconds <= 0) {
     throw new Error('payPeriodSeconds must be a positive number');
   }
   
   if (![0, 1].includes(body.scrollPolicy)) {
     throw new Error('scrollPolicy must be 0 (Time) or 1 (Proof)');
+  }
+  
+  // Validate remaining (department budget) [14]
+  if (typeof body.remaining !== 'number' || body.remaining <= 0) {
+    throw new Error('remaining must be a positive number (total pay periods budget)');
   }
   
   // Validate hex strings
@@ -129,6 +134,11 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
   // Validate encryptionEntropy is a non-empty string [3]
   if (typeof body.encryptionEntropy !== 'string' || body.encryptionEntropy.length === 0) {
     throw new Error('encryptionEntropy must be a non-empty string from wallet signature');
+  }
+  
+  // Validate department is a non-empty string
+  if (typeof body.department !== 'string' || body.department.trim().length === 0) {
+    throw new Error('department must be a non-empty string');
   }
   
   // Validate multiSigSigners if provided
@@ -173,32 +183,31 @@ async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRec
 }
 
 /**
- * Save plan record with employer reference
+ * Save plan record with employer reference - UPDATED for Unified Model
+ * Now includes remaining field (department budget)
  */
 async function savePlanRecord(
   appId: string,
   planUtxo: string,
   employerAddress: string,
   department: string,
-  role: string,
-  compensationSats: number,
   payPeriodSeconds: number,
+  remaining: number,
   metadataHash: string,
   scrollPolicy: number
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     db.run(
-      `INSERT INTO plans (appId, nftUtxoId, ticker, employerAddress, department, role, compensationSats, payPeriodSeconds, metadataHash, scrollPolicy, createdAt, updatedAt) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO plans (appId, nftUtxoId, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt, updatedAt) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         appId, 
         planUtxo, 
         constants.PAYROLL_NFT_TICKER, 
         employerAddress,
         department, 
-        role, 
-        compensationSats, 
         payPeriodSeconds, 
+        remaining,
         metadataHash, 
         scrollPolicy, 
         new Date().toISOString(),
@@ -217,7 +226,10 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
   multiSigSigners?: string[];
   multiSigThreshold?: number;
 } {
-  if (!multiSigRequired) return {};
+  // Default to false if not provided [5, 6]
+  const isMultiSigRequired = multiSigRequired === true;
+  
+  if (!isMultiSigRequired) return {};
 
   // Prioritize dynamic signers passed in request for flexibility [4, 5]
   if (requestSigners && requestSigners.length >= 2) {
@@ -232,12 +244,19 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
 }
 
 // --------------------------------------------------------------------------------
-// Main API Handler - PRODUCTION VERSION
+// Main API Handler - PRODUCTION VERSION (Unified Departmental NFT Model)
 // --------------------------------------------------------------------------------
 
 /**
  * Creates a Departmental Plan NFT with Hybrid Metadata.
  * Endpoint: POST /api/plans/mint
+ * 
+ * UNIFIED DEPARTMENTAL NFT MODEL:
+ * 1. One NFT per department (e.g., "Engineering")
+ * 2. No salary or role in on-chain enforcement
+ * 3. Salary enforcement moved to Scroll Settlement Layer
+ * 4. Individual worker salaries stored in encrypted IPFS
+ * 5. Department budget (remaining) sets total available pay periods [14]
  * 
  * PRODUCTION CHANGES:
  * 1. All UTXOs come from frontend wallet selection, NOT .env [1, 2]
@@ -245,6 +264,9 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
  * 3. Multi-sig uses dynamic signers from request, NOT .env [5]
  * 4. Plan records are saved with employer reference [9]
  * 5. Company treasuryHexDest is fetched from database, NOT .env [16, 17, 18, 19]
+ * 6. REMOVED role and compensationSats from validation and record saving
+ * 7. ADDED remaining field for department budget [14]
+ * 8. FETCH funding UTXO hex from the blockchain (not just ID) [22]
  */
 export async function createPayrollPlan(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -268,11 +290,10 @@ export async function createPayrollPlan(req: Request, res: Response) {
       fundingUtxo: req.body.fundingUtxo ? `${req.body.fundingUtxo.substring(0, 20)}...` : 'missing',
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
       department: req.body.department,
-      role: req.body.role,
-      compensationSats: req.body.compensationSats,
+      remaining: req.body.remaining,
       payPeriodSeconds: req.body.payPeriodSeconds,
       scrollPolicy: req.body.scrollPolicy,
-      multiSigRequired: req.body.multiSigRequired,
+      multiSigRequired: req.body.multiSigRequired || false,
       multiSigSignersCount: req.body.multiSigSigners?.length || 0,
       hasEncryptionEntropy: !!req.body.encryptionEntropy
     });
@@ -288,11 +309,10 @@ export async function createPayrollPlan(req: Request, res: Response) {
       fundingValue,
       employerAddress,
       department,
-      role,
-      compensationSats,
       payPeriodSeconds,
       scrollPolicy,
-      encryptionEntropy,      // From wallet signature - NON-CUSTODIAL [3]
+      remaining,           // Department budget [14]
+      encryptionEntropy,   // From wallet signature - NON-CUSTODIAL [3]
       multiSigRequired,
       multiSigSigners,
       multiSigThreshold
@@ -302,6 +322,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     const cleanAnchorTxHex = anchorTxHex.replace(/\s/g, '');
     
     console.log(`[PLANS API:${requestId}] ✅ Validation passed`);
+    console.log(`[PLANS API:${requestId}] Department budget: ${remaining} pay periods`);
     
     // ----------------------------------------------------------------------------
     // Step 2: Look up company in database - NO .env fallback [16, 17]
@@ -324,16 +345,35 @@ export async function createPayrollPlan(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 3: Encrypt using wallet-provided entropy (Backend acts as blind relay) [3, 4]
+    // Step 3: Fetch funding UTXO hex from the blockchain
+    // CRITICAL: Frontend provides only the UTXO ID, prover needs the full hex [22]
+    // ----------------------------------------------------------------------------
+    console.log(`[PLANS API:${requestId}] 🔍 Fetching funding UTXO hex...`);
+    
+    const fundingTxid = fundingUtxo.split(':')[0];
+    let fundingTxHex: string;
+    
+    try {
+      fundingTxHex = await fetchTransactionHex(fundingTxid);
+      console.log(`[PLANS API:${requestId}] ✅ Funding UTXO hex fetched (length: ${fundingTxHex.length} chars)`);
+    } catch (error: any) {
+      console.error(`[PLANS API:${requestId}] ❌ Failed to fetch funding UTXO hex:`, error.message);
+      return res.status(400).json({ 
+        error: `Failed to fetch funding transaction hex: ${error.message}`,
+        fundingTxid
+      });
+    }
+    
+    // ----------------------------------------------------------------------------
+    // Step 4: Encrypt using wallet-provided entropy (Backend acts as blind relay) [3, 4]
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔐 Encrypting payroll data with wallet entropy...`);
     
     // No environment key - using encryptionEntropy from wallet signature
+    // NOTE: No salary or role in department-level metadata
     const encryptedBlob = encryptPayrollData({
       department,
-      role,
-      employerAddress,
-      baseSalarySats: compensationSats,
+      remaining,           // Include budget in encrypted metadata
       created: new Date().toISOString(),
       scrollPolicy,
       payPeriodSeconds,
@@ -343,7 +383,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     console.log(`[PLANS API:${requestId}] ✅ Data encrypted with wallet entropy (non-custodial)`);
     
     // ----------------------------------------------------------------------------
-    // Step 4: Pin encrypted data to IPFS [6, 7]
+    // Step 5: Pin encrypted data to IPFS [6, 7]
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 📦 Pinning to IPFS...`);
     
@@ -354,7 +394,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     console.log(`    Hash: ${metadataHash.substring(0, 16)}...`);
     
     // ----------------------------------------------------------------------------
-    // Step 5: Persist CID mapping for indexer lookup [7]
+    // Step 6: Persist CID mapping for indexer lookup [7]
     // ----------------------------------------------------------------------------
     await new Promise((resolve, reject) => {
       db.run(
@@ -367,7 +407,8 @@ export async function createPayrollPlan(req: Request, res: Response) {
     console.log(`[PLANS API:${requestId}] ✅ CID Mapping saved: ${metadataHash.substring(0, 16)}... -> ${cid}`);
     
     // ----------------------------------------------------------------------------
-    // Step 6: Construct SpellRequest with dynamic signers [4, 5, 8]
+    // Step 7: Construct SpellRequest with dynamic signers [4, 5, 8]
+    // NOTE: Pass remaining as the budget [14], compensationSats = 0 for Unified Model [15]
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔧 Building SpellRequest...`);
     
@@ -382,43 +423,45 @@ export async function createPayrollPlan(req: Request, res: Response) {
       outputs: [{
         address: employerAddress,
         nftMetadata: {
-          ticker: constants.PAYROLL_NFT_TICKER,
-          remaining: 1,
+          ticker: `${department.toUpperCase()}-PAY`, // Department-based ticker
+          remaining: remaining,                      // Department budget [14]
           metadataHash: metadataHash,
           scrollPolicy: scrollPolicy,
           payPeriodSeconds: payPeriodSeconds,
-          compensationSats: compensationSats
+          compensationSats: 0                        // Explicitly 0 for Unified Model [15]
         }
       }],
       ...getMultiSigConfig(multiSigRequired, multiSigSigners, multiSigThreshold)
     };
     
     // ----------------------------------------------------------------------------
-    // Step 7: Generate unsigned transactions via prover [8]
+    // Step 8: Generate unsigned transactions via prover
+    // CRITICAL: Pass BOTH hex strings (anchor + funding) to the prover [22, 112]
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] ⏳ Calling proverClient...`);
     
     const result = await generateUnsignedTransactions(
       request, 
-      [cleanAnchorTxHex, fundingUtxo], // Both UTXOs from frontend
-      undefined // appId not needed for mint-nft
+      [cleanAnchorTxHex, fundingTxHex], // BOTH must be raw hex strings [112]
+      company.treasuryHexDest,          // Pass treasuryHexDest from company lookup
+      undefined                         // appId not needed for mint-nft
     );
     
     console.log(`[PLANS API:${requestId}] ✅ Transactions generated`);
     
     // ----------------------------------------------------------------------------
-    // Step 8: Derive App ID from anchor UTXO
+    // Step 9: Derive App ID from anchor UTXO
     // ----------------------------------------------------------------------------
     const appId = crypto.createHash('sha256').update(anchorUtxo).digest('hex');
     
     // ----------------------------------------------------------------------------
-    // Step 9: Derive Plan NFT UTXO from spellTxHex [9]
+    // Step 10: Derive Plan NFT UTXO from spellTxHex [9]
     // ----------------------------------------------------------------------------
     const spellTx = require('bitcoinjs-lib').Transaction.fromHex(result.spellTxHex);
     const planUtxo = `${spellTx.getId()}:0`;
     
     // ----------------------------------------------------------------------------
-    // Step 10: Save plan record with employer reference [9]
+    // Step 11: Save plan record with employer reference [9] - UPDATED
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 💾 Saving plan record...`);
     
@@ -427,29 +470,32 @@ export async function createPayrollPlan(req: Request, res: Response) {
       planUtxo,
       employerAddress,
       department,
-      role,
-      compensationSats,
       payPeriodSeconds,
+      remaining,        // Save department budget
       metadataHash,
       scrollPolicy
     );
     
-    console.log(`[PLANS API:${requestId}] ✅ Plan record saved`);
+    console.log(`[PLANS API:${requestId}] ✅ Plan record saved with budget: ${remaining}`);
     
     // ----------------------------------------------------------------------------
-    // Step 11: Return success response
+    // Step 12: Return success response
     // ----------------------------------------------------------------------------
     const response: PayrollPlanResponse = {
       commitTxHex: result.commitTxHex,
       spellTxHex: result.spellTxHex,
+      isSingle: result.isSingle,
       ipfsCid: cid,
       appId,
       metadataHash,
       department
     };
     
+    console.log(`[PLANS API:${requestId}] ✅ Success - isSingle: ${result.isSingle}`);
     console.log(`[PLANS API:${requestId}] ✅ Success - App ID: ${appId.substring(0, 16)}...`);
     console.log(`[PLANS API:${requestId}] ✅ Success - Plan UTXO: ${planUtxo}`);
+    console.log(`[PLANS API:${requestId}] ✅ Success - Department: ${department}`);
+    console.log(`[PLANS API:${requestId}] ✅ Success - Budget: ${remaining} pay periods`);
     console.log(`[PLANS API:${requestId}] ✅ Success - Treasury Hex: ${company.treasuryHexDest.substring(0, 30)}...`);
     console.log(`[PLANS API:${requestId}] ===== END =====\n`);
     
@@ -473,6 +519,8 @@ export async function createPayrollPlan(req: Request, res: Response) {
       statusCode = 502;
     } else if (error.message.includes('IPFS')) {
       statusCode = 503;
+    } else if (error.message.includes('fetch funding transaction')) {
+      statusCode = 400;
     }
     
     return res.status(statusCode).json({
@@ -483,7 +531,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
 }
 
 // --------------------------------------------------------------------------------
-// Plan Query API - For frontend dashboard [9]
+// Plan Query API - For frontend dashboard [9] - UPDATED
 // --------------------------------------------------------------------------------
 
 /**
@@ -494,7 +542,7 @@ export async function getPlans(req: Request, res: Response) {
   try {
     const { department, employerAddress, limit = '50', offset = '0' } = req.query;
     
-    let query = 'SELECT * FROM plans WHERE 1=1';
+    let query = 'SELECT appId, nftUtxoId, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE 1=1';
     const params: any[] = [];
     
     if (department) {
@@ -523,9 +571,8 @@ export async function getPlans(req: Request, res: Response) {
         ticker: row.ticker,
         employerAddress: row.employerAddress ? row.employerAddress.substring(0, 20) + '...' : null,
         department: row.department,
-        role: row.role,
-        compensationSats: row.compensationSats,
         payPeriodSeconds: row.payPeriodSeconds,
+        remaining: row.remaining,
         metadataHash: row.metadataHash.substring(0, 16) + '...',
         scrollPolicy: row.scrollPolicy,
         createdAt: row.createdAt
@@ -540,7 +587,7 @@ export async function getPlans(req: Request, res: Response) {
 }
 
 // --------------------------------------------------------------------------------
-// Plan Details API - Get single plan by appId
+// Plan Details API - Get single plan by appId - UPDATED
 // --------------------------------------------------------------------------------
 
 /**
@@ -556,7 +603,7 @@ export async function getPlanById(req: Request, res: Response) {
     }
     
     db.get(
-      'SELECT * FROM plans WHERE appId = ?',
+      'SELECT appId, nftUtxoId, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE appId = ?',
       [appId],
       (err: Error | null, row: any) => {
         if (err) {
@@ -575,9 +622,8 @@ export async function getPlanById(req: Request, res: Response) {
           ticker: row.ticker,
           employerAddress: row.employerAddress ? row.employerAddress.substring(0, 20) + '...' : null,
           department: row.department,
-          role: row.role,
-          compensationSats: row.compensationSats,
           payPeriodSeconds: row.payPeriodSeconds,
+          remaining: row.remaining,
           metadataHash: row.metadataHash.substring(0, 16) + '...',
           scrollPolicy: row.scrollPolicy,
           createdAt: row.createdAt

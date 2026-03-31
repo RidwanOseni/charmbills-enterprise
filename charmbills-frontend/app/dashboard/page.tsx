@@ -23,7 +23,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
-import { Wallet, Users, CheckCircle, Building2 } from 'lucide-react'
+import { Wallet, Users, CheckCircle, Building2, PlusCircle, CreditCard } from 'lucide-react'
 import { useWallet } from '@/lib/WalletContext';
 import { getWalletStatus } from '@/lib/charms-utils';
 import { WorkerStatus, ProverResult } from '../../shared/types';
@@ -32,6 +32,23 @@ import * as constants from '../../shared/constants';
 // Import for company onboarding hex derivation
 import * as btc from '@scure/btc-signer';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
+
+// Create API client with absolute URL and increased timeout for ZK-proof generation
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002',
+  timeout: 180000 // 3 minutes timeout for ZK-proof generation (matches backend PROVER_TIMEOUT_MS)
+});
+
+// Map frontend selection to deterministic seconds
+const frequencyToSeconds = (freq: string) => {
+  const map: Record<string, number> = {
+    'weekly': constants.SECONDS_PER_WEEK,
+    'biweekly': constants.SECONDS_PER_BIWEEK,
+    'monthly': constants.SECONDS_PER_MONTH,
+    'demo': constants.DEMO_SECONDS_PER_PERIOD
+  };
+  return map[freq] || constants.SECONDS_PER_BIWEEK;
+};
 
 export default function EmployerDashboard() {
   const { 
@@ -42,6 +59,28 @@ export default function EmployerDashboard() {
     signAndBroadcastPackage 
   } = useWallet();
 
+  // ============================================================
+  // Infrastructure State (Departments - One NFT per Department)
+  // ============================================================
+  const [registeredDepts, setRegisteredDepts] = useState<any[]>([]);
+  const [setupDeptName, setSetupDeptName] = useState('');
+  const [setupBudget, setSetupBudget] = useState('100'); // ADDED: Budget field
+  const [setupFrequency, setSetupFrequency] = useState('biweekly');
+  const [setupType, setSetupType] = useState('employee');
+  const [isSettingUpDept, setIsSettingUpDept] = useState(false);
+  
+  // ============================================================
+  // Hiring State (Workers assigned to Departments)
+  // ============================================================
+  const [selectedDeptId, setSelectedDeptId] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [role, setRole] = useState('');
+  const [salary, setSalary] = useState('');
+  const [bitcoinAddress, setBitcoinAddress] = useState('');
+  
+  // ============================================================
+  // Operational State
+  // ============================================================
   const [workers, setWorkers] = useState<any[]>([]);
   const [vaultBalance, setVaultBalance] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -49,73 +88,134 @@ export default function EmployerDashboard() {
   const [hasActiveWorkers, setHasActiveWorkers] = useState<boolean>(false);
   const [isOnboarding, setIsOnboarding] = useState<boolean>(false);
   const [companyRegistered, setCompanyRegistered] = useState<boolean>(false);
+  const [onboardingError, setOnboardingError] = useState<string | null>(null);
+  const [onboardingAttempted, setOnboardingAttempted] = useState<boolean>(false);
   
-  const [fullName, setFullName] = useState('')
-  const [role, setRole] = useState('')
-  const [salary, setSalary] = useState('')
-  const [bitcoinAddress, setBitcoinAddress] = useState('')
-  const [department, setDepartment] = useState('engineering')
-  const [payFrequency, setPayFrequency] = useState('monthly')
-  const [workerType, setWorkerType] = useState('employee')
-  
+  // ============================================================
+  // Batch Minting State
+  // ============================================================
   const [selectedWorkers, setSelectedWorkers] = useState<Set<string>>(new Set());
-  const [selectedDept, setSelectedDept] = useState('engineering')
-  const [selectedPeriods, setSelectedPeriods] = useState('1')
-  const [statusFilter, setStatusFilter] = useState('all')
-  const [toast, setToast] = useState('')
+  const [selectedDept, setSelectedDept] = useState('');
+  const [selectedPeriods, setSelectedPeriods] = useState('1');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [toast, setToast] = useState('');
   
   const [currentPlanNftUtxo, setCurrentPlanNftUtxo] = useState('');
   const [currentPlanMetadata, setCurrentPlanMetadata] = useState<any>(null);
+
+  // ============================================================
+  // Helper: Scan wallet for UTXO context (Fixes "Cannot read properties of undefined (reading 'fee')")
+  // This provides the anchor and fee UTXOs needed for sequential signing
+  // FIX: Use txid/vout check instead of referential equality to ensure UTXOs are different
+  // ============================================================
+  const getBtcContext = async () => {
+    if (!address) throw new Error("Wallet not connected");
+    
+    console.log("[DEPARTMENT SETUP] Scanning wallet for UTXOs...");
+    
+    // 1. Fetch all UTXOs for the connected Taproot address
+    const response = await axios.get(`https://mempool.space/testnet4/api/address/${address}/utxo`);
+    const utxos = response.data;
+    
+    console.log(`[DEPARTMENT SETUP] Found ${utxos.length} UTXOs`);
+    
+    // 2. Find a UTXO >= 10,000 sats to act as the Anchor (for NFT identity)
+    const anchorUtxo = utxos.find((u: any) => u.value >= 10000 && u.status.confirmed);
+    
+    // 3. Find a separate UTXO >= 5,000 sats to pay for fees (sponsorship/funding)
+    // CRITICAL FIX: Use txid/vout check instead of referential equality
+    // The Mempool API returns new objects for every call, so u !== anchorUtxo would always be true
+    const feeUtxo = utxos.find((u: any) => 
+      u.value >= 5000 && 
+      u.status.confirmed && 
+      (u.txid !== anchorUtxo?.txid || u.vout !== anchorUtxo?.vout)
+    );
+    
+    if (!anchorUtxo) {
+      throw new Error("Insufficient funds: Need a UTXO >= 10,000 sats for Anchor (NFT identity).");
+    }
+    
+    if (!feeUtxo) {
+      throw new Error("Insufficient funds: Need a separate UTXO >= 5,000 sats for transaction fees.");
+    }
+    
+    console.log("[DEPARTMENT SETUP] Selected anchor UTXO:", anchorUtxo.txid, `value: ${anchorUtxo.value}`);
+    console.log("[DEPARTMENT SETUP] Selected fee UTXO:", feeUtxo.txid, `value: ${feeUtxo.value}`);
+    
+    // 4. Fetch the raw hex for these UTXOs (Required for provenance in Taproot signing)
+    const [anchorHex, feeHex] = await Promise.all([
+      axios.get(`https://mempool.space/testnet4/api/tx/${anchorUtxo.txid}/hex`),
+      axios.get(`https://mempool.space/testnet4/api/tx/${feeUtxo.txid}/hex`)
+    ]);
+    
+    return {
+      anchor: {
+        utxoId: `${anchorUtxo.txid}:${anchorUtxo.vout}`,
+        value: anchorUtxo.value,
+        hex: anchorHex.data
+      },
+      fee: {
+        utxoId: `${feeUtxo.txid}:${feeUtxo.vout}`,
+        value: feeUtxo.value,
+        hex: feeHex.data
+      }
+    };
+  };
 
   // ============================================================
   // COMPANY ONBOARDING: Auto-register when wallet connects
   // ============================================================
   useEffect(() => {
     const checkAndRegisterCompany = async () => {
-      if (!walletConnected || !address || companyRegistered) return;
+      if (!walletConnected || !address || companyRegistered || isOnboarding || onboardingError || onboardingAttempted) {
+        return;
+      }
       
       setIsOnboarding(true);
+      setOnboardingAttempted(true);
+      
       try {
         console.log("[ONBOARDING] Checking if company exists for:", address);
         
-        // Check if company already registered
-        const checkResponse = await axios.get(`/api/companies/${address}`);
+        const checkResponse = await api.get(`/api/companies/${address}`).catch((err) => {
+          if (err.response?.status === 404) return { data: null };
+          throw err;
+        });
         
-        if (checkResponse.data?.success) {
+        if (checkResponse?.data?.success) {
           console.log("[ONBOARDING] Company already registered");
           setCompanyRegistered(true);
           setIsOnboarding(false);
           return;
         }
-      } catch (error: any) {
-        // 404 means company not found - proceed with registration
-        if (error.response?.status !== 404) {
-          console.error("[ONBOARDING] Error checking company:", error.message);
-          setIsOnboarding(false);
-          return;
-        }
-      }
-      
-      // Company not found - register new company
-      try {
+        
         console.log("[ONBOARDING] Registering new company...");
         
-        // 1. Get Taproot address from Leather wallet
+        if (!(window as any).LeatherProvider) {
+          throw new Error("Leather wallet not detected. Please install Leather extension.");
+        }
+        
         const response = await (window as any).LeatherProvider.request("getAddresses");
+        
+        if (!response?.result?.addresses) {
+          throw new Error("Failed to get addresses from wallet");
+        }
+        
         const p2tr = response.result.addresses.find((a: any) => a.type === 'p2tr');
         
         if (!p2tr) {
-          throw new Error("Taproot address (p2tr) not found in wallet. Please ensure your wallet has a Taproot address.");
+          throw new Error("Taproot address (p2tr) not found in wallet.");
         }
         
         console.log("[ONBOARDING] Found Taproot address:", p2tr.address);
         
-        // 2. AUTOMATICALLY derive the Hex Destination
-        // Slices 33-byte key to 32-byte X-only Schnorr key
+        if (!p2tr.publicKey) {
+          throw new Error("Public key not found for Taproot address");
+        }
+        
         const fullKey = hexToBytes(p2tr.publicKey);
         const schnorrKey = fullKey.length === 33 ? fullKey.slice(1) : fullKey;
         
-        // Testnet4 parameters
         const network = { 
           bech32: 'tb', 
           pubKeyHash: 0x6f, 
@@ -126,19 +226,16 @@ export default function EmployerDashboard() {
         const payment = btc.p2tr(schnorrKey, undefined, network);
         const derivedHex = bytesToHex(payment.script);
         
-        console.log("[ONBOARDING] Derived hex destination:", derivedHex.substring(0, 40) + "...");
-        
-        // 3. Save to Database via API
-        const registerResponse = await axios.post('/api/companies/register', {
+        const registerResponse = await api.post('/api/companies/register', {
           employerAddress: p2tr.address,
-          treasuryAddress: p2tr.address, // Usually the same during setup
+          treasuryAddress: p2tr.address,
           treasuryHexDest: derivedHex
         });
         
         if (registerResponse.data?.success) {
           console.log("[ONBOARDING] ✅ Company registered successfully");
           setCompanyRegistered(true);
-          setToast("✅ Company infrastructure registered! You can now hire workers.");
+          setToast("✅ Company infrastructure registered! You can now create departments.");
           setTimeout(() => setToast(''), 4000);
         } else {
           throw new Error(registerResponse.data?.error || "Registration failed");
@@ -146,6 +243,7 @@ export default function EmployerDashboard() {
         
       } catch (error: any) {
         console.error("[ONBOARDING] Registration failed:", error.message);
+        setOnboardingError(error.message);
         setToast(`❌ Company registration failed: ${error.message}`);
         setTimeout(() => setToast(''), 5000);
       } finally {
@@ -154,13 +252,301 @@ export default function EmployerDashboard() {
     };
     
     checkAndRegisterCompany();
-  }, [walletConnected, address, companyRegistered]);
+  }, [walletConnected, address, companyRegistered, isOnboarding, onboardingError, onboardingAttempted]);
 
-  // DYNAMIC DATA FETCHING (Overview Cards)
+  // ============================================================
+  // STAGE 1: Setup Department (Mint Plan NFT - One per Department)
+  // ============================================================
+  const handleSetupDepartment = async () => {
+    if (!setupDeptName) {
+      setToast("❌ Please enter a department name.");
+      return;
+    }
+    
+    const budgetValue = parseInt(setupBudget);
+    if (isNaN(budgetValue) || budgetValue <= 0) {
+      setToast("❌ Please enter a valid budget (positive number of pay periods).");
+      return;
+    }
+    
+    if (!companyRegistered) {
+      setToast("⚠️ Please wait for company registration to complete first.");
+      return;
+    }
+    
+    // CRITICAL: Set loading state at the beginning - stays true throughout the entire ZK-proof generation (60-105 seconds)
+    setIsSettingUpDept(true);
+    
+    try {
+      console.log("[DEPARTMENT SETUP] Creating department:", setupDeptName);
+      console.log("[DEPARTMENT SETUP] Budget:", budgetValue, "pay periods");
+      
+      // Get UTXO context from wallet scanner (returns anchor and fee UTXOs)
+      const btcContext = await getBtcContext();
+      
+      console.log("[DEPARTMENT SETUP] BTC Context obtained:", {
+        anchor: btcContext.anchor.utxoId,
+        fee: btcContext.fee.utxoId
+      });
+      
+      // Request wallet signature for encryption authority
+      if (!(window as any).LeatherProvider) {
+        throw new Error("Leather wallet not detected");
+      }
+      
+      const sigRes = await (window as any).LeatherProvider.request("signMessage", {
+        message: `CharmBills Department Authority: ${setupDeptName}`,
+        paymentType: "p2tr",
+        network: "testnet"
+      });
+      
+      const payload = {
+        anchorUtxo: btcContext.anchor.utxoId,
+        anchorTxHex: btcContext.anchor.hex,
+        anchorValue: btcContext.anchor.value,
+        fundingUtxo: btcContext.fee.utxoId,
+        fundingValue: btcContext.fee.value,
+        employerAddress: address,
+        department: setupDeptName.toLowerCase(),
+        ticker: `${setupDeptName.substring(0, 3).toUpperCase()}-PAY`,
+        role: "Department Authority",
+        compensationSats: 1000, // Placeholder - specific salaries handled at hiring layer
+        payPeriodSeconds: frequencyToSeconds(setupFrequency),
+        scrollPolicy: setupType === 'employee' ? 0 : 1,
+        remaining: budgetValue, // This sets the 'remaining' supply [11]
+        encryptionEntropy: sigRes.result.signature,
+        multiSigRequired: false // WORKAROUND: Force single-signer for demo [11, 12]
+      };
+      
+      // CRITICAL: Use axios directly with explicit timeout to ensure ZK-proof generation completes
+      // The backend timeout is 180 seconds, frontend must match or exceed
+      const response = await axios.post('/api/plans/mint', payload, {
+        timeout: 180000, // 3 minutes timeout for ZK-proof generation
+        baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
+      });
+      
+      const proverResult: ProverResult = response.data;
+      
+      // Pass the UTXO context to the signing function (required for sequential signing)
+      const signingResult = await signAndBroadcastPackage(proverResult, btcContext);
+      const txids = signingResult?.txids;
+      
+      if (txids && txids.length > 0) {
+        setToast(`✅ ${setupDeptName} Department created with ${budgetValue} pay periods budget!`);
+        await fetchPlans();
+        
+        // Reset form
+        setSetupDeptName('');
+        setSetupBudget('100');
+        setSetupFrequency('biweekly');
+        setSetupType('employee');
+      } else {
+        setToast('⚠️ Department setup was cancelled or failed');
+      }
+      
+    } catch (err: any) {
+      console.error("[DEPARTMENT SETUP] Failed:", err.message);
+      setToast(`❌ Department setup failed: ${err.message}`);
+    } finally {
+      // CRITICAL: Only reset loading state AFTER the entire operation (including ZK-proof and signing) completes
+      setIsSettingUpDept(false);
+      setTimeout(() => setToast(''), 4000);
+    }
+  };
+  
+  // ============================================================
+  // STAGE 2: New Hire (Assign Worker to Existing Department NFT)
+  // ============================================================
+  const handleHire = async () => {
+    if (!fullName || !selectedDeptId) {
+      setToast("❌ Please select a department and enter worker name.");
+      return;
+    }
+    
+    if (!bitcoinAddress) {
+      setToast("❌ Please enter worker's Bitcoin address.");
+      return;
+    }
+    
+    // CRITICAL: Set processing state at the beginning - stays true throughout ZK-proof generation
+    setIsProcessing(true);
+    
+    try {
+      const dept = registeredDepts.find(d => d.appId === selectedDeptId);
+      if (!dept) {
+        throw new Error("Selected department not found");
+      }
+      
+      console.log("[HIRING] Hiring", fullName, "to", dept.department);
+      
+      // Get UTXO context for fee payment (batch hiring needs funding UTXO)
+      const btcContext = await getBtcContext();
+      
+      if (!(window as any).LeatherProvider) {
+        throw new Error("Leather wallet not detected");
+      }
+      
+      const sigRes = await (window as any).LeatherProvider.request("signMessage", {
+        message: `Hire ${fullName} for ${dept.department}`,
+        paymentType: "p2tr",
+        network: "testnet"
+      });
+      
+      const payload = {
+        authorityUtxo: dept.nftUtxoId,
+        authorityTxHex: btcContext.anchor.hex, // Use anchor hex for authority provenance
+        fundingUtxo: btcContext.fee.utxoId,
+        fundingValue: btcContext.fee.value,
+        employerAddress: address,
+        workers: [{ 
+          address: bitcoinAddress, 
+          periods: 1,
+          salarySats: parseInt(salary) || 5000000,
+          role: role || "Team Member"
+        }],
+        planMetadata: { 
+          ...dept, 
+          remaining: dept.remaining
+        },
+        encryptionEntropy: sigRes.result.signature
+      };
+      
+      // CRITICAL: Use axios directly with explicit timeout for ZK-proof generation
+      const response = await axios.post('/api/payrollhiring/mint', payload, {
+        timeout: 180000, // 3 minutes timeout for ZK-proof generation
+        baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
+      });
+      
+      const proverResult: ProverResult = response.data;
+      
+      const signingResult = await signAndBroadcastPackage(proverResult, btcContext);
+      const txids = signingResult?.txids;
+      
+      if (txids && txids.length > 0) {
+        setToast(`✅ ${fullName} hired to ${dept.department}!`);
+        await refreshWorkers();
+        
+        // Reset form
+        setFullName('');
+        setRole('');
+        setSalary('');
+        setBitcoinAddress('');
+        setSelectedDeptId('');
+      } else {
+        setToast('⚠️ Hiring was cancelled or failed');
+      }
+      
+    } catch (err: any) {
+      console.error("[HIRING] Failed:", err.message);
+      setToast(`❌ Hire failed: ${err.message}`);
+    } finally {
+      // CRITICAL: Only reset processing state AFTER the entire operation completes
+      setIsProcessing(false);
+      setTimeout(() => setToast(''), 4000);
+    }
+  };
+  
+  // ============================================================
+  // Batch Token Issuance (Pay Your Team - All at Once)
+  // ============================================================
+  const handleIssueTokens = async () => {
+    if (selectedWorkers.size === 0) {
+      setToast("❌ Please select workers to issue tokens.");
+      return;
+    }
+    
+    if (!currentPlanNftUtxo) {
+      setToast("❌ No active Plan NFT found for this department.");
+      return;
+    }
+
+    if (!currentPlanMetadata) {
+      setToast("❌ Plan metadata not found. Please refresh the page.");
+      return;
+    }  
+    
+    // CRITICAL: Set processing state at the beginning - stays true throughout ZK-proof generation
+    setIsProcessing(true);
+
+    try {
+      const workerList = workers.filter(w => selectedWorkers.has(w.wallet));
+      const periods = parseInt(selectedPeriods);
+      
+      // Get UTXO context for fee payment
+      const btcContext = await getBtcContext();
+
+      const payload = {
+        authorityUtxo: currentPlanNftUtxo,
+        authorityTxHex: btcContext.anchor.hex,
+        fundingUtxo: btcContext.fee.utxoId,
+        fundingValue: btcContext.fee.value,
+        workers: workerList.map(w => ({ 
+          address: w.wallet, 
+          periods,
+          salarySats: w.salarySats || 5000000,
+          role: w.role || "Team Member"
+        })),
+        employerAddress: address,
+        planMetadata: currentPlanMetadata
+      };
+
+      // CRITICAL: Use axios directly with explicit timeout for ZK-proof generation
+      const response = await axios.post('/api/payrollhiring/mint', payload, {
+        timeout: 180000, // 3 minutes timeout for ZK-proof generation
+        baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
+      });
+      
+      const signingResult = await signAndBroadcastPackage(response.data, btcContext);
+      const txids = signingResult?.txids;
+      
+      if (txids && txids.length > 0) {
+        setToast(`✅ Batch tokens issued! ${workerList.length} workers covered.`);
+        await refreshWorkers();
+        setSelectedWorkers(new Set());
+      } else {
+        setToast('⚠️ Signing was cancelled or failed');
+      }
+    } catch (err: any) {
+      console.error("Batch minting failed:", err.message);
+      setToast(`❌ Batch minting failed: ${err.message}`);
+    } finally {
+      // CRITICAL: Only reset processing state AFTER the entire operation completes
+      setIsProcessing(false);
+      setTimeout(() => setToast(''), 4000);
+    }
+  };
+  
+  // ============================================================
+  // Data Fetching Helpers
+  // ============================================================
+  const fetchPlans = async () => {
+    if (!address) return;
+    try {
+      const res = await api.get(`/api/plans?employerAddress=${address}`);
+      setRegisteredDepts(res.data);
+      if (res.data.length > 0 && !selectedDeptId) {
+        setSelectedDeptId(res.data[0].appId);
+      }
+    } catch (error) {
+      console.error('Failed to fetch plans:', error);
+    }
+  };
+  
+  const refreshWorkers = async () => {
+    try {
+      const response = await api.get('/api/workers');
+      setWorkers(response.data);
+      await fetchPlans();
+    } catch (error) {
+      console.error('Failed to refresh workers:', error);
+    }
+  };
+  
+  // Fetch dashboard stats
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const statsRes = await axios.get('/api/dashboard/stats');
+        const statsRes = await api.get('/api/dashboard/stats');
         if (statsRes.data.nextRun) {
           const date = new Date(statsRes.data.nextRun);
           setNextRunDate(date.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }));
@@ -177,44 +563,42 @@ export default function EmployerDashboard() {
     fetchStats();
   }, [workers]);
 
-  // Dynamic Fetch: Workforce Registry & Company Vault
+  // Fetch vault balance
   useEffect(() => {
-    const fetchDashboardData = async () => {
+    const fetchVaultBalance = async () => {
       if (!walletConnected) return;
-      
       try {
-        // 1. Fetch Company Vault Balance (Treasury)
-        const treasuryAddr = process.env.NEXT_PUBLIC_TREASURY_ADDRESS!; 
-        const status = await getWalletStatus(treasuryAddr);
-        setVaultBalance(status.totalBalance);
-
-        // 2. Fetch Workers from Derivable Indexer
-        const response = await axios.get('/api/workers'); 
-        setWorkers(response.data);
-        
-        // Check if there are any active workers
-        const activeExists = response.data.some((w: any) => w.currentPeriod?.status === 'active');
-        setHasActiveWorkers(activeExists);
-        
+        const treasuryAddr = process.env.NEXT_PUBLIC_TREASURY_ADDRESS;
+        if (treasuryAddr) {
+          const status = await getWalletStatus(treasuryAddr);
+          setVaultBalance(status.totalBalance);
+        }
       } catch (error) {
-        console.error('Failed to fetch dashboard data:', error);
+        console.error('Failed to fetch vault balance:', error);
       }
     };
-    fetchDashboardData();
+    fetchVaultBalance();
   }, [walletConnected]);
-
-  // Implement Dynamic Plan NFT Retrieval
+  
+  // Fetch initial data when wallet connects
+  useEffect(() => {
+    if (walletConnected && address) {
+      fetchPlans();
+      refreshWorkers();
+    }
+  }, [walletConnected, address]);
+  
+  // Fetch plan metadata when department selection changes
   useEffect(() => {
     const fetchPlanForDepartment = async () => {
-      if (!walletConnected || selectedDept === 'all') return;
+      if (!selectedDept || !address) return;
       try {
-        // Fetch the Plan NFT governing this department from the Derivable Indexer cache
-        const response = await axios.get(`/api/plans?department=${selectedDept}`);
+        const response = await api.get(`/api/plans?department=${selectedDept}&employerAddress=${address}`);
         if (response.data && response.data.length > 0) {
-          const plan = response.data;
+          const plan = response.data[0];
           setCurrentPlanNftUtxo(plan.nftUtxoId);
-          // Metadata is required for supply math in the ZK-proof
           setCurrentPlanMetadata({
+            appId: plan.appId,
             ticker: plan.ticker,
             remaining: plan.remaining,
             metadataHash: plan.metadataHash,
@@ -224,12 +608,13 @@ export default function EmployerDashboard() {
           });
         }
       } catch (error) {
-        console.error('Failed to fetch departmental Plan NFT:', error);
+        console.error('Failed to fetch plan metadata:', error);
       }
     };
     fetchPlanForDepartment();
-  }, [walletConnected, selectedDept]);
+  }, [selectedDept, address]);
 
+  // Worker filtering and selection helpers
   const totalWorkers = workers.length;
   const deptWorkers = selectedDept === 'all' 
     ? workers 
@@ -261,137 +646,11 @@ export default function EmployerDashboard() {
     }
   };
 
-  const refreshWorkers = async () => {
-    try {
-      const response = await axios.get('/api/workers');
-      setWorkers(response.data);
-    } catch (error) {
-      console.error('Failed to refresh workers:', error);
-    }
-  };
-
-  // PRODUCTION ENCRYPTION (Hire Logic)
-  const handleHire = async () => {
-    if (!fullName || !role || !salary || !bitcoinAddress) return;
-    if (!companyRegistered) {
-      setToast("⚠️ Please wait for company registration to complete before hiring.");
-      setTimeout(() => setToast(''), 4000);
-      return;
-    }
-    setIsProcessing(true);
-
-    try {
-      // Request wallet signature for non-custodial entropy
-      console.log("🔐 Requesting encryption authority from wallet...");
-      const signatureResponse = await (window as any).LeatherProvider.request("signMessage", {
-        message: "CharmBills Payroll Encryption Authority v1",
-        paymentType: "p2tr",
-        network: "testnet"
-      });
-
-      const payload = {
-        department,
-        role,
-        compensationSats: parseInt(salary),
-        payPeriodSeconds: constants.SECONDS_PER_BIWEEK,
-        scrollPolicy: workerType === 'employee' ? 0 : 1,
-        employerAddress: address,
-        encryptionEntropy: signatureResponse.result.signature,
-        multiSigRequired: true
-      };
-
-      const response = await axios.post('/api/plans/mint', payload);
-      const proverResult: ProverResult = response.data;
-
-      // Step 2: Trigger Phase 3 Dual-Signing (Commit + Spell)
-      const signingResult = await signAndBroadcastPackage(proverResult, response.data.dualUtxoContext);
-      const txids = signingResult?.txids;
-
-      if (txids && txids.length > 0) {
-        setToast(`✅ Hire Initiated! Tx: ${txids[0]}`);
-        // Optimistic UI Update
-        setWorkers([...workers, { 
-          wallet: bitcoinAddress, 
-          name: fullName, 
-          role, 
-          department,
-          engagementType: workerType as any, 
-          currentPeriod: {
-            tokenId: '',
-            validFrom: new Date().toISOString(),
-            validTo: new Date(Date.now() + constants.SECONDS_PER_BIWEEK * 1000).toISOString(),
-            status: 'pending'
-          }
-        } as any]);
-        setFullName('');
-        setRole('');
-        setSalary('');
-        setBitcoinAddress('');
-        setDepartment('engineering');
-        setPayFrequency('monthly');
-        setWorkerType('employee');
-      } else {
-        console.log('User cancelled signing or no transaction IDs returned');
-        setToast('⚠️ Signing was cancelled or failed');
-      }
-    } catch (err: any) {
-      console.error("Hire failed:", err.message);
-      setToast(`❌ Hire failed: ${err.message}`);
-    } finally {
-      setIsProcessing(false);
-      setTimeout(() => setToast(''), 4000);
-    }
-  };
-
-  // Correct handleIssueTokens Implementation
-  const handleIssueTokens = async () => {
-    if (selectedWorkers.size === 0 || !currentPlanNftUtxo) {
-      setToast("❌ Please select workers and ensure a Plan NFT is active.");
-      return;
-    }
-    setIsProcessing(true);
-
-    try {
-      // Filter the workforce to only the selected wallets
-      const workerList = workers.filter(w => selectedWorkers.has(w.wallet));
-      const periods = parseInt(selectedPeriods);
-
-      // Construct payload for /api/payrollhiring/mint
-      const payload = {
-        authorityUtxo: currentPlanNftUtxo,
-        workers: workerList.map(w => ({ address: w.wallet, periods })),
-        employerAddress: address,
-        planMetadata: currentPlanMetadata
-      };
-
-      const response = await axios.post('/api/payrollhiring/mint', payload);
-      
-      // Execute the Dual-Signing Flow (Commit + Spell)
-      const signingResult = await signAndBroadcastPackage(response.data, response.data.dualUtxoContext);
-      const txids = signingResult?.txids;
-      
-      if (txids && txids.length > 0) {
-        setToast(`✅ Batch tokens issued! ${workerList.length} workers covered.`);
-        await refreshWorkers();
-        setSelectedWorkers(new Set());
-      } else {
-        console.log('User cancelled signing or no transaction IDs returned');
-        setToast('⚠️ Signing was cancelled or failed');
-      }
-    } catch (err: any) {
-      console.error("Batch minting failed:", err.message);
-      setToast(`❌ Batch minting failed: ${err.message}`);
-    } finally {
-      setIsProcessing(false);
-      setTimeout(() => setToast(''), 4000);
-    }
-  };
-
   const handleTerminate = async (workerWallet: string) => {
     if (!confirm("Are you sure? This triggers a 3-of-5 Board override to freeze vault funds.")) return;
     
     try {
-      await axios.post('/api/workers/terminate', { walletAddress: workerWallet });
+      await api.post('/api/workers/terminate', { walletAddress: workerWallet });
       setToast("✅ Termination initiated. Check Treasury for Board approval.");
       await refreshWorkers();
     } catch (err) {
@@ -401,7 +660,7 @@ export default function EmployerDashboard() {
     }
   };
 
-  // If wallet not connected, show connection prompt
+  // UI States
   if (!walletConnected) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -421,7 +680,6 @@ export default function EmployerDashboard() {
     );
   }
 
-  // If onboarding in progress, show loading state
   if (isOnboarding) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -436,6 +694,31 @@ export default function EmployerDashboard() {
           <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
             <div className="bg-primary h-full w-2/3 animate-pulse rounded-full"></div>
           </div>
+        </Card>
+      </div>
+    );
+  }
+
+  if (onboardingError && !companyRegistered) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <Card className="max-w-md w-full p-8 text-center">
+          <div className="flex justify-center mb-6">
+            <div className="p-4 bg-destructive/10 rounded-full">
+              <Building2 className="w-12 h-12 text-destructive" />
+            </div>
+          </div>
+          <h1 className="text-2xl font-bold text-destructive mb-2">Setup Failed</h1>
+          <p className="text-foreground mb-6">{onboardingError}</p>
+          <Button 
+            onClick={() => {
+              setOnboardingError(null);
+              setOnboardingAttempted(false);
+            }} 
+            className="w-full"
+          >
+            Retry Setup
+          </Button>
         </Card>
       </div>
     );
@@ -458,7 +741,6 @@ export default function EmployerDashboard() {
         </div>
       )}
 
-      {/* Main Content */}
       <main className="max-w-7xl mx-auto px-6 py-12">
         {/* Toast Notification */}
         {toast && (
@@ -473,7 +755,7 @@ export default function EmployerDashboard() {
           <Card className="p-6 bg-card border border-border rounded-xl">
             <p className="text-sm text-muted-foreground mb-2">Total Team</p>
             <p className="text-4xl font-bold text-primary">{totalWorkers} workers</p>
-            <p className="text-xs text-muted-foreground mt-2">Employees and freelancers</p>
+            <p className="text-xs text-muted-foreground mt-2">Across {registeredDepts.length} department(s)</p>
           </Card>
           <Card className="p-6 bg-card border border-border rounded-xl">
             <p className="text-sm text-muted-foreground mb-2">Next Payroll Run</p>
@@ -493,25 +775,141 @@ export default function EmployerDashboard() {
 
         {/* Welcome Section */}
         <div className="mb-8">
-          <h1 className="text-3xl font-bold text-primary mb-2">Manage Your Team</h1>
-          <p className="text-foreground">Add workers and issue tokens for payroll</p>
+          <h1 className="text-3xl font-bold text-primary mb-2">Employer Orchestration</h1>
+          <p className="text-foreground">Create departments, hire workers, and manage payroll with one-click batch payments</p>
         </div>
 
-        {/* Rest of the component remains the same */}
-        {/* Action Cards Grid */}
-        <div className="grid lg:grid-cols-3 gap-8 mb-12">
-          {/* Card A: New Hire */}
+        {/* Two-Column Layout: Setup Department + New Hire */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12">
+          {/* Card 1: DEPARTMENT SETUP (STAGE 1) */}
+          <Card className="p-8 bg-card border border-border rounded-xl">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="p-2 bg-primary/10 rounded-lg">
+                <PlusCircle className="w-6 h-6 text-primary" />
+              </div>
+              <h2 className="text-2xl font-bold text-primary">1. Setup Department</h2>
+            </div>
+            <p className="text-sm text-muted-foreground mb-4">Create a department NFT. One NFT per department handles all workers with different salaries.</p>
+
+            <div className="space-y-5">
+              <div>
+                <Label className="text-sm font-medium text-foreground block mb-2">Department Name</Label>
+                <Input
+                  placeholder="e.g., Engineering"
+                  value={setupDeptName}
+                  onChange={(e) => setSetupDeptName(e.target.value)}
+                  className="rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground"
+                  disabled={isSettingUpDept}
+                />
+              </div>
+
+              <div>
+                <Label className="text-sm font-medium text-foreground block mb-2">Authorized Pay Periods (Budget)</Label>
+                <Input 
+                  type="number" 
+                  value={setupBudget} 
+                  onChange={(e) => setSetupBudget(e.target.value)} 
+                  placeholder="e.g. 100"
+                  className="rounded-lg border-border bg-background text-foreground placeholder:text-muted-foreground"
+                  disabled={isSettingUpDept}
+                />
+                <p className="text-xs text-muted-foreground italic mt-1">
+                  Total pay periods this department is authorized to issue (Budget). Each worker uses 1 pay period per payment cycle.
+                </p>
+              </div>
+
+              <div>
+                <Label className="text-sm font-medium text-foreground block mb-2">Pay Frequency</Label>
+                <Select value={setupFrequency} onValueChange={setSetupFrequency} disabled={isSettingUpDept}>
+                  <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
+                    <SelectValue placeholder="Select frequency" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="weekly">Weekly</SelectItem>
+                    <SelectItem value="biweekly">Bi-weekly (Standard)</SelectItem>
+                    <SelectItem value="monthly">Monthly</SelectItem>
+                    <SelectItem value="demo">Investor Demo (1 Minute)</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground mt-1">Sets the on-chain pay period for all workers in this department.</p>
+              </div>
+
+              <div>
+                <Label className="text-sm font-medium text-foreground block mb-2">Worker Type</Label>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setSetupType('employee')}
+                    disabled={isSettingUpDept}
+                    className={`flex-1 px-4 py-2 rounded-lg font-medium transition ${
+                      setupType === 'employee'
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted text-muted-foreground border border-border'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    Employee (Time-based)
+                  </button>
+                  <button
+                    onClick={() => setSetupType('freelancer')}
+                    disabled={isSettingUpDept}
+                    className={`flex-1 px-4 py-2 rounded-lg font-medium transition ${
+                      setupType === 'freelancer'
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted text-muted-foreground border border-border'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    Freelancer (Proof-based)
+                  </button>
+                </div>
+              </div>
+
+              <Button 
+                onClick={handleSetupDepartment} 
+                disabled={isSettingUpDept || !companyRegistered || !setupDeptName}
+                className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-2 rounded-lg disabled:opacity-50"
+              >
+                {isSettingUpDept ? 'Creating Department (60-105 sec)...' : 'Create Department NFT'}
+              </Button>
+
+              {registeredDepts.length > 0 && (
+                <p className="text-xs text-muted-foreground text-center mt-2">
+                  ✅ {registeredDepts.length} active department(s)
+                </p>
+              )}
+            </div>
+          </Card>
+
+          {/* Card 2: NEW HIRE (STAGE 2) */}
           <Card className="p-8 bg-card border border-border rounded-xl">
             <div className="flex items-center gap-3 mb-6">
               <div className="p-2 bg-primary/10 rounded-lg">
                 <Users className="w-6 h-6 text-primary" />
               </div>
-              <h2 className="text-2xl font-bold text-primary">New Hire</h2>
+              <h2 className="text-2xl font-bold text-primary">2. New Hire</h2>
             </div>
+            <p className="text-sm text-muted-foreground mb-4">Assign a worker to an existing department. Salaries are stored encrypted.</p>
 
             <div className="space-y-5">
               <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Full Name</Label>
+                <Label className="text-sm font-medium text-foreground block mb-2">Select Department</Label>
+                <Select value={selectedDeptId} onValueChange={setSelectedDeptId} disabled={isProcessing || registeredDepts.length === 0}>
+                  <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
+                    <SelectValue placeholder={registeredDepts.length === 0 ? "Create a department first" : "Select department"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {registeredDepts.map((dept) => (
+                      <SelectItem key={dept.appId} value={dept.appId}>
+                        {dept.department.charAt(0).toUpperCase() + dept.department.slice(1)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {registeredDepts.length === 0 && (
+                  <p className="text-xs text-muted-foreground mt-1">⚠️ Please create a department first</p>
+                )}
+              </div>
+
+              <div>
+                <Label className="text-sm font-medium text-foreground block mb-2">Worker Name</Label>
                 <Input
                   placeholder="e.g., Alex Chen"
                   value={fullName}
@@ -522,7 +920,7 @@ export default function EmployerDashboard() {
               </div>
 
               <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Role</Label>
+                <Label className="text-sm font-medium text-foreground block mb-2">Role (Optional)</Label>
                 <Input
                   placeholder="e.g., Senior Engineer"
                   value={role}
@@ -533,7 +931,7 @@ export default function EmployerDashboard() {
               </div>
 
               <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Salary (sats)</Label>
+                <Label className="text-sm font-medium text-foreground block mb-2">Salary (sats/period)</Label>
                 <Input
                   type="number"
                   placeholder="5000000"
@@ -555,207 +953,152 @@ export default function EmployerDashboard() {
                 />
               </div>
 
-              <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Department</Label>
-                <Select value={department} onValueChange={setDepartment} disabled={workerType === 'freelancer' || isProcessing}>
-                  <SelectTrigger className="rounded-lg border-border bg-background text-foreground disabled:opacity-60">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="engineering">Engineering</SelectItem>
-                    <SelectItem value="design">Design</SelectItem>
-                    <SelectItem value="product">Product</SelectItem>
-                    <SelectItem value="marketing">Marketing</SelectItem>
-                    <SelectItem value="operations">Operations</SelectItem>
-                  </SelectContent>
-                </Select>
-                {workerType === 'freelancer' && (
-                  <p className="text-xs text-muted-foreground mt-1">Freelancers are automatically assigned to the Freelancer category</p>
-                )}
-              </div>
-
-              <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Pay Frequency</Label>
-                <Select value={payFrequency} onValueChange={setPayFrequency} disabled={isProcessing}>
-                  <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="weekly">Weekly</SelectItem>
-                    <SelectItem value="biweekly">Bi-weekly</SelectItem>
-                    <SelectItem value="monthly">Monthly</SelectItem>
-                    <SelectItem value="demo">Demo</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Worker Type</Label>
-                <div className="flex gap-3">
-                  <button
-                    onClick={() => setWorkerType('employee')}
-                    disabled={isProcessing}
-                    className={`flex-1 px-4 py-2 rounded-lg font-medium transition ${
-                      workerType === 'employee'
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-muted text-muted-foreground border border-border'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    Employee
-                  </button>
-                  <button
-                    onClick={() => setWorkerType('freelancer')}
-                    disabled={isProcessing}
-                    className={`flex-1 px-4 py-2 rounded-lg font-medium transition ${
-                      workerType === 'freelancer'
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-muted text-muted-foreground border border-border'
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
-                  >
-                    Freelancer
-                  </button>
-                </div>
-              </div>
-
               <Button 
                 onClick={handleHire} 
-                disabled={isProcessing || !companyRegistered}
-                className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-2 rounded-lg disabled:opacity-50"
+                disabled={isProcessing || !selectedDeptId || !fullName || !bitcoinAddress}
+                className="w-full bg-secondary hover:bg-secondary/90 text-secondary-foreground font-semibold py-2 rounded-lg disabled:opacity-50"
               >
-                {isProcessing ? 'Processing...' : 'Hire'}
+                {isProcessing ? 'Processing (60-105 sec)...' : 'Assign Worker'}
               </Button>
             </div>
           </Card>
+        </div>
 
-          {/* Card B: Batch Minting - Keep existing implementation */}
-          <Card className="p-8 bg-card border border-border rounded-xl flex flex-col md:col-span-2">
-            <div>
-              <h2 className="text-2xl font-bold text-primary mb-1">Pay Your Team — All at Once</h2>
-              <p className="text-foreground mb-6">Issue tokens in one transaction. Save 90% on fees.</p>
-
-              {/* Department Selector */}
-              <div className="mb-6">
-                <Label className="text-sm font-medium text-foreground block mb-2">Select Department/Role</Label>
-                <Select value={selectedDept} onValueChange={setSelectedDept} disabled={isProcessing}>
-                  <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="engineering">Engineering Department</SelectItem>
-                    <SelectItem value="design">Design Department</SelectItem>
-                    <SelectItem value="product">Product Department</SelectItem>
-                    <SelectItem value="marketing">Marketing Department</SelectItem>
-                    <SelectItem value="operations">Operations Department</SelectItem>
-                  </SelectContent>
-                </Select>
+        {/* Card 3: Batch Minting */}
+        <div className="flex justify-center mb-12">
+          <Card className="w-full max-w-4xl p-8 bg-card border border-border rounded-xl">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="p-2 bg-secondary/10 rounded-lg">
+                <CreditCard className="w-6 h-6 text-secondary" />
               </div>
-
-              {/* Worker Selection Table */}
-              <div className="mb-6">
-                <div className="flex items-center justify-between mb-3">
-                  <p className="text-sm font-medium text-foreground">Workers in {selectedDept.charAt(0).toUpperCase() + selectedDept.slice(1)}</p>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={selectedWorkers.size === deptWorkers.length && deptWorkers.length > 0}
-                      onChange={selectAllDeptWorkers}
-                      className="w-4 h-4 rounded border-border"
-                      disabled={isProcessing}
-                    />
-                    <span className="text-xs text-muted-foreground">Select All</span>
-                  </label>
-                </div>
-                <div className="border border-border rounded-lg p-4 max-h-48 overflow-y-auto bg-muted/30">
-                  {deptWorkers.length > 0 ? (
-                    <Table>
-                      <TableBody>
-                        {deptWorkers.map((worker: any) => (
-                          <TableRow key={worker.wallet} className="border-b border-border/50 last:border-b-0 hover:bg-muted/20">
-                            <TableCell className="py-2 pl-0 w-6">
-                              <input
-                                type="checkbox"
-                                checked={selectedWorkers.has(worker.wallet)}
-                                onChange={() => toggleWorkerSelection(worker.wallet)}
-                                className="w-4 h-4 rounded border-border"
-                                disabled={isProcessing}
-                              />
-                            </TableCell>
-                            <TableCell className="text-sm font-medium text-foreground py-2">{worker.name || 'Unnamed'}</TableCell>
-                            <TableCell className="text-sm text-muted-foreground py-2">{worker.role}</TableCell>
-                            <TableCell className="py-2">
-                              <Badge className={`rounded-full px-2 py-0.5 text-xs ${
-                                worker.currentPeriod?.status === 'active'
-                                  ? 'bg-secondary/20 text-secondary'
-                                  : 'bg-yellow-100 text-yellow-700'
-                              }`}>
-                                {worker.currentPeriod?.status === 'active' ? 'Active' : 'Needs Tokens'}
-                              </Badge>
-                            </TableCell>
-                            <TableCell className="text-sm text-muted-foreground py-2">
-                              {worker.currentPeriod?.validTo ? new Date(worker.currentPeriod.validTo).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  ) : (
-                    <p className="text-sm text-muted-foreground text-center py-4">No workers in this department</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Periods Selector */}
-              <div className="mb-6">
-                <Label className="text-sm font-medium text-foreground block mb-3">Cover payroll for:</Label>
-                <div className="flex gap-3">
-                  {['1', '3', '6', '12'].map((period) => (
-                    <button
-                      key={period}
-                      onClick={() => setSelectedPeriods(period)}
-                      disabled={isProcessing}
-                      className={`px-4 py-2 rounded-lg font-medium text-sm transition ${
-                        selectedPeriods === period
-                          ? 'bg-primary text-primary-foreground'
-                          : 'bg-muted text-muted-foreground border border-border hover:border-primary'
-                      } disabled:opacity-50 disabled:cursor-not-allowed`}
-                    >
-                      {period} {period === '1' ? 'month' : 'months'}
-                    </button>
-                  ))}
-                </div>
-                <p className="text-xs text-muted-foreground mt-2">Paying for multiple months now means automatic payments later—no extra work.</p>
-              </div>
-
-              {/* Fee Summary */}
-              <div className="bg-muted/30 rounded-lg p-4 border border-border mb-6">
-                <p className="text-sm text-foreground">
-                  <span className="font-medium">Estimated network fee:</span> {constants.SCROLL_FIXED_COST} sats (Sponsored by Treasury)
-                </p>
-                <p className="text-xs text-muted-foreground mt-2">Company treasury pays this. Workers pay nothing.</p>
-              </div>
-
-              {/* Issue Button */}
-              <Button 
-                onClick={handleIssueTokens}
-                disabled={selectedWorkers.size === 0 || isProcessing || !currentPlanNftUtxo}
-                className="w-full bg-secondary hover:bg-secondary/90 disabled:bg-muted disabled:text-muted-foreground text-secondary-foreground font-semibold py-2 rounded-lg mb-6"
-              >
-                {isProcessing ? 'Processing...' : `Issue Tokens for ${selectedWorkers.size} ${selectedWorkers.size === 1 ? 'Worker' : 'Workers'}`}
-              </Button>
-
-              {/* Preview Section */}
-              {selectedWorkers.size > 0 && (
-                <div className="bg-primary/5 border border-primary/20 rounded-lg p-4">
-                  <p className="text-sm text-foreground mb-2">
-                    <span className="font-medium">Summary:</span> {selectedWorkers.size} worker{selectedWorkers.size !== 1 ? 's' : ''} will receive tokens covering the next {selectedPeriods} month{parseInt(selectedPeriods) !== 1 ? 's' : ''}
-                  </p>
-                  <p className="text-sm text-foreground">
-                    <span className="font-medium">Total:</span> {selectedWorkers.size * parseInt(selectedPeriods)} tokens issued in 1 Bitcoin transaction
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-2">Instead of {selectedWorkers.size * parseInt(selectedPeriods)} separate transactions, you pay once.</p>
-                </div>
-              )}
+              <h2 className="text-2xl font-bold text-primary">Pay Your Team — All at Once</h2>
             </div>
+            <p className="text-foreground mb-6">Issue tokens in one transaction. Save 90% on fees.</p>
+
+            {/* Department Selector */}
+            <div className="mb-6">
+              <Label className="text-sm font-medium text-foreground block mb-2">Select Department</Label>
+              <Select value={selectedDept} onValueChange={setSelectedDept} disabled={isProcessing || registeredDepts.length === 0}>
+                <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
+                  <SelectValue placeholder={registeredDepts.length === 0 ? "Create a department first" : "Select department"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {registeredDepts.map((dept) => (
+                    <SelectItem key={dept.appId} value={dept.department}>
+                      {dept.department.charAt(0).toUpperCase() + dept.department.slice(1)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Worker Selection Table */}
+            <div className="mb-6">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-sm font-medium text-foreground">
+                  Workers in {selectedDept ? selectedDept.charAt(0).toUpperCase() + selectedDept.slice(1) : 'selected department'}
+                </p>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedWorkers.size === deptWorkers.length && deptWorkers.length > 0}
+                    onChange={selectAllDeptWorkers}
+                    className="w-4 h-4 rounded border-border"
+                    disabled={isProcessing}
+                  />
+                  <span className="text-xs text-muted-foreground">Select All</span>
+                </label>
+              </div>
+              <div className="border border-border rounded-lg p-4 max-h-48 overflow-y-auto bg-muted/30">
+                {deptWorkers.length > 0 ? (
+                  <Table>
+                    <TableBody>
+                      {deptWorkers.map((worker: any) => (
+                        <TableRow key={worker.wallet} className="border-b border-border/50 last:border-b-0 hover:bg-muted/20">
+                          <TableCell className="py-2 pl-0 w-6">
+                            <input
+                              type="checkbox"
+                              checked={selectedWorkers.has(worker.wallet)}
+                              onChange={() => toggleWorkerSelection(worker.wallet)}
+                              className="w-4 h-4 rounded border-border"
+                              disabled={isProcessing}
+                            />
+                          </TableCell>
+                          <TableCell className="text-sm font-medium text-foreground py-2">{worker.name || 'Unnamed'}</TableCell>
+                          <TableCell className="text-sm text-muted-foreground py-2">{worker.role}</TableCell>
+                          <TableCell className="py-2">
+                            <Badge className={`rounded-full px-2 py-0.5 text-xs ${
+                              worker.currentPeriod?.status === 'active'
+                                ? 'bg-secondary/20 text-secondary'
+                                : 'bg-yellow-100 text-yellow-700'
+                            }`}>
+                              {worker.currentPeriod?.status === 'active' ? 'Active' : 'Needs Tokens'}
+                            </Badge>
+                          </TableCell>
+                          <TableCell className="text-sm text-muted-foreground py-2">
+                            {worker.currentPeriod?.validTo ? new Date(worker.currentPeriod.validTo).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                ) : (
+                  <p className="text-sm text-muted-foreground text-center py-4">No workers in this department</p>
+                )}
+              </div>
+            </div>
+
+            {/* Periods Selector */}
+            <div className="mb-6">
+              <Label className="text-sm font-medium text-foreground block mb-3">Cover payroll for:</Label>
+              <div className="flex gap-3">
+                {['1', '3', '6', '12'].map((period) => (
+                  <button
+                    key={period}
+                    onClick={() => setSelectedPeriods(period)}
+                    disabled={isProcessing}
+                    className={`px-4 py-2 rounded-lg font-medium text-sm transition ${
+                      selectedPeriods === period
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-muted text-muted-foreground border border-border hover:border-primary'
+                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                  >
+                    {period} {period === '1' ? 'month' : 'months'}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">Paying for multiple months now means automatic payments later—no extra work.</p>
+            </div>
+
+            {/* Fee Summary */}
+            <div className="bg-muted/30 rounded-lg p-4 border border-border mb-6">
+              <p className="text-sm text-foreground">
+                <span className="font-medium">Estimated network fee:</span> {constants.SCROLL_FIXED_COST} sats (Sponsored by Treasury)
+              </p>
+              <p className="text-xs text-muted-foreground mt-2">Company treasury pays this. Workers pay nothing.</p>
+            </div>
+
+            {/* Issue Button */}
+            <Button 
+              onClick={handleIssueTokens}
+              disabled={selectedWorkers.size === 0 || isProcessing || !currentPlanNftUtxo || registeredDepts.length === 0}
+              className="w-full bg-secondary hover:bg-secondary/90 disabled:bg-muted disabled:text-muted-foreground text-secondary-foreground font-semibold py-2 rounded-lg mb-6"
+            >
+              {isProcessing ? 'Processing (60-105 sec)...' : `Issue Tokens for ${selectedWorkers.size} ${selectedWorkers.size === 1 ? 'Worker' : 'Workers'}`}
+            </Button>
+
+            {/* Preview Section */}
+            {selectedWorkers.size > 0 && (
+              <div className="bg-primary/5 border border-primary/20 rounded-lg p-4">
+                <p className="text-sm text-foreground mb-2">
+                  <span className="font-medium">Summary:</span> {selectedWorkers.size} worker{selectedWorkers.size !== 1 ? 's' : ''} will receive tokens covering the next {selectedPeriods} month{parseInt(selectedPeriods) !== 1 ? 's' : ''}
+                </p>
+                <p className="text-sm text-foreground">
+                  <span className="font-medium">Total:</span> {selectedWorkers.size * parseInt(selectedPeriods)} tokens issued in 1 Bitcoin transaction
+                </p>
+                <p className="text-xs text-muted-foreground mt-2">Instead of {selectedWorkers.size * parseInt(selectedPeriods)} separate transactions, you pay once.</p>
+              </div>
+            )}
           </Card>
         </div>
 
@@ -855,10 +1198,10 @@ export default function EmployerDashboard() {
         {/* Helper Text */}
         <div className="mt-8 p-4 bg-muted/30 rounded-lg border border-border">
           <p className="text-sm text-foreground">
-            <span className="font-medium">✨ One transaction pays your whole team.</span> Instead of {totalWorkers} separate payments, you pay once. Workers see their status instantly.
+            <span className="font-medium">✨ One NFT per department, unlimited workers.</span> Create a department NFT once, then hire as many workers as you need with different salaries. All workers under the same department share the same pay frequency.
           </p>
           <p className="text-sm text-foreground mt-2">
-            <span className="font-medium">🔒 All salaries encrypted.</span> Only you and the worker can see payment details.
+            <span className="font-medium">🔒 Salaries encrypted.</span> Only you and the worker can see payment details. The blockchain only enforces the pay period, not individual salaries.
           </p>
         </div>
       </main>

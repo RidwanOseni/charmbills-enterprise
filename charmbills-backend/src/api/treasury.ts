@@ -1,15 +1,44 @@
 import { Request, Response } from 'express';
 import { Database } from 'sqlite3';
 import axios from 'axios';
-// 1. IMPORT the hex fetcher from your utxo-manager
 import { fetchTransactionHex } from '../lib/utxo-manager';
 import { generateUnsignedTransactions } from '../charms/proverClient';
-import { v4 as uuidv4 } from 'uuid';
+import * as crypto from 'crypto';
 import * as constants from '@shared/constants';
+import { SpellRequest } from '@shared/types';
+
 const db: Database = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
 
+// --------------------------------------------------------------------------------
+// Database Helper - Company Lookup
+// --------------------------------------------------------------------------------
+
+interface CompanyRecord {
+  employerAddress: string;
+  treasuryAddress: string;
+  treasuryHexDest: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
 /**
- * GET /api/termination/pending
+ * Get company configuration by employer address
+ */
+async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRecord | null> {
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+      [employerAddress],
+      (err: Error | null, row: any) => {
+        if (err) reject(err);
+        else resolve(row || null);
+      }
+    );
+  });
+}
+
+/**
+ * GET /api/treasury/pending
  * Fetches all pending multisig actions requiring board approval [2]
  */
 export async function getPendingApprovals(req: Request, res: Response) {
@@ -39,25 +68,77 @@ export async function getPendingApprovals(req: Request, res: Response) {
 }
 
 /**
- * POST /api/termination/terminate
+ * POST /api/workers/terminate
  * Terminates a worker and creates board-level emergency pause transaction [3]
  * 
- * Body: { walletAddress: string, reason?: string }
+ * Body: { 
+ *   walletAddress: string, 
+ *   employerAddress: string, 
+ *   authorityUtxo: string,
+ *   fundingUtxo: string,
+ *   fundingValue: number,
+ *   changeAddress: string,
+ *   reason?: string 
+ * }
  */
 export async function terminateWorker(req: Request, res: Response) {
-    const { walletAddress, reason } = req.body;
+    const { 
+        walletAddress, 
+        employerAddress, 
+        authorityUtxo,      // The worker token UTXO to freeze
+        fundingUtxo,        // Treasury UTXO for fees
+        fundingValue,       // Value of funding UTXO
+        changeAddress,      // Change address for BTC
+        reason 
+    } = req.body;
     
     if (!walletAddress) {
         return res.status(400).json({ error: 'walletAddress is required' });
     }
     
+    if (!employerAddress) {
+        return res.status(400).json({ error: 'employerAddress is required' });
+    }
+    
+    if (!authorityUtxo) {
+        return res.status(400).json({ error: 'authorityUtxo (worker token) is required' });
+    }
+    
+    if (!fundingUtxo || !fundingValue) {
+        return res.status(400).json({ error: 'fundingUtxo and fundingValue are required' });
+    }
+    
+    if (!changeAddress) {
+        return res.status(400).json({ error: 'changeAddress is required' });
+    }
+    
     try {
+        // ----------------------------------------------------------------------------
+        // Step 1: Look up company configuration for treasuryHexDest [4]
+        // ----------------------------------------------------------------------------
+        console.log(`[TERMINATION API] 🔍 Looking up company for employer: ${employerAddress.substring(0, 20)}...`);
+        
+        const company = await getCompanyByEmployer(employerAddress);
+        
+        if (!company || !company.treasuryHexDest) {
+            console.error(`[TERMINATION API] ❌ Company not found for employer: ${employerAddress}`);
+            return res.status(404).json({ 
+                error: 'Company not registered. Please complete company onboarding first.',
+                employerAddress: employerAddress.substring(0, 20) + '...'
+            });
+        }
+        
+        console.log(`[TERMINATION API] ✅ Company found:`, {
+            treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...',
+            treasuryAddress: company.treasuryAddress.substring(0, 20) + '...'
+        });
+        
         // Begin transaction for atomicity
         await new Promise((resolve, reject) => {
             db.run('BEGIN TRANSACTION', (err: Error | null) => err ? reject(err) : resolve(null));
         });
 
-        // 1. Off-chain: Update status in WorkerCache to prevent future funding [4]
+        // Step 2: Off-chain: Update status in WorkerCache to prevent future funding [4]
         await new Promise((resolve, reject) => {
             db.run(
                 'UPDATE workers SET status = "terminated" WHERE walletAddress = ?', 
@@ -72,10 +153,10 @@ export async function terminateWorker(req: Request, res: Response) {
             );
         });
 
-        // 2. Get vault details - specifically target the unspent token currently held by the worker [17]
+        // Step 3: Get vault details - specifically target the unspent token currently held by the worker [17]
         const vaultDetails: any = await new Promise((resolve, reject) => {
             db.get(
-                `SELECT p.appId, w.currentTokenUtxo, p.multiSigSigners
+                `SELECT p.appId, w.currentTokenUtxo, p.multiSigSigners, p.ticker
                  FROM workers w
                  JOIN plans p ON w.planId = p.appId
                  WHERE w.walletAddress = ? AND w.status = 'active'`,
@@ -88,36 +169,38 @@ export async function terminateWorker(req: Request, res: Response) {
             throw new Error('No active payroll vault found for this worker');
         }
 
-        // 3. PRODUCTION FIX: Fetch raw hexes for provenance verification [5, 6]
+        // Step 4: PRODUCTION FIX: Fetch raw hexes for provenance verification [5, 6]
         const [tokenTxid] = vaultDetails.currentTokenUtxo.split(':');
         const tokenTxHex = await fetchTransactionHex(tokenTxid);
         
-        // Also fetch treasury funding hex for sponsorship
-        const treasuryUtxo = process.env.PAYROLL_TREASURY_UTXO;
-        if (!treasuryUtxo) {
-            throw new Error('PAYROLL_TREASURY_UTXO not configured');
-        }
-        const [treasuryTxid] = treasuryUtxo.split(':');
-        const treasuryTxHex = await fetchTransactionHex(treasuryTxid);
+        // Also fetch funding UTXO hex
+        const [fundingTxid] = fundingUtxo.split(':');
+        const fundingTxHex = await fetchTransactionHex(fundingTxid);
 
-        // 4. Generate the emergency freeze spell (requires board signatures) [3, 5]
-        // PASS currentTokenUtxo as the authorityUtxo to freeze [15]
+        // Step 5: FIX FOR TS2345: Explicitly type the request object [1]
+        // This prevents the "Type 'string' is not assignable to type..." error
+        const request: SpellRequest = {
+            type: 'send', // Freeze operation using send spell (no outputs = freeze)
+            authorityUtxo: authorityUtxo, // The worker token to freeze
+            fundingUtxo: fundingUtxo,
+            fundingUtxoValue: fundingValue,
+            changeAddress: changeAddress,
+            feeRate: constants.DEFAULT_FEE_RATE,
+            outputs: [] // Empty outputs = freeze/burn operation
+        };
+        
+        console.log(`[TERMINATION API] ⏳ Generating freeze spell with treasury hex: ${company.treasuryHexDest.substring(0, 30)}...`);
+        
+        // Step 6: FIX FOR TS2554: Pass treasuryHexDest as the 3rd argument [3, 6, 7]
         const freezeSpell = await generateUnsignedTransactions(
-            {
-                type: 'scroll-freeze', // You'll need to implement this in proverClient
-                authorityUtxo: vaultDetails.currentTokenUtxo, // TARGET: The specific worker token [15]
-                fundingUtxo: process.env.PAYROLL_TREASURY_UTXO!,
-                fundingUtxoValue: parseInt(process.env.PAYROLL_TREASURY_VALUE!),
-                changeAddress: process.env.PAYROLL_CHANGE_ADDRESS!,
-                feeRate: constants.DEFAULT_FEE_RATE,
-                outputs: [] // Freeze operations typically have no outputs
-            },
-            [tokenTxHex, treasuryTxHex], // Corrected: Full raw hexes [5, 8]
-            vaultDetails.appId
+            request, 
+            [tokenTxHex, fundingTxHex], // prevTxHexes: worker token + funding UTXO
+            company.treasuryHexDest,    // FIX: Pass treasuryHexDest from company lookup [7]
+            vaultDetails.appId          // appId for the plan
         );
 
-        // 5. Create multisig transaction record for board approval with worker_address column
-        const multisigId = `freeze-${uuidv4()}`;
+        // Step 7: Create multisig transaction record for board approval
+        const multisigId = crypto.randomUUID();
         const description = reason 
             ? `Emergency Freeze: Worker ${walletAddress} - ${reason}`
             : `Emergency Freeze: Worker ${walletAddress}`;
@@ -125,12 +208,13 @@ export async function terminateWorker(req: Request, res: Response) {
         await new Promise((resolve, reject) => {
             db.run(
                 `INSERT INTO multisig_transactions 
-                (id, type, category, description, worker_address, commitTxHex, spellTxHex, threshold, signers_json, createdAt, status) 
-                VALUES (?, 'vault-freeze', 'corporate', ?, ?, ?, ?, 3, '[]', ?, 'pending')`,
+                (id, type, category, description, worker_address, employerAddress, commitTxHex, spellTxHex, threshold, signers_json, createdAt, status) 
+                VALUES (?, 'vault-freeze', 'corporate', ?, ?, ?, ?, ?, 3, '[]', ?, 'pending')`,
                 [
                     multisigId,
                     description,
-                    walletAddress, // POPULATE NEW COLUMN
+                    walletAddress,              // worker_address column
+                    employerAddress,            // employerAddress column
                     freezeSpell.commitTxHex,
                     freezeSpell.spellTxHex,
                     new Date().toISOString()
@@ -175,14 +259,13 @@ export async function terminateWorker(req: Request, res: Response) {
 }
 
 /**
- * POST /api/termination/approve
+ * POST /api/treasury/approve
  * Allows board members to sign pending multisig transactions with RBAC verification
  * and PSBT state persistence until threshold is met, then broadcasts to network.
  * 
  * Body: { multisigId: string, signerKey: string, signedCommitHex: string, signedSpellHex: string }
  */
 export async function approveTermination(req: Request, res: Response) {
-    // 1. ADDITION: Receive the partially signed hexes from the frontend [1]
     const { multisigId, signerKey, signedCommitHex, signedSpellHex } = req.body;
 
     if (!multisigId || !signerKey || !signedCommitHex || !signedSpellHex) {
@@ -194,7 +277,7 @@ export async function approveTermination(req: Request, res: Response) {
         const authData: any = await new Promise((resolve, reject) => {
             db.get(
                 `SELECT p.multiSigSigners FROM multisig_transactions mt
-                 JOIN workers w ON mt.worker_address = w.walletAddress -- RELIABLE JOIN
+                 JOIN workers w ON mt.worker_address = w.walletAddress
                  JOIN plans p ON w.planId = p.appId
                  WHERE mt.id = ?`,
                 [multisigId],
@@ -234,8 +317,7 @@ export async function approveTermination(req: Request, res: Response) {
         const threshold = tx.threshold;
         const canBroadcast = currentSigners.length >= threshold;
 
-        // 2. OVERSIGHT FIX (PSBT State Persistence): Save the updated hexes to the DB [1, 2]
-        // This allows the next signer to build upon the previous signatures.
+        // Save the updated hexes to the DB with state persistence [1, 2]
         await new Promise((resolve, reject) => {
             db.run(
                 `UPDATE multisig_transactions 
@@ -253,19 +335,17 @@ export async function approveTermination(req: Request, res: Response) {
             );
         });
 
-        // 3. OVERSIGHT FIX (Broadcast Coordination): Trigger on-chain broadcast [3-5]
+        // Trigger on-chain broadcast if threshold met [3-5]
         if (canBroadcast) {
             console.log(`[TERMINATION API] ✅ Threshold met for ${multisigId}. Broadcasting package...`);
             
-            // Prepare RPC request for submitpackage
             const rpcRequest = {
                 jsonrpc: "1.0",
-                id: "charmbills-multisig-broadcast-" + Date.now(),
+                id: `charmbills-multisig-broadcast-${Date.now()}`,
                 method: "submitpackage",
-                params: [[signedCommitHex, signedSpellHex]] // Both txs must be accepted simultaneously [4, 6]
+                params: [[signedCommitHex, signedSpellHex]]
             };
 
-            // Get RPC credentials from environment
             const rpcUser = process.env.RPC_USER;
             const rpcPassword = process.env.RPC_PASSWORD;
             const rpcPort = process.env.RPC_PORT || 48332;
@@ -275,7 +355,6 @@ export async function approveTermination(req: Request, res: Response) {
                 throw new Error('RPC credentials not configured');
             }
 
-            // Submit package to Bitcoin node
             const rpcRes = await axios.post(`http://${rpcHost}:${rpcPort}`, rpcRequest, {
                 auth: { username: rpcUser, password: rpcPassword },
                 headers: { 'Content-Type': 'application/json' }
@@ -286,7 +365,6 @@ export async function approveTermination(req: Request, res: Response) {
             }
 
             if (rpcRes.data.result) {
-                // Update transaction status to broadcasted
                 await new Promise((resolve, reject) => {
                     db.run(
                         'UPDATE multisig_transactions SET status = "broadcasted" WHERE id = ?', 

@@ -49,6 +49,7 @@ export function deriveAppId(utxoId: string): string {
 
 /**
  * Validates that the request contains all required fields for payroll NFT minting
+ * UPDATED: Removed compensationSats validation - now enforced at Scroll Settlement Layer
  */
 function validatePayrollRequest(request: SpellRequest): void {
   // Check request type
@@ -111,11 +112,14 @@ function validatePayrollRequest(request: SpellRequest): void {
     throw new ValidationError(`payPeriodSeconds must be positive, got ${metadata.payPeriodSeconds}`);
   }
   
-  if (!metadata.compensationSats || metadata.compensationSats < MIN_OUTPUT_SATS) {
-    throw new ValidationError(
-      `compensationSats must be at least ${MIN_OUTPUT_SATS}, got ${metadata.compensationSats}`
-    );
-  }
+  // ----------------------------------------------------------------------------
+  // REMOVED: compensationSats validation - no longer enforced on-chain
+  // Salary enforcement now happens at Scroll Settlement Layer
+  // ----------------------------------------------------------------------------
+  // OLD VALIDATION (REMOVED):
+  // if (!metadata.compensationSats || metadata.compensationSats < MIN_OUTPUT_SATS) {
+  //   throw new ValidationError(...);
+  // }
   
   // Optional fields with defaults
   if (metadata.remaining !== undefined && metadata.remaining <= 0) {
@@ -134,22 +138,43 @@ function validatePayrollRequest(request: SpellRequest): void {
  * 
  * Implements the Hybrid Metadata model for privacy and enforcement [1].
  * 
+ * UNIFIED DEPARTMENTAL NFT MODEL:
+ * - compensationSats is now a placeholder (0) since salary is enforced at Scroll Settlement Layer
+ * - One NFT per department handles multiple workers with different salaries
+ * 
  * @param request - Validated spell request with payroll metadata
+ * @param treasuryHexDest - The treasury hex destination (from company config) [5, 11]
  * @returns Object containing template variables and derived appId
  */
-export function buildMintNFT(request: SpellRequest): { spellVars: Record<string, string>; appId: string } {
+export function buildMintNFT(
+  request: SpellRequest, 
+  treasuryHexDest: string // Passed from API lookup [5, 11]
+): { spellVars: Record<string, string>; appId: string } {
   // ----------------------------------------------------------------------------
   // Step 1: Validate input
   // ----------------------------------------------------------------------------
   validatePayrollRequest(request);
   
   // ----------------------------------------------------------------------------
-  // Step 2: Derive appId from anchor UTXO
+  // Step 2: Validate treasuryHexDest parameter
+  // ----------------------------------------------------------------------------
+  if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
+    throw new ValidationError('treasuryHexDest is required for NFT minting');
+  }
+  
+  // Validate hex destination format (should be hex string, starts with '5120' for Taproot)
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+    throw new ValidationError('treasuryHexDest must be a valid hex string (even number of hex characters)');
+  }
+  
+  // ----------------------------------------------------------------------------
+  // Step 3: Derive appId from anchor UTXO
   // ----------------------------------------------------------------------------
   const appId = deriveAppId(request.anchorUtxo!);
   
   // ----------------------------------------------------------------------------
-  // Step 3: Extract validated data
+  // Step 4: Extract validated data
   // ----------------------------------------------------------------------------
   const output = request.outputs[0];
   const metadata = output.nftMetadata!;
@@ -160,40 +185,33 @@ export function buildMintNFT(request: SpellRequest): { spellVars: Record<string,
   // Remaining supply (default to 1 unless specified)
   const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
   
-  // Get treasury hex destination from environment
-  const treasuryHexDest = process.env.PAYROLL_TREASURY_HEX_DEST;
-  if (!treasuryHexDest) {
-    throw new ValidationError('PAYROLL_TREASURY_HEX_DEST environment variable is required');
-  }
-  
   // ----------------------------------------------------------------------------
-  // Step 4: Build template variables for envsubst
-  // These variables will replace placeholders in the YAML templates
+  // Step 5: Build template variables for envsubst
   // ----------------------------------------------------------------------------
   const spellVars: Record<string, string> = {
     // App identifiers
     app_id: appId,
     app_vk: APP_VK,
     
-    // UTXO inputs
+    // UTXO inputs for the YAML 'ins' block [Source 729]
     in_utxo_0: request.anchorUtxo!,
     funding_utxo: request.fundingUtxo!,
-    
-    // NFT metadata fields
+
+    // NFT metadata - Casing must be camelCase for Rust serde [Source 38]
     ticker: ticker,
     remaining: remaining.toString(),
     metadataHash: metadata.metadataHash,
-    scrollPolicy: metadata.scrollPolicy.toString(),
-    payPeriodSeconds: metadata.payPeriodSeconds.toString(),
-    compensationSats: metadata.compensationSats.toString(),
+    scrollPolicy: (metadata.scrollPolicy ?? 0).toString(),
+    payPeriodSeconds: (metadata.payPeriodSeconds ?? 0).toString(),
     
-    // Native Bitcoin output (treasury)
+    // CRITICAL: Must be >= 1000 to pass Rust validation [Source 39]
+    // Even if placeholder, "0" will cause a Condition Failed error.
+    compensationSats: Math.max(metadata.compensationSats || 0, 1000).toString(),
+
+    // Bitcoin Destination - Must match ${dest_0} in mint-nft.yaml [Source 729]
     dest_0: treasuryHexDest,
-    amount_0: MIN_OUTPUT_SATS.toString(),
-    
-    // Change address (for remaining BTC)
-    change_address: request.changeAddress
-  };
+    amount_0: "1000" // Required for the coins array amount [Source 810]
+};
   
   // Add optional multi-sig fields if present
   if (request.multiSigSigners && request.multiSigSigners.length > 0) {
@@ -202,7 +220,7 @@ export function buildMintNFT(request: SpellRequest): { spellVars: Record<string,
   }
   
   // ----------------------------------------------------------------------------
-  // Step 5: Logging (debug only, remove in production)
+  // Step 6: Logging (debug only, remove in production)
   // ----------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
     console.log('[buildMintNFT.payroll] ✅ Template variables built:', {
@@ -211,11 +229,11 @@ export function buildMintNFT(request: SpellRequest): { spellVars: Record<string,
       remaining,
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       payPeriodSeconds: metadata.payPeriodSeconds,
-      compensationSats: metadata.compensationSats,
+      compensationSats: spellVars.compensationSats,
       metadataHash: metadata.metadataHash.substring(0, 16) + '...',
       anchorUtxo: request.anchorUtxo,
       fundingUtxo: request.fundingUtxo,
-      treasuryDest: treasuryHexDest.substring(0, 16) + '...',
+      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
       hasMultiSig: !!request.multiSigSigners
     });
   }
@@ -244,7 +262,7 @@ export function createPayrollPlanRequest(params: {
   metadataHash: string;      // SHA256 of encrypted IPFS JSON
   scrollPolicy: 0 | 1;       // 0=Time, 1=Proof
   payPeriodSeconds: number;
-  compensationSats: number;
+  compensationSats?: number;  // Optional - now only used in IPFS metadata
   remaining?: number;        // Optional, defaults to 1
   feeRate?: number;
   multiSigSigners?: string[];
@@ -285,7 +303,7 @@ export function createPayrollPlanRequest(params: {
           metadataHash,
           scrollPolicy,
           payPeriodSeconds,
-          compensationSats
+          compensationSats: compensationSats || 0 // Placeholder - not enforced on-chain
         }
       }
     ],
@@ -330,9 +348,9 @@ export function createTestPayrollRequest(): SpellRequest {
     metadataHash: crypto.createHash('sha256').update('test-cid').digest('hex'),
     scrollPolicy: 0, // Time-based for employees
     payPeriodSeconds: 1209600, // 2 weeks
-    compensationSats: 5000000, // 5M sats
+    compensationSats: 0, // Placeholder - not enforced
     ticker: 'PAY-TEST',
-    remaining: 1, // Single authority NFT
+    remaining: 100, // Department supply (100 tokens for hiring)
     multiSigSigners: ['key1', 'key2', 'key3'],
     multiSigThreshold: 2
   });

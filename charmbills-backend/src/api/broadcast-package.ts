@@ -2,15 +2,34 @@ import { Request, Response } from 'express';
 import axios from 'axios';
 import * as constants from '@shared/constants';
 
+// --------------------------------------------------------------------------------
+// Configuration for local Bitcoin node (Testnet4)
+// --------------------------------------------------------------------------------
+const RPC_USER = process.env.RPC_USER;
+const RPC_PASSWORD = process.env.RPC_PASSWORD;
+const RPC_HOST = process.env.RPC_HOST || constants.DEFAULT_RPC_HOST || '127.0.0.1';
+const RPC_PORT = process.env.RPC_PORT || constants.DEFAULT_RPC_PORT || '48332';
+const RPC_URL = `http://${RPC_HOST}:${RPC_PORT}`;
+
+const auth = { username: RPC_USER || '', password: RPC_PASSWORD || '' };
+const headers = { 'Content-Type': 'text/plain' };
+
+// --------------------------------------------------------------------------------
+// Broadcast Package - Main Handler
+// --------------------------------------------------------------------------------
+
 /**
- * Broadcasts the signed transactions as a package to Bitcoin testnet4.
- * The frontend sends an array: [signedCommitHex, signedSpellHex].
+ * Broadcasts signed transactions as a package using submitpackage.
+ * Mandatory for v0.12 because the Spell depends on the Commit.
+ * 
+ * The frontend sends an array: [signedCommitHex, signedSpellHex] OR [signedCombinedHex] for v0.12.
  * 
  * PRODUCTION IMPLEMENTATION:
- * 1. Resolves RPC connection details from environment or constants
- * 2. Uses submitpackage RPC method for atomic broadcast (Protocol v0.12) [3]
+ * 1. Uses submitpackage RPC method for atomic broadcast (Protocol v0.12) [3]
+ * 2. Uses sendrawtransaction for single transactions (v0.12 collapsed model)
  * 3. Handles both object and string transaction formats
- * 4. Enhanced error logging for debugging
+ * 4. Supports single-transaction packages (v0.12 collapsed funding/spell model) [55, 225]
+ * 5. Enhanced error logging for debugging
  */
 export async function broadcastPackage(req: Request, res: Response) {
   const requestId = Math.random().toString(36).substring(7);
@@ -32,6 +51,8 @@ export async function broadcastPackage(req: Request, res: Response) {
 
     // ----------------------------------------------------------------------------
     // Step 2: Validate transactions package
+    // CRITICAL FIX: Allow single-transaction packages for v0.12 compatibility [Source 55, 225]
+    // The v0.12 collapsed funding/spell model returns a single combined transaction
     // ----------------------------------------------------------------------------
     console.log(`[BROADCAST:${requestId}] Transactions package analysis:`, {
       count: transactions?.length || 0,
@@ -40,27 +61,26 @@ export async function broadcastPackage(req: Request, res: Response) {
       secondItemType: transactions?.[1] ? typeof transactions[1] : 'undefined'
     });
 
-    if (!transactions || !Array.isArray(transactions) || transactions.length < 2) {
-      throw new Error("Package must contain exactly two signed transactions.");
+    // [FIX] Change validation from < 2 to === 0 to support single hexes [Source 55, 225]
+    if (!transactions || !Array.isArray(transactions) || transactions.length === 0) {
+      throw new Error("Package must contain at least one signed transaction.");
+    }
+
+    console.log(`[BROADCAST:${requestId}] Package contains ${transactions.length} transaction(s)`);
+    const isSingleTransaction = transactions.length === 1;
+    if (isSingleTransaction) {
+      console.log(`[BROADCAST:${requestId}] Single-transaction mode detected (v0.12 collapsed model) - using sendrawtransaction`);
+    } else {
+      console.log(`[BROADCAST:${requestId}] Dual-transaction mode detected (v11/v12 standard model) - using submitpackage`);
     }
 
     // ----------------------------------------------------------------------------
     // Step 3: Extract hex strings from object format if needed
     // ----------------------------------------------------------------------------
-    let hexTransactions: string[] = [];
+    const hexTransactions: string[] = [];
     
     for (let index = 0; index < transactions.length; index++) {
       const tx = transactions[index];
-      
-      console.log(`[BROADCAST:${requestId}] Transaction ${index} analysis:`, {
-        type: typeof tx,
-        isObject: tx && typeof tx === 'object',
-        isString: typeof tx === 'string',
-        hasBitcoinProperty: tx && typeof tx === 'object' && 'bitcoin' in tx,
-        bitcoinType: tx?.bitcoin ? typeof tx.bitcoin : 'N/A',
-        bitcoinLength: tx?.bitcoin?.length || 0,
-        rawValue: JSON.stringify(tx).substring(0, 100) + (JSON.stringify(tx).length > 100 ? '...' : '')
-      });
       
       // Extract hex from object format {bitcoin: "hex..."}
       if (tx && typeof tx === 'object' && tx.bitcoin && typeof tx.bitcoin === 'string') {
@@ -68,8 +88,7 @@ export async function broadcastPackage(req: Request, res: Response) {
         console.log(`[BROADCAST:${requestId}] Extracted hex from object for tx ${index}`);
         
         // Validate hex
-        const hex = tx.bitcoin;
-        if (!/^[0-9a-fA-F]+$/.test(hex)) {
+        if (!/^[0-9a-fA-F]+$/.test(tx.bitcoin)) {
           throw new Error(`Transaction ${index} contains invalid hex characters`);
         }
         
@@ -97,56 +116,49 @@ export async function broadcastPackage(req: Request, res: Response) {
     });
 
     // ----------------------------------------------------------------------------
-    // Step 4: Resolve RPC connection details [1]
-    // Priority: Environment Variables (.env) > Shared Constants > Hardcoded Default
+    // Step 4: Validate RPC credentials
     // ----------------------------------------------------------------------------
-    const rpcHost = process.env.RPC_HOST || constants.DEFAULT_RPC_HOST || '127.0.0.1';
-    const rpcPort = process.env.RPC_PORT || constants.DEFAULT_RPC_PORT || '48332';
-    const rpcUrl = `http://${rpcHost}:${rpcPort}`;
-    
-    // Get RPC credentials from environment [4]
-    const rpcUser = process.env.RPC_USER;
-    const rpcPassword = process.env.RPC_PASSWORD;
-    
-    if (!rpcUser || !rpcPassword) {
+    if (!RPC_USER || !RPC_PASSWORD) {
       throw new Error('RPC_USER and RPC_PASSWORD must be set in environment variables');
     }
     
     console.log(`[BROADCAST:${requestId}] RPC Configuration:`, {
-      host: rpcHost,
-      port: rpcPort,
-      url: rpcUrl,
-      hasUser: !!rpcUser,
-      hasPassword: !!rpcPassword
+      host: RPC_HOST,
+      port: RPC_PORT,
+      url: RPC_URL,
+      hasUser: !!RPC_USER,
+      hasPassword: !!RPC_PASSWORD
     });
 
     // ----------------------------------------------------------------------------
-    // Step 5: Prepare submitpackage RPC request for atomic broadcast [3]
-    // CRITICAL: submitpackage is mandatory for v0.12 atomic broadcast
+    // Step 5: Prepare RPC request - use appropriate method based on transaction count
+    // CRITICAL: submitpackage requires at least 2 transactions
+    // For single transactions, use sendrawtransaction instead
     // ----------------------------------------------------------------------------
+    const isSingle = hexTransactions.length === 1;
+    const rpcMethod = isSingle ? "sendrawtransaction" : "submitpackage";
+    const rpcParams = isSingle ? [hexTransactions[0]] : [hexTransactions];
+    
     const rpcRequest = {
       jsonrpc: "1.0",
       id: `charmbills-broadcast-${requestId}`,
-      method: "submitpackage", // Mandatory method for v11/v12 spells [3]
-      params: [hexTransactions] // The array: [signedCommitHex, signedSpellHex]
+      method: rpcMethod,
+      params: rpcParams
     };
     
     console.log(`[BROADCAST:${requestId}] RPC Request:`, {
       method: rpcRequest.method,
       paramsCount: rpcRequest.params.length,
-      txCount: rpcRequest.params[0]?.length
+      txCount: Array.isArray(rpcRequest.params[0]) ? rpcRequest.params[0].length : 1
     });
 
     // ----------------------------------------------------------------------------
     // Step 6: Execute the broadcast via RPC [4]
     // ----------------------------------------------------------------------------
-    console.log(`[BROADCAST:${requestId}] Connecting to: ${rpcUrl}`);
+    console.log(`[BROADCAST:${requestId}] Connecting to: ${RPC_URL}`);
     
-    const rpcResponse = await axios.post(rpcUrl, rpcRequest, {
-      auth: {
-        username: rpcUser,
-        password: rpcPassword
-      },
+    const rpcResponse = await axios.post(RPC_URL, rpcRequest, {
+      auth: { username: RPC_USER, password: RPC_PASSWORD },
       headers: { 'Content-Type': 'text/plain' },
       timeout: 30000 // 30 second timeout
     });
@@ -161,13 +173,16 @@ export async function broadcastPackage(req: Request, res: Response) {
     }
 
     const result = rpcResponse.data.result;
-    console.log(`[BROADCAST:${requestId}] Package submitted successfully via RPC:`, result);
+    console.log(`[BROADCAST:${requestId}] Broadcast successful via ${rpcMethod}:`, result);
     
     // ----------------------------------------------------------------------------
     // Step 8: Parse and return transaction IDs
     // ----------------------------------------------------------------------------
     let txids: string[] = [];
-    if (Array.isArray(result)) {
+    if (isSingle) {
+      // sendrawtransaction returns a single txid string
+      txids = [result];
+    } else if (Array.isArray(result)) {
       txids = result;
     } else if (typeof result === 'string') {
       txids = [result];
@@ -181,8 +196,9 @@ export async function broadcastPackage(req: Request, res: Response) {
     return res.status(200).json({
       success: true,
       txids: txids,
-      message: `Successfully broadcast package with ${txids.length} transaction(s)`,
-      rpcEndpoint: rpcUrl
+      message: `Successfully broadcast ${txids.length} transaction(s) using ${rpcMethod}`,
+      rpcEndpoint: RPC_URL,
+      isSingleMode: isSingle
     });
 
   } catch (error: any) {
@@ -221,12 +237,17 @@ export async function broadcastPackage(req: Request, res: Response) {
     } else if (error.message.includes('Invalid transaction')) {
       statusCode = 400;
       errorMessage = error.message;
+    } else if (error.message.includes('at least one signed transaction')) {
+      statusCode = 400;
+      errorMessage = error.message;
     }
+    
+    const errorData = error.response?.data?.error || error.response?.data || error.message;
     
     return res.status(statusCode).json({
       success: false,
       error: errorMessage,
-      details: error.response?.data?.error || error.response?.data,
+      details: errorData,
       code: error.code,
       requestId
     });
@@ -247,15 +268,8 @@ export async function checkRpcHealth(req: Request, res: Response) {
   console.log(`\n[RPC HEALTH:${requestId}] Checking RPC connection...`);
   
   try {
-    // Resolve RPC connection details using same priority [1]
-    const rpcHost = process.env.RPC_HOST || constants.DEFAULT_RPC_HOST || '127.0.0.1';
-    const rpcPort = process.env.RPC_PORT || constants.DEFAULT_RPC_PORT || '48332';
-    const rpcUrl = `http://${rpcHost}:${rpcPort}`;
-    
-    const rpcUser = process.env.RPC_USER;
-    const rpcPassword = process.env.RPC_PASSWORD;
-    
-    if (!rpcUser || !rpcPassword) {
+    // Validate RPC credentials
+    if (!RPC_USER || !RPC_PASSWORD) {
       throw new Error('RPC credentials not configured');
     }
     
@@ -267,10 +281,11 @@ export async function checkRpcHealth(req: Request, res: Response) {
       params: []
     };
     
-    console.log(`[RPC HEALTH:${requestId}] Testing connection to: ${rpcUrl}`);
+    console.log(`[RPC HEALTH:${requestId}] Testing connection to: ${RPC_URL}`);
     
-    const response = await axios.post(rpcUrl, rpcRequest, {
-      auth: { username: rpcUser, password: rpcPassword },
+    const response = await axios.post(RPC_URL, rpcRequest, {
+      auth: { username: RPC_USER, password: RPC_PASSWORD },
+      headers: { 'Content-Type': 'text/plain' },
       timeout: 5000
     });
     
@@ -290,7 +305,7 @@ export async function checkRpcHealth(req: Request, res: Response) {
       blocks: blockchainInfo.blocks,
       headers: blockchainInfo.headers,
       nodeVersion: blockchainInfo.version,
-      rpcEndpoint: rpcUrl,
+      rpcEndpoint: RPC_URL,
       message: 'RPC connection successful'
     });
     
@@ -298,6 +313,70 @@ export async function checkRpcHealth(req: Request, res: Response) {
     console.error(`[RPC HEALTH:${requestId}] ❌ RPC connection failed:`, error.message);
     
     return res.status(503).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data?.error || error.code
+    });
+  }
+}
+
+// --------------------------------------------------------------------------------
+// Node Info Endpoint - Get node details for dashboard
+// --------------------------------------------------------------------------------
+
+/**
+ * FIX FOR TS2305: Provides node version and network details to the dashboard.
+ * GET /api/broadcast/node-info
+ */
+export async function getNodeInfo(req: Request, res: Response) {
+  const requestId = Math.random().toString(36).substring(7);
+  
+  console.log(`\n[RPC NODE INFO:${requestId}] Fetching node information...`);
+  
+  try {
+    // Validate RPC credentials
+    if (!RPC_USER || !RPC_PASSWORD) {
+      throw new Error('RPC credentials not configured');
+    }
+    
+    // Get network info
+    const rpcRequest = {
+      jsonrpc: "1.0",
+      id: `node-info-${requestId}`,
+      method: "getnetworkinfo",
+      params: []
+    };
+    
+    const response = await axios.post(RPC_URL, rpcRequest, {
+      auth: { username: RPC_USER, password: RPC_PASSWORD },
+      headers: { 'Content-Type': 'text/plain' },
+      timeout: 10000
+    });
+    
+    if (response.data?.error) {
+      throw new Error(`RPC Error: ${response.data.error.message}`);
+    }
+    
+    const networkInfo = response.data.result;
+    
+    console.log(`[RPC NODE INFO:${requestId}] ✅ Node info retrieved`);
+    console.log(`[RPC NODE INFO:${requestId}] Version: ${networkInfo.version}`);
+    console.log(`[RPC NODE INFO:${requestId}] Network: ${networkInfo.network}`);
+    
+    return res.status(200).json({
+      success: true,
+      version: networkInfo.version,
+      subversion: networkInfo.subversion,
+      network: networkInfo.network,
+      connections: networkInfo.connections,
+      protocols: networkInfo.protocolversion,
+      warnings: networkInfo.warnings
+    });
+    
+  } catch (error: any) {
+    console.error(`[RPC NODE INFO:${requestId}] ❌ Failed to fetch node info:`, error.message);
+    
+    return res.status(500).json({
       success: false,
       error: error.message,
       details: error.response?.data?.error || error.code

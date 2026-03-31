@@ -1,11 +1,15 @@
 import { Request, Response } from 'express';
-import { generateUnsignedTransactions } from '../charms/proverClient';
-import { batchPayroll } from '../charms/proverClient';
-import { getDynamicFundingUtxo, estimateRequiredSats } from '../lib/utxo-manager';
+import { generateUnsignedTransactions, batchPayroll } from '../charms/proverClient';
+import { getDynamicFundingUtxo, estimateRequiredSats, fetchTransactionHex } from '../lib/utxo-manager';
 import { SpellRequest, ProverResult } from '@shared/types';
-import { calculateScrollFee } from '../lib/charms-utils';
+import { calculateScrollFee, verifyUtxoStatus } from '../lib/charms-utils';
+import { encryptPayrollData } from '@shared/encryption';
+import { pinToIPFS } from '../lib/ipfs-pinner';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
+import { Database } from 'sqlite3';
+
+const db = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
 
 // --------------------------------------------------------------------------------
 // Types
@@ -13,13 +17,15 @@ import * as crypto from 'crypto';
 
 interface WorkerAllocation {
   address: string;
-  periods: number;  // Number of pay periods to allocate (1 token = 1 period)
+  periods: number;        // Number of pay periods (1 token = 1 period)
+  salarySats: number;     // Individual worker salary in satoshis
+  role: string;           // Worker's role (e.g., "Senior Engineer")
 }
 
 interface MintPayrollTokenRequest {
-  authorityUtxo: string;      // Plan NFT UTXO from frontend scanner [1]
+  authorityUtxo: string;      // Plan NFT UTXO from frontend scanner
   authorityTxHex: string;     // Plan NFT creation tx hex (for provenance)
-  workers: WorkerAllocation[]; // Array of workers with their allocations
+  workers: WorkerAllocation[]; // Array of workers with their allocations, salaries, and roles
   employerAddress: string;     // Where to return the Plan NFT
   planMetadata: {
     appId: string;
@@ -30,6 +36,32 @@ interface MintPayrollTokenRequest {
     payPeriodSeconds: number;
     compensationSats: number;
   };
+  encryptionEntropy: string;   // REQUIRED: From wallet signature
+}
+
+interface CompanyRecord {
+  employerAddress: string;
+  treasuryAddress: string;
+  treasuryHexDest: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+// --------------------------------------------------------------------------------
+// Database Helper
+// --------------------------------------------------------------------------------
+
+async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRecord | null> {
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+      [employerAddress],
+      (err: Error | null, row: any) => {
+        if (err) reject(err);
+        else resolve(row || null);
+      }
+    );
+  });
 }
 
 // --------------------------------------------------------------------------------
@@ -42,7 +74,8 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
     'authorityTxHex',
     'workers',
     'employerAddress',
-    'planMetadata'
+    'planMetadata',
+    'encryptionEntropy'
   ];
   
   const missing = required.filter(field => {
@@ -69,14 +102,27 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
     throw new Error('workers must be a non-empty array');
   }
   
-  // Validate each worker
+  // Validate each worker with new fields
   body.workers.forEach((w: any, i: number) => {
     if (!w.address || typeof w.address !== 'string') {
       throw new Error(`Worker ${i}: address is required`);
     }
+    
+    // Validate periods (optional, default 1)
     if (w.periods !== undefined && (typeof w.periods !== 'number' || w.periods <= 0)) {
       throw new Error(`Worker ${i}: periods must be a positive number if provided`);
     }
+    
+    // Validate salarySats
+    if (typeof w.salarySats !== 'number' || w.salarySats < constants.MIN_OUTPUT_SATS) {
+      throw new Error(`Worker ${i}: salarySats must be a number >= ${constants.MIN_OUTPUT_SATS}`);
+    }
+    
+    // Validate role
+    if (!w.role || typeof w.role !== 'string' || w.role.trim().length === 0) {
+      throw new Error(`Worker ${i}: role is required and must be a non-empty string`);
+    }
+    
     // Validate address format (basic Bech32 check)
     if (!w.address.startsWith('tb1') && !w.address.startsWith('bc1')) {
       throw new Error(`Worker ${i}: address must be a valid Bech32 address (tb1... or bc1...)`);
@@ -100,6 +146,11 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
   if (!body.planMetadata.metadataHash || typeof body.planMetadata.metadataHash !== 'string') {
     throw new Error('planMetadata.metadataHash is required');
   }
+  
+  // Validate encryptionEntropy is a non-empty string
+  if (typeof body.encryptionEntropy !== 'string' || body.encryptionEntropy.length === 0) {
+    throw new Error('encryptionEntropy must be a non-empty string from wallet signature');
+  }
 }
 
 // --------------------------------------------------------------------------------
@@ -108,13 +159,12 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
 
 /**
  * Endpoint to hire workers (mint payroll tokens) with dynamic UTXO selection
- * POST /api/subscriptions/mint
+ * POST /api/payrollhiring/mint
  * 
- * PRODUCTION CHANGES:
- * 1. authorityUtxo comes from frontend scanner, NOT .env [1]
- * 2. Batch proving creates M tokens and returns 1 NFT to employer [10, 14]
- * 3. Dynamic funding selection for gas sponsorship [13]
- * 4. Uses batchPayroll helper for 1:M:N scaling [14]
+ * UNIFIED DEPARTMENTAL NFT MODEL:
+ * - Each worker has their own salary and role stored in encrypted IPFS
+ * - One Plan NFT governs the entire department
+ * - Salary enforcement happens at Scroll Settlement Layer, not on-chain
  */
 export async function mintPayrollToken(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -123,7 +173,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
   
   try {
     // ----------------------------------------------------------------------------
-    // Step 1: Validate request body - authorityUtxo MUST come from frontend [1]
+    // Step 1: Validate request body
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] Validating request body...`);
     
@@ -138,18 +188,20 @@ export async function mintPayrollToken(req: Request, res: Response) {
       workerCount: req.body.workers?.length || 0,
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
       hasPlanMetadata: !!req.body.planMetadata,
-      appId: req.body.planMetadata?.appId ? `${req.body.planMetadata.appId.substring(0, 16)}...` : 'missing'
+      appId: req.body.planMetadata?.appId ? `${req.body.planMetadata.appId.substring(0, 16)}...` : 'missing',
+      hasEncryptionEntropy: !!req.body.encryptionEntropy
     });
     
     // Validate all required fields
     validateMintRequest(req.body);
     
     const { 
-      authorityUtxo,      // Plan NFT UTXO from frontend scanner [1]
-      authorityTxHex,     // Plan NFT creation tx hex (for provenance)
-      workers,            // Array of worker allocations
-      employerAddress,    // Where to return the Plan NFT
-      planMetadata        // Plan NFT metadata (passed from frontend)
+      authorityUtxo,
+      authorityTxHex,
+      workers,
+      employerAddress,
+      planMetadata,
+      encryptionEntropy
     } = req.body;
     
     // Clean hex
@@ -158,7 +210,104 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`[HIRING API:${requestId}] ✅ Validation passed`);
     
     // ----------------------------------------------------------------------------
-    // Step 2: Calculate total tokens being minted
+    // Step 2: Safely handle encryption entropy - FIX TS2345
+    // This ensures the value passed to encryption is NEVER undefined
+    // ----------------------------------------------------------------------------
+    const entropy: string = encryptionEntropy || process.env.DEFAULT_ENCRYPTION_ENTROPY || "";
+    
+    if (!entropy) {
+      throw new Error("No encryption entropy source available. Wallet signature required.");
+    }
+    
+    console.log(`[HIRING API:${requestId}] 🔐 Encryption entropy available (length: ${entropy.length})`);
+    
+    // ----------------------------------------------------------------------------
+    // Step 3: Look up company to get treasuryHexDest
+    // ----------------------------------------------------------------------------
+    console.log(`[HIRING API:${requestId}] 🔍 Looking up company for employer: ${employerAddress.substring(0, 20)}...`);
+    
+    const company = await getCompanyByEmployer(employerAddress);
+    
+    if (!company) {
+      console.error(`[HIRING API:${requestId}] ❌ Company not found for employer: ${employerAddress}`);
+      return res.status(404).json({ 
+        error: 'Company not registered. Please complete company onboarding first.',
+        employerAddress: employerAddress.substring(0, 20) + '...'
+      });
+    }
+    
+    console.log(`[HIRING API:${requestId}] ✅ Company found`);
+    
+    // ----------------------------------------------------------------------------
+    // Step 4: Verify Plan NFT is still unspent
+    // ----------------------------------------------------------------------------
+    console.log(`[HIRING API:${requestId}] 🔍 Verifying Plan NFT UTXO: ${authorityUtxo.substring(0, 30)}...`);
+    
+    const utxoStatus = await verifyUtxoStatus(authorityUtxo);
+    
+    if (utxoStatus.spent) {
+      console.error(`[HIRING API:${requestId}] ❌ Plan NFT has been spent or is in mempool`);
+      return res.status(400).json({ 
+        error: "Plan NFT (Authority) has been spent or is in mempool. Please wait for confirmation.",
+        utxo: authorityUtxo,
+        status: utxoStatus
+      });
+    }
+    
+    console.log(`[HIRING API:${requestId}] ✅ Plan NFT is unspent and confirmed`);
+    
+    // ----------------------------------------------------------------------------
+    // Step 5: Encrypt worker data to IPFS with wallet entropy
+    // ----------------------------------------------------------------------------
+    console.log(`[HIRING API:${requestId}] 🔐 Encrypting worker data for ${workers.length} workers...`);
+    
+    const workerMetadataHashes: string[] = [];
+    
+    for (let i = 0; i < workers.length; i++) {
+      const worker = workers[i];
+      console.log(`[HIRING API:${requestId}]   Worker ${i + 1}: ${worker.address.substring(0, 16)}... (${worker.role})`);
+      
+      // Encrypt worker-specific data using wallet entropy
+      const encryptedWorkerData = encryptPayrollData({
+        walletAddress: worker.address,
+        role: worker.role,
+        salarySats: worker.salarySats,
+        department: planMetadata.ticker?.replace('-PAY', '') || 'Unknown',
+        hiredAt: new Date().toISOString(),
+        periods: worker.periods || 1
+      }, entropy);
+      
+      // Pin to IPFS
+      const { metadataHash } = await pinToIPFS(encryptedWorkerData);
+      workerMetadataHashes.push(metadataHash);
+      
+      // Save to workers table
+      await new Promise((resolve, reject) => {
+        db.run(
+          `INSERT OR REPLACE INTO workers (walletAddress, name, planId, engagementType, status, lastMintedPeriod, currentTokenUtxo, expiresAt, metadataHash, salarySats, role)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            worker.address,
+            worker.role,
+            planMetadata.appId,
+            planMetadata.scrollPolicy === 0 ? 0 : 1,
+            'active',
+            new Date().toISOString(),
+            null,
+            new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString(),
+            metadataHash,
+            worker.salarySats,
+            worker.role
+          ],
+          (err: Error | null) => err ? reject(err) : resolve(null)
+        );
+      });
+    }
+    
+    console.log(`[HIRING API:${requestId}] ✅ Worker data encrypted and pinned to IPFS`);
+    
+    // ----------------------------------------------------------------------------
+    // Step 6: Calculate total tokens being minted
     // ----------------------------------------------------------------------------
     const totalTokens = workers.reduce((sum, w) => sum + (w.periods || 1), 0);
     const newRemainingSupply = planMetadata.remaining - totalTokens;
@@ -178,7 +327,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     }
     
     // ----------------------------------------------------------------------------
-    // Step 3: Get treasury address from environment
+    // Step 7: Get treasury address from environment
     // ----------------------------------------------------------------------------
     const treasuryAddress = process.env.PAYROLL_TREASURY_ADDRESS;
     if (!treasuryAddress) {
@@ -186,38 +335,59 @@ export async function mintPayrollToken(req: Request, res: Response) {
     }
     
     // ----------------------------------------------------------------------------
-    // Step 4: Calculate required satoshis for fee sponsorship [13]
+    // Step 8: Calculate required satoshis for fee sponsorship
     // ----------------------------------------------------------------------------
     const requiredSats = estimateRequiredSats(workers.length);
     console.log(`[HIRING API:${requestId}] Estimated required: ${requiredSats} sats`);
     
     // ----------------------------------------------------------------------------
-    // Step 5: Dynamically select funding UTXO from treasury [13]
+    // Step 9: Dynamically select funding UTXO from treasury
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] Selecting funding UTXO...`);
-    const funding = await getDynamicFundingUtxo(treasuryAddress, requiredSats);
+    
+    const funding = await getDynamicFundingUtxo(
+      treasuryAddress, 
+      requiredSats,
+      employerAddress
+    );
     
     console.log(`[HIRING API:${requestId}] Selected funding:`, {
       utxo: funding.utxoId,
-      value: funding.value,
-      hexLength: funding.hex.length
+      value: funding.value
     });
     
     // ----------------------------------------------------------------------------
-    // Step 6: Calculate Scroll service fee (ENTERPRISE ADDITION)
+    // Step 10: Fetch funding UTXO hex from the blockchain
+    // CRITICAL: Frontend provides only the UTXO ID, prover needs the full hex
     // ----------------------------------------------------------------------------
-    const totalSatsSpent = funding.value;
-    const numInputs = 2; // Authority UTXO + Funding UTXO
-    const scrollFee = calculateScrollFee(numInputs, totalSatsSpent);
+    console.log(`[HIRING API:${requestId}] 🔍 Fetching funding UTXO hex...`);
     
-    console.log(`[HIRING API:${requestId}] 💳 Calculated Scroll Service Fee: ${scrollFee} sats`);
+    const fundingTxid = funding.utxoId.split(':')[0];
+    let fundingTxHex: string;
+    
+    try {
+      fundingTxHex = await fetchTransactionHex(fundingTxid);
+      console.log(`[HIRING API:${requestId}] ✅ Funding UTXO hex fetched (length: ${fundingTxHex.length} chars)`);
+    } catch (error: any) {
+      console.error(`[HIRING API:${requestId}] ❌ Failed to fetch funding UTXO hex:`, error.message);
+      return res.status(400).json({ 
+        error: `Failed to fetch funding transaction hex: ${error.message}`,
+        fundingTxid
+      });
+    }
     
     // ----------------------------------------------------------------------------
-    // Step 7: Prepare worker allocations for batchPayroll
+    // Step 11: Calculate Scroll service fee
+    // ----------------------------------------------------------------------------
+    const scrollFee = calculateScrollFee(2, funding.value);
+    console.log(`[HIRING API:${requestId}] 💳 Scroll Service Fee: ${scrollFee} sats`);
+    
+    // ----------------------------------------------------------------------------
+    // Step 12: Prepare worker allocations for batchPayroll
     // ----------------------------------------------------------------------------
     const workerAllocations = workers.map(w => ({
       address: w.address,
-      amount: w.periods || 1  // Default 1 token = 1 pay period
+      amount: w.periods || 1
     }));
     
     console.log(`[HIRING API:${requestId}] Worker allocations:`, {
@@ -226,24 +396,35 @@ export async function mintPayrollToken(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 8: Generate batch hiring transactions via batchPayroll [10, 14]
-    // This creates M worker tokens and returns 1 NFT to employer
+    // Step 13: Generate batch hiring transactions
+    // CRITICAL: Pass BOTH hex strings (authority + funding) to the prover
     // ----------------------------------------------------------------------------
-    console.log(`[HIRING API:${requestId}] Calling batchPayroll (1:M:N scaling)...`);
+    console.log(`[HIRING API:${requestId}] Calling batchPayroll...`);
     
-    const result: ProverResult = await batchPayroll(
-      authorityUtxo,                                      // Plan NFT UTXO [1]
-      workerAllocations,                                  // M workers with their token amounts
-      { utxo: funding.utxoId, value: funding.value },    // Dynamic funding UTXO [13]
-      employerAddress,                                    // Where to return the Plan NFT
-      planMetadata.appId,                                 // App ID from plan metadata
-      undefined                                           // Multi-sig signers (optional)
+    // Create a temporary SpellRequest for batchPayroll that includes both UTXOs
+    const batchRequest: SpellRequest = {
+      type: 'mint-token',
+      authorityUtxo: authorityUtxo,
+      anchorUtxo: authorityUtxo,
+      fundingUtxo: funding.utxoId,
+      fundingUtxoValue: funding.value,
+      changeAddress: employerAddress,
+      feeRate: constants.DEFAULT_FEE_RATE,
+      outputs: workerAllocations.map(w => ({ address: w.address, tokenAmount: w.amount })),
+    };
+    
+    // Call generateUnsignedTransactions directly with both hexes
+    const result: ProverResult = await generateUnsignedTransactions(
+      batchRequest,
+      [cleanAuthorityTxHex, fundingTxHex], // BOTH must be raw hex strings
+      company.treasuryHexDest,
+      planMetadata.appId
     );
     
-    console.log(`[HIRING API:${requestId}] ✅ Transactions generated via batchPayroll`);
+    console.log(`[HIRING API:${requestId}] ✅ Transactions generated`);
     
     // ----------------------------------------------------------------------------
-    // Step 9: Return success response with fee information
+    // Step 14: Return success response
     // ----------------------------------------------------------------------------
     const response = {
       ...result,
@@ -255,14 +436,14 @@ export async function mintPayrollToken(req: Request, res: Response) {
       scrollFee,
       sponsored: true,
       authorityUtxo: authorityUtxo,
+      utxoVerification: { verified: true, unspent: true },
+      workerMetadataHashes,
       requestId
     };
     
     console.log(`[HIRING API:${requestId}] ===== SUCCESS =====`);
-    console.log(`  Commit Tx: ${result.commitTxHex.substring(0, 40)}...`);
-    console.log(`  Spell Tx:  ${result.spellTxHex.substring(0, 40)}...`);
-    console.log(`  Workers:   ${workers.length}`);
-    console.log(`  Tokens:    ${totalTokens}`);
+    console.log(`  Workers: ${workers.length}`);
+    console.log(`  Tokens: ${totalTokens}`);
     console.log(`  Remaining: ${newRemainingSupply}`);
     console.log(`[HIRING API:${requestId}] ===== END =====\n`);
     
@@ -274,7 +455,6 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.error(`Stack: ${error.stack}`);
     console.error(`[HIRING API:${requestId}] ===== END =====\n`);
     
-    // Determine appropriate status code
     let statusCode = 500;
     if (error.message.includes('Missing') || 
         error.message.includes('must be') ||
@@ -282,7 +462,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       statusCode = 400;
     } else if (error.message.includes('Prover') || error.message.includes('generate')) {
       statusCode = 502;
-    } else if (error.message.includes('funding') || error.message.includes('UTXO')) {
+    } else if (error.message.includes('funding') || error.message.includes('UTXO') || error.message.includes('fetch funding')) {
       statusCode = 503;
     }
     
@@ -294,13 +474,9 @@ export async function mintPayrollToken(req: Request, res: Response) {
 }
 
 // --------------------------------------------------------------------------------
-// Batch Hire API - For hiring multiple workers in one transaction
+// Batch Hire API
 // --------------------------------------------------------------------------------
 
-/**
- * Endpoint to batch hire multiple workers
- * POST /api/subscriptions/batch-hire
- */
 export async function batchHireWorkers(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
   
@@ -308,14 +484,14 @@ export async function batchHireWorkers(req: Request, res: Response) {
   
   try {
     const { 
-      authorityUtxo,      // Plan NFT UTXO from frontend scanner
-      authorityTxHex,     // Plan NFT creation tx hex
-      workers,            // Array of worker addresses (each gets 1 token)
-      employerAddress,    // Where to return the Plan NFT
-      planMetadata        // Plan NFT metadata
+      authorityUtxo,
+      authorityTxHex,
+      workers,
+      employerAddress,
+      planMetadata,
+      encryptionEntropy
     } = req.body;
     
-    // Validate
     if (!authorityUtxo || !authorityTxHex || !workers || !employerAddress || !planMetadata) {
       throw new Error('Missing required fields');
     }
@@ -324,14 +500,16 @@ export async function batchHireWorkers(req: Request, res: Response) {
       throw new Error('workers must be a non-empty array');
     }
     
-    // Convert simple addresses to allocations with 1 token each
-    const allocations = workers.map((address: string) => ({
-      address,
-      amount: 1
+    // Convert simple addresses to full worker objects
+    const allocations = workers.map((w: any) => ({
+      address: w.address,
+      periods: w.periods || 1,
+      salarySats: w.salarySats,
+      role: w.role
     }));
     
-    // Delegate to main mint function
     req.body.workers = allocations;
+    req.body.encryptionEntropy = encryptionEntropy;
     return await mintPayrollToken(req, res);
     
   } catch (error: any) {
@@ -346,13 +524,9 @@ export async function batchHireWorkers(req: Request, res: Response) {
 }
 
 // --------------------------------------------------------------------------------
-// Get Hiring Quote API - Estimate fees before hiring
+// Get Hiring Quote API
 // --------------------------------------------------------------------------------
 
-/**
- * Endpoint to get a quote for hiring workers
- * POST /api/subscriptions/quote
- */
 export async function getHiringQuote(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
   
@@ -369,11 +543,8 @@ export async function getHiringQuote(req: Request, res: Response) {
       throw new Error('planRemaining must be a non-negative number if provided');
     }
     
-    // Calculate estimated fees
     const requiredSats = estimateRequiredSats(workerCount);
-    const scrollFee = calculateScrollFee(2, requiredSats); // 2 inputs: authority + funding
-    
-    // Calculate supply impact
+    const scrollFee = calculateScrollFee(2, requiredSats);
     const supplyRemaining = planRemaining !== undefined ? planRemaining - workerCount : undefined;
     
     const response = {

@@ -193,40 +193,57 @@ function calculateBatchMetrics(
  * 
  * @param request - Validated spell request with worker outputs and NFT return metadata
  * @param appId - The existing appId from the saved plan (passed, not derived)
+ * @param anchorUtxo - The anchor UTXO for private inputs (from company config) [10]
+ * @param treasuryHexDest - The treasury hex destination for change output (from company config) [12]
  * @returns Template variables object for envsubst
  */
-export function buildMintToken(request: SpellRequest, appId: string): Record<string, string> {
+export function buildMintToken(
+  request: SpellRequest, 
+  appId: string,
+  anchorUtxo: string,      // Required for private_inputs [10]
+  treasuryHexDest: string  // Required for change output [12]
+): Record<string, string> {
   // ----------------------------------------------------------------------------
   // Step 1: Validate request
   // ----------------------------------------------------------------------------
   validateBatchMintRequest(request);
 
   // ----------------------------------------------------------------------------
-  // Step 2: Separate and validate outputs
+  // Step 2: Validate parameters
+  // ----------------------------------------------------------------------------
+  if (!anchorUtxo || typeof anchorUtxo !== 'string') {
+    throw new ValidationError('anchorUtxo is required for batch token minting');
+  }
+  
+  // Validate anchor UTXO format
+  if (!/^[a-f0-9]+:\d+$/i.test(anchorUtxo)) {
+    throw new ValidationError(`Invalid anchorUtxo format: ${anchorUtxo} (expected "txid:vout")`);
+  }
+  
+  if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
+    throw new ValidationError('treasuryHexDest is required for batch token minting');
+  }
+  
+  // Validate hex destination format
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+    throw new ValidationError('treasuryHexDest must be a valid hex string (even number of hex characters)');
+  }
+
+  // ----------------------------------------------------------------------------
+  // Step 3: Separate and validate outputs
   // ----------------------------------------------------------------------------
   const { workerOutputs, nftReturnOutput } = separateOutputs(request);
   const metadata = nftReturnOutput.nftMetadata;
 
   // ----------------------------------------------------------------------------
-  // Step 3: Calculate batch metrics
+  // Step 4: Calculate batch metrics
   // ----------------------------------------------------------------------------
   const currentSupply = Number(metadata.remaining);
   const { totalTokensToMint, newRemainingSupply } = calculateBatchMetrics(
     workerOutputs,
     currentSupply
   );
-
-  // ----------------------------------------------------------------------------
-  // Step 4: Validate environment variables
-  // ----------------------------------------------------------------------------
-  if (!process.env.PAYROLL_ANCHOR_UTXO) {
-    throw new ValidationError('PAYROLL_ANCHOR_UTXO environment variable is required for private_inputs');
-  }
-
-  const treasuryHexDest = process.env.PAYROLL_TREASURY_HEX_DEST;
-  if (!treasuryHexDest) {
-    throw new ValidationError('PAYROLL_TREASURY_HEX_DEST environment variable is required');
-  }
 
   // ----------------------------------------------------------------------------
   // Step 5: Log batch details (debug only)
@@ -241,7 +258,8 @@ export function buildMintToken(request: SpellRequest, appId: string): Record<str
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       authorityUtxo: request.authorityUtxo,
       fundingUtxo: request.fundingUtxo,
-      anchorUtxo: process.env.PAYROLL_ANCHOR_UTXO?.substring(0, 32) + '...'
+      anchorUtxo: anchorUtxo.substring(0, 32) + '...',
+      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...'
     });
   }
 
@@ -253,12 +271,27 @@ export function buildMintToken(request: SpellRequest, appId: string): Record<str
     app_id: appId,
     app_vk: APP_VK,
     
-    // Anchor UTXO for private inputs
-    anchor_utxo: process.env.PAYROLL_ANCHOR_UTXO,
+    // UTXO inputs for the YAML 'ins' block [Source 230, 750]
+    plan_utxo: request.authorityUtxo!, 
+    funding_utxo: request.fundingUtxo!,
+    anchor_utxo: anchorUtxo, // Required for private witness [Source 64, 750]
+
+    // NFT metadata - Casing must be camelCase for Rust Serde [Source 49]
+    ticker: metadata.ticker || DEFAULT_TICKER,
+    currentSupply: currentSupply.toString(),
+    newRemaining: newRemainingSupply.toString(),
+    metadataHash: metadata.metadataHash,
+    scrollPolicy: (metadata.scrollPolicy ?? 0).toString(),
+    payPeriodSeconds: (metadata.payPeriodSeconds ?? 0).toString(),
     
-    // Change address
-    change_address: request.changeAddress
-  };
+    // CRITICAL: Must be >= 1000 to satisfy Rust validation [Source 50]
+    compensationSats: Math.max(metadata.compensationSats || 0, 1000).toString(),
+
+    // Treasury destinations [Source 231, 750]
+    change_amount: MIN_OUTPUT_SATS.toString(),
+    treasury_hex_dest: treasuryHexDest,
+    amount_0: MIN_OUTPUT_SATS.toString() // Standard return amount for authority NFT 
+};
   
   // ----------------------------------------------------------------------------
   // Step 7: ADD ALL REQUIRED MAPPINGS FOR THE YAML TEMPLATE
@@ -278,13 +311,13 @@ export function buildMintToken(request: SpellRequest, appId: string): Record<str
   spellVars.payPeriodSeconds = metadata.payPeriodSeconds.toString();
   spellVars.compensationSats = metadata.compensationSats.toString();
   
-  // Treasury change variables - Required for the Bitcoin output
+  // Treasury change variables - Required for the Bitcoin output (from parameter) [12]
   spellVars.change_amount = MIN_OUTPUT_SATS.toString();
   spellVars.treasury_hex_dest = treasuryHexDest;
   spellVars.amount_0 = MIN_OUTPUT_SATS.toString(); // For backward compatibility
   
   // ----------------------------------------------------------------------------
-  // Step 8: Add worker outputs with HEX destination conversion (FIXED)
+  // Step 8: Add worker outputs with HEX destination conversion
   // CRITICAL FIX: Use Buffer.from() to avoid TypeScript error and convert address to hex
   // ----------------------------------------------------------------------------
   workerOutputs.forEach((worker, index) => {

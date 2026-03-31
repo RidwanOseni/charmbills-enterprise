@@ -64,39 +64,68 @@ export async function scanAddressForCharms(address: string) {
     }
 }
 
-// REMOVED: markUtxoAsUsed, isUtxoUsed, getFundingUtxo, clearUsedUtxos, verifyUtxoStatus, 
+// REMOVED: markUtxoAsUsed, isUtxoUsed, getFundingUtxo, clearUsedUtxos, 
 // getWalletStatus, debugUtxos - Use utxo-manager.ts for backend selection logic
 
 /**
  * Manual verification of UTXO status using mempool.space API
- * Useful for debugging - KEPT for frontend debugging purposes
+ * FIX: Throws error on API failure instead of returning false positive
+ * 
+ * @param utxoId - UTXO ID in format "txid:vout"
+ * @returns Object containing spent status and transaction details
+ * @throws Error if API request fails
  */
 export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean, details: any }> {
   const [txid, vout] = utxoId.split(':');
+  
+  if (!txid || vout === undefined) {
+    throw new Error(`Invalid UTXO ID format: ${utxoId}. Expected "txid:vout"`);
+  }
+  
   try {
     // Try the outspend endpoint first (most accurate)
-    const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`);
+    const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`, {
+      timeout: 10000 // 10 second timeout
+    });
     const spentStatus = outspendResponse.data;
     
     // Also get the full transaction to see confirmations
-    const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`);
+    const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`, {
+      timeout: 10000
+    });
     const txDetails = txResponse.data;
     
+    const isSpent = spentStatus.spent === true;
+    const isConfirmed = txDetails.status?.confirmed === true;
+    
     console.log(`🔍 UTXO ${utxoId} verification:`, {
-      spent: spentStatus.spent,
+      spent: isSpent,
       spentBy: spentStatus.txid || 'Not spent yet',
-      confirmed: txDetails.status?.confirmed || false,
+      confirmed: isConfirmed,
       blockHeight: txDetails.status?.block_height,
       confirmations: txDetails.status?.confirmations || 0
     });
     
     return {
-      spent: spentStatus.spent,
+      spent: isSpent,
       details: { ...spentStatus, txDetails }
     };
-  } catch (error) {
-    console.error(`Failed to verify UTXO ${utxoId}:`, error);
-    return { spent: true, details: { error: 'Verification failed' } };
+    
+  } catch (error: any) {
+    console.error(`Failed to verify UTXO ${utxoId}:`, error.message);
+    
+    // Throw error instead of returning false positive
+    if (axios.isAxiosError(error)) {
+      if (error.response?.status === 404) {
+        throw new Error(`UTXO ${utxoId} not found on chain`);
+      }
+      if (error.code === 'ECONNABORTED') {
+        throw new Error(`UTXO verification timeout for ${utxoId}`);
+      }
+      throw new Error(`UTXO verification failed: ${error.message}`);
+    }
+    
+    throw error;
   }
 }
 
@@ -111,7 +140,9 @@ export async function getWalletStatus(address: string): Promise<{
   unconfirmedUtxos: number;
 }> {
   try {
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
+    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
+      timeout: 10000
+    });
     const utxos = response.data;
     
     return {
@@ -132,14 +163,18 @@ export async function getWalletStatus(address: string): Promise<{
  */
 export async function debugUtxos(address: string): Promise<any> {
   try {
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
+    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
+      timeout: 10000
+    });
     const utxos = response.data;
     
     const detailedUtxos = await Promise.all(
       utxos.map(async (utxo: any) => {
         const utxoId = `${utxo.txid}:${utxo.vout}`;
         try {
-          const outspend = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/outspend/${utxo.vout}`);
+          const outspend = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/outspend/${utxo.vout}`, {
+            timeout: 5000
+          });
           
           return {
             ...utxo,

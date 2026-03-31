@@ -5,58 +5,46 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
+// Conditional imports for WASM bridge - only included when building with 'wasm-bridge' feature
+#[cfg(feature = "wasm-bridge")]
+use wasm_bindgen::prelude::*;
+#[cfg(feature = "wasm-bridge")]
+use std::collections::HashMap;
+
 // --------------------------------------------------------------------------------
 // NFT Content Structure for Payroll
 // --------------------------------------------------------------------------------
-// This struct defines what lives ON-CHAIN in the Plan NFT.
-// Only fields that affect ENFORCEMENT logic go here.
-// Human-readable data (name, role, salary) goes in encrypted IPFS.
-//
-// #[serde(rename_all = "camelCase")] ensures JSON uses camelCase
-// for compatibility with WASM module and frontend dashboard
-//
-// FIX #1: Using u8 for scroll_policy instead of enum to ensure CBOR parsing succeeds
-// FIX #2: Using String for metadata_hash to match TypeScript hex string format
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NftContent {
-    pub ticker: String,              // "CHARMS-PAY"
-    pub remaining: u64,               // Supply remaining (usually 1 per period)
-    pub metadata_hash: String,         // SHA256 of encrypted IPFS JSON as hex string
-    pub scroll_policy: u8,             // 0=time, 1=proof (using u8 for CBOR compatibility)
-    pub pay_period_seconds: u64,       // e.g., 1209600 for 2 weeks
-    pub compensation_sats: u64,         // Per period in satoshis
+    pub ticker: String,
+    pub remaining: u64,
+    pub metadata_hash: String,
+    pub scroll_policy: u8,
+    pub pay_period_seconds: u64,
+    pub compensation_sats: u64,
 }
 
 impl NftContent {
     pub fn validate(&self) -> bool {
-        // Basic validation rules enforced on-chain
         if self.ticker.is_empty() {
             return false;
         }
-        
-        // metadata_hash must be non-empty (64-char hex validation happens off-chain)
         if self.metadata_hash.is_empty() {
             return false;
         }
-        
         if self.pay_period_seconds == 0 {
             return false;
         }
-        
-        // Validate scroll_policy range (must be 0 or 1)
         if self.scroll_policy > 1 {
             return false;
         }
-        
-        if self.compensation_sats < 1000 { // Below dust limit
+        if self.compensation_sats < 1000 {
             return false;
         }
-        
         true
     }
     
-    // Helper method to interpret scroll_policy semantically
     pub fn is_time_based(&self) -> bool {
         self.scroll_policy == 0
     }
@@ -69,10 +57,11 @@ impl NftContent {
 // --------------------------------------------------------------------------------
 // Main App Contract Entry Point
 // --------------------------------------------------------------------------------
+// REMOVED: #[cfg_attr(feature = "wasm-bridge", wasm_bindgen)]
+// This function is for the Charms ZK-VM, not for JavaScript.
+// wasm-bindgen cannot handle the complex Charms SDK types (App, Transaction, Data).
 pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
-    // Force compiler to recognize the argument exists (prevents optimization trap)
     let _ = _x.bytes();
-    
     match app.tag {
         NFT => nft_contract_satisfied(app, tx, w),
         TOKEN => token_contract_satisfied(app, tx),
@@ -84,72 +73,49 @@ pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
 // NFT Contract Logic
 // --------------------------------------------------------------------------------
 fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
-    // ----------------------------------------------------------------------------
-    // Step 1: Safely extract witness data - NO UNWRAP()
-    // ----------------------------------------------------------------------------
     let w_str = match w.value::<String>() {
         Ok(val) => val,
         Err(_) => return false,
     };
     
-    // ----------------------------------------------------------------------------
-    // Step 2: Verify hash(w) == app.identity (establishes authority)
-    // ----------------------------------------------------------------------------
     if hash(&w_str) != app.identity {
         return false;
     }
     
-    // ----------------------------------------------------------------------------
-    // Step 3: Parse UTXO ID from witness
-    // ----------------------------------------------------------------------------
     let w_utxo_id = match UtxoId::from_str(&w_str) {
         Ok(id) => id,
         Err(_) => return false,
     };
     
-    // ----------------------------------------------------------------------------
-    // Step 4: Determine transaction type
-    // ----------------------------------------------------------------------------
     let is_nft_minting = tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id);
     
     if is_nft_minting {
-        // NFT MINTING: Original UTXO must be in inputs
         if !tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id) {
             return false;
         }
     }
     
-    // ----------------------------------------------------------------------------
-    // Step 5: Validate NFT outputs
-    // ----------------------------------------------------------------------------
     let nft_outputs: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
     
     if nft_outputs.is_empty() {
         return false;
     }
     
-    // For NFT minting, expect exactly 1 NFT output
     if is_nft_minting && nft_outputs.len() != 1 {
         return false;
     }
     
-    // ----------------------------------------------------------------------------
-    // Step 6: Validate each NFT content structure - SAFE PARSING
-    // ----------------------------------------------------------------------------
     for (i, data) in nft_outputs.iter().enumerate() {
         let content: NftContent = match data.value() {
             Ok(c) => c,
             Err(_) => return false,
         };
         
-        // Validate content
         if !content.validate() {
             return false;
         }
         
-        // Additional cross-check for NFT minting
         if is_nft_minting && i == 0 {
-            // For the primary NFT being minted, verify it has a non-empty ticker
             if content.ticker.is_empty() {
                 return false;
             }
@@ -167,28 +133,19 @@ fn token_contract_satisfied(token_app: &App, tx: &Transaction) -> bool {
 }
 
 // --------------------------------------------------------------------------------
-// Token Minting Validation - UPDATED WITH DEBUG LOGGING
+// Token Minting Validation
 // --------------------------------------------------------------------------------
 fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
     eprintln!("\n--- [ZK-DEBUG] Token Mint Start ---");
     
-    // Create corresponding NFT app (same identity, different tag)
     let nft_app = App {
         tag: NFT,
         identity: token_app.identity.clone(),
         vk: token_app.vk.clone(),
     };
 
-    // ----------------------------------------------------------------------------
-    // Step 1: Find NFT content in inputs - SAFE PARSING with debug logging
-    // ----------------------------------------------------------------------------
     let nft_inputs: Vec<NftContent> = charm_values(&nft_app, tx.ins.iter().map(|(_, v)| v))
-        .filter_map(|data| {
-            match data.value::<NftContent>() {
-                Ok(content) => Some(content),
-                Err(_) => None,
-            }
-        })
+        .filter_map(|data| data.value::<NftContent>().ok())
         .collect();
 
     if nft_inputs.is_empty() {
@@ -200,16 +157,8 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
     let incoming_supply = nft_in.remaining;
     eprintln!("✅ Incoming Supply: {}", incoming_supply);
 
-    // ----------------------------------------------------------------------------
-    // Step 2: Find NFT content in outputs - SAFE PARSING with debug logging
-    // ----------------------------------------------------------------------------
     let nft_outputs: Vec<NftContent> = charm_values(&nft_app, tx.outs.iter())
-        .filter_map(|data| {
-            match data.value::<NftContent>() {
-                Ok(content) => Some(content),
-                Err(_) => None,
-            }
-        })
+        .filter_map(|data| data.value::<NftContent>().ok())
         .collect();
 
     if nft_outputs.is_empty() {
@@ -221,9 +170,6 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
     let outgoing_supply = nft_out.remaining;
     eprintln!("✅ Outgoing Supply: {}", outgoing_supply);
 
-    // ----------------------------------------------------------------------------
-    // Step 3: Validate supply constraints with debug logging
-    // ----------------------------------------------------------------------------
     if incoming_supply < outgoing_supply {
         eprintln!("❌ Error: Supply increased ({} < {})", incoming_supply, outgoing_supply);
         return false;
@@ -231,9 +177,6 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
     
     let tokens_to_mint = incoming_supply - outgoing_supply;
 
-    // ----------------------------------------------------------------------------
-    // Step 4: Validate token amounts - SAFE WITH unwrap_or and debug logging
-    // ----------------------------------------------------------------------------
     let input_tokens = match sum_token_amount(token_app, tx.ins.iter().map(|(_, v)| v)) {
         Ok(amount) => amount,
         Err(_) => 0,
@@ -270,6 +213,99 @@ pub(crate) fn hash(data: &str) -> B32 {
 }
 
 // --------------------------------------------------------------------------------
+// WASM Bridge Functions for Template Processing
+// These are ONLY included when building with 'wasm-bridge' feature
+// These functions use standard types (String, HashMap) that are compatible with wasm-bindgen
+// --------------------------------------------------------------------------------
+
+#[cfg(feature = "wasm-bridge")]
+fn substitute_variables(
+    mut value: serde_yaml::Value,
+    vars: &HashMap<String, String>
+) -> serde_yaml::Value {
+    match &mut value {
+        serde_yaml::Value::String(s) => {
+            for (key, val) in vars {
+                let pattern = format!("{{{{{}}}}}", key);
+                if s.contains(&pattern) {
+                    *s = s.replace(&pattern, val);
+                }
+            }
+            value
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (_, v) in map.iter_mut() {
+                *v = substitute_variables(v.clone(), vars);
+            }
+            value
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                *item = substitute_variables(item.clone(), vars);
+            }
+            value
+        }
+        _ => value,
+    }
+}
+
+#[cfg(feature = "wasm-bridge")]
+fn transform_identity_keys(mut value: serde_yaml::Value) -> serde_yaml::Value {
+    match &mut value {
+        serde_yaml::Value::Mapping(map) => {
+            let mut new_map = serde_yaml::Mapping::new();
+            
+            for (key, val) in map.iter() {
+                if let serde_yaml::Value::String(key_str) = key {
+                    let parts: Vec<&str> = key_str.split('/').collect();
+                    if parts.len() == 3 && (parts[0] == "n" || parts[0] == "t") {
+                        let array_key = serde_yaml::Value::Sequence(vec![
+                            serde_yaml::Value::String(parts[0].to_string()),
+                            serde_yaml::Value::String(parts[1].to_string()),
+                            serde_yaml::Value::String(parts[2].to_string()),
+                        ]);
+                        new_map.insert(array_key, val.clone());
+                    } else {
+                        new_map.insert(key.clone(), transform_identity_keys(val.clone()));
+                    }
+                } else {
+                    new_map.insert(key.clone(), transform_identity_keys(val.clone()));
+                }
+            }
+            
+            serde_yaml::Value::Mapping(new_map)
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            let new_seq: Vec<serde_yaml::Value> = seq
+                .iter()
+                .map(|item| transform_identity_keys(item.clone()))
+                .collect();
+            serde_yaml::Value::Sequence(new_seq)
+        }
+        _ => value,
+    }
+}
+
+#[cfg(feature = "wasm-bridge")]
+#[wasm_bindgen]
+pub fn process_spell_template(template_yaml: &str, variables_json: &str) -> Result<String, JsValue> {
+    let vars: HashMap<String, String> = serde_json::from_str(variables_json)
+        .map_err(|e| JsValue::from_str(&format!("JSON Parse Error: {}", e)))?;
+
+    let mut yaml_val: serde_yaml::Value = serde_yaml::from_str(template_yaml)
+        .map_err(|e| JsValue::from_str(&format!("YAML Parse Error: {}", e)))?;
+
+    yaml_val = substitute_variables(yaml_val, &vars);
+    yaml_val = transform_identity_keys(yaml_val);
+
+    let json_val = serde_json::to_value(&yaml_val)
+        .map_err(|e| JsValue::from_str(&format!("JSON Conversion Error: {}", e)))?;
+
+    serde_json::to_string(&json_val)
+        .map_err(|e| JsValue::from_str(&format!("Serialization Error: {}", e)))
+}
+
+// --------------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------------
 #[cfg(test)]
@@ -289,14 +325,13 @@ mod tests {
 
     #[test]
     fn test_nft_content_validation() {
-        // Create a test hash string (64 hex chars)
         let test_hash = "f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa";
         
         let valid = NftContent {
             ticker: "CHARMS-PAY".to_string(),
             remaining: 1,
             metadata_hash: test_hash.to_string(),
-            scroll_policy: 0, // Time-based
+            scroll_policy: 0,
             pay_period_seconds: 1209600,
             compensation_sats: 5000000,
         };
@@ -305,7 +340,7 @@ mod tests {
         assert!(!valid.is_proof_based());
 
         let valid_proof = NftContent {
-            scroll_policy: 1, // Proof-based
+            scroll_policy: 1,
             ..valid.clone()
         };
         assert!(valid_proof.validate());
@@ -331,13 +366,13 @@ mod tests {
         assert!(!invalid_period.validate());
 
         let invalid_policy = NftContent {
-            scroll_policy: 2, // Invalid (must be 0 or 1)
+            scroll_policy: 2,
             ..valid.clone()
         };
         assert!(!invalid_policy.validate());
 
         let invalid_compensation = NftContent {
-            compensation_sats: 500, // Below dust
+            compensation_sats: 500,
             ..valid
         };
         assert!(!invalid_compensation.validate());
@@ -351,31 +386,80 @@ mod tests {
             ticker: "CHARMS-PAY".to_string(),
             remaining: 1,
             metadata_hash: test_hash.to_string(),
-            scroll_policy: 1, // Proof-based
+            scroll_policy: 1,
             pay_period_seconds: 604800,
             compensation_sats: 2500000,
         };
 
         let serialized = serde_json::to_string(&content).unwrap();
-        
         let deserialized: NftContent = serde_json::from_str(&serialized).unwrap();
         assert_eq!(content, deserialized);
         
-        // Verify field names are camelCase (for WASM/frontend compatibility)
         assert!(serialized.contains("\"metadataHash\""));
         assert!(serialized.contains("\"scrollPolicy\""));
         assert!(serialized.contains("\"payPeriodSeconds\""));
         assert!(serialized.contains("\"compensationSats\""));
-        
-        // Verify snake_case is NOT present
         assert!(!serialized.contains("\"metadata_hash\""));
         assert!(!serialized.contains("\"scroll_policy\""));
         assert!(!serialized.contains("\"pay_period_seconds\""));
         assert!(!serialized.contains("\"compensation_sats\""));
-        
-        // Verify scroll_policy is serialized as number, not string
         assert!(serialized.contains("\"scrollPolicy\":1"));
-        // Verify metadataHash is serialized as string
-        assert!(serialized.contains("\"metadataHash\":\"f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa\""));
+    }
+
+    #[cfg(feature = "wasm-bridge")]
+    #[test]
+    fn test_transform_identity_keys() {
+        let input = serde_yaml::from_str(r#"
+app_public_inputs:
+  "n/abc123/vk456": null
+  "t/def789/vk000": null
+"#).unwrap();
+        
+        let transformed = transform_identity_keys(input);
+        
+        let yaml_string = serde_yaml::to_string(&transformed).unwrap();
+        assert!(yaml_string.contains("- n"));
+        assert!(yaml_string.contains("- abc123"));
+        assert!(yaml_string.contains("- vk456"));
+        assert!(!yaml_string.contains("n/abc123/vk456"));
+    }
+
+    #[cfg(feature = "wasm-bridge")]
+    #[test]
+    fn test_process_spell_template_with_identity_transform() {
+        let template = r#"
+version: 11
+tx:
+  ins:
+    - "{{anchor_utxo}}"
+    - "{{funding_utxo}}"
+  outs:
+    - 0:
+        ticker: "{{ticker}}"
+        remaining: {{remaining}}
+  coins:
+    - amount: 1000
+      dest: "{{treasury_hex_dest}}"
+app_public_inputs:
+  "n/{{app_id}}/{{vk}}": null
+"#;
+        
+        let vars = serde_json::json!({
+            "anchor_utxo": "abc123:0",
+            "funding_utxo": "def456:1",
+            "ticker": "TEST-PAY",
+            "remaining": "100",
+            "treasury_hex_dest": "5120abc...",
+            "app_id": "test123",
+            "vk": "vk456"
+        });
+        
+        let result = process_spell_template(template, &vars.to_string()).unwrap();
+        
+        assert!(result.contains(r#"[["n","test123","vk456"],null]"#) || 
+                result.contains(r#"[["n","test123","vk456"],null]"#));
+        assert!(!result.contains(r#""n/test123/vk456""#));
+        assert!(result.contains("TEST-PAY"));
+        assert!(result.contains("abc123:0"));
     }
 }

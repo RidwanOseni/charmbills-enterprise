@@ -151,12 +151,27 @@ export interface TransactionRecord {
 }
 
 // --- 9. ProverResult (Frontend Receipt) ---
+// FIX: Updated to include dualUtxoContext for Sequential Signing [Source 769, 939]
 export interface ProverResult {
   commitTxHex: string;
   spellTxHex: string;
+  isSingle?: boolean;
   commitOutput?: {
     scriptPubKey: string;
     value: number;
+  };
+  // CRITICAL: Dual UTXO Context for Leather wallet to correctly sign
+  // the Spell transaction after the Commit transaction is generated
+  dualUtxoContext?: {
+    anchor: {
+      utxoId: string;
+      hex: string;
+      value: number;
+    };
+    fee: {
+      utxoId: string;
+      value: number;
+    };
   };
 }
 
