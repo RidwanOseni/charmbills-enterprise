@@ -201,8 +201,6 @@ export async function generateUnsignedTransactions(
 
   // ----------------------------------------------------------------------------
   // Step 7: DYNAMIC EXPORTS & SCRIPT EXECUTION
-  // CRITICAL FIX: Place fallback values FIRST, then spread spellVars to overwrite
-  // This ensures builder values (the source of truth) take precedence
   // ----------------------------------------------------------------------------
 
   try {
@@ -302,6 +300,42 @@ cat "${spellTemplatePath}" | envsubst | "${CHARMS_EXECUTABLE}" spell prove --pay
     const requestBody = JSON.parse(stdout);
 
     console.log('[PAYROLL PROVER] ✅ Successfully generated API payload.');
+
+    // ABSOLUTE SOURCE OF TRUTH - Log structure only (no large binaries)
+    console.log('\n[PAYROLL PROVER] ===== ABSOLUTE SOURCE OF TRUTH (STRUCTURE ONLY) =====');
+    console.log('[PAYROLL PROVER] spell type:', typeof requestBody.spell);
+    console.log('[PAYROLL PROVER] spell is string?', typeof requestBody.spell === 'string');
+    console.log('[PAYROLL PROVER] spell length:', requestBody.spell?.length);
+    console.log('[PAYROLL PROVER] spell first 50 chars:', requestBody.spell?.substring(0, 50));
+
+    console.log('[PAYROLL PROVER] app_private_inputs keys:', Object.keys(requestBody.app_private_inputs || {}));
+    const firstPrivateKey = Object.keys(requestBody.app_private_inputs || {})[0];
+    if (firstPrivateKey) {
+        console.log('[PAYROLL PROVER] app_private_inputs key format:', firstPrivateKey);
+        console.log('[PAYROLL PROVER] app_private_inputs value type:', typeof requestBody.app_private_inputs[firstPrivateKey]);
+        console.log('[PAYROLL PROVER] app_private_inputs value first 50 chars:', requestBody.app_private_inputs[firstPrivateKey]?.substring(0, 50));
+    }
+
+    console.log('[PAYROLL PROVER] binaries keys:', Object.keys(requestBody.binaries || {}));
+    const firstBinaryKey = Object.keys(requestBody.binaries || {})[0];
+    if (firstBinaryKey) {
+        console.log('[PAYROLL PROVER] binaries key format:', firstBinaryKey);
+        console.log('[PAYROLL PROVER] binaries value type:', typeof requestBody.binaries[firstBinaryKey]);
+        console.log('[PAYROLL PROVER] binaries value first 100 chars:', requestBody.binaries[firstBinaryKey]?.substring(0, 100));
+    }
+
+    console.log('[PAYROLL PROVER] prev_txs type:', typeof requestBody.prev_txs);
+    console.log('[PAYROLL PROVER] prev_txs is array:', Array.isArray(requestBody.prev_txs));
+    console.log('[PAYROLL PROVER] prev_txs length:', requestBody.prev_txs?.length);
+    if (requestBody.prev_txs && requestBody.prev_txs.length > 0) {
+        console.log('[PAYROLL PROVER] prev_txs[0] type:', typeof requestBody.prev_txs[0]);
+        console.log('[PAYROLL PROVER] prev_txs[0] keys:', requestBody.prev_txs[0] ? Object.keys(requestBody.prev_txs[0]) : 'null');
+    }
+
+    console.log('[PAYROLL PROVER] change_address type:', typeof requestBody.change_address);
+    console.log('[PAYROLL PROVER] fee_rate type:', typeof requestBody.fee_rate);
+    console.log('[PAYROLL PROVER] chain:', requestBody.chain);
+    console.log('[PAYROLL PROVER] ===== END SOURCE OF TRUTH =====\n');
 
     // ----------------------------------------------------------------------------
     // Step 8: SEND TO PROVER API WITH RETRIES
