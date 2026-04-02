@@ -116,10 +116,6 @@ function validatePayrollRequest(request: SpellRequest): void {
   // REMOVED: compensationSats validation - no longer enforced on-chain
   // Salary enforcement now happens at Scroll Settlement Layer
   // ----------------------------------------------------------------------------
-  // OLD VALIDATION (REMOVED):
-  // if (!metadata.compensationSats || metadata.compensationSats < MIN_OUTPUT_SATS) {
-  //   throw new ValidationError(...);
-  // }
   
   // Optional fields with defaults
   if (metadata.remaining !== undefined && metadata.remaining <= 0) {
@@ -128,28 +124,25 @@ function validatePayrollRequest(request: SpellRequest): void {
 }
 
 // --------------------------------------------------------------------------------
-// Spell Builder (Template Variables Version)
+// Spell Builder (JSON Construction Version)
 // --------------------------------------------------------------------------------
 
 /**
- * Builds the template variables for creating a Charms Inc. Plan NFT (Authority Object).
- * Instead of building the complete JSON, this returns variables that will be substituted
- * into YAML templates via envsubst in proverClient.ts.
- * 
- * Implements the Hybrid Metadata model for privacy and enforcement [1].
+ * Builds the spell JSON object for creating a Charms Inc. Plan NFT (Authority Object).
+ * This returns a structured JSON object that can be directly sent to the prover.
  * 
  * UNIFIED DEPARTMENTAL NFT MODEL:
- * - compensationSats is now a placeholder (0) since salary is enforced at Scroll Settlement Layer
+ * - compensationSats is now a placeholder (1000) since salary is enforced at Scroll Settlement Layer
  * - One NFT per department handles multiple workers with different salaries
  * 
  * @param request - Validated spell request with payroll metadata
- * @param treasuryHexDest - The treasury hex destination (from company config) [5, 11]
- * @returns Object containing template variables and derived appId
+ * @param treasuryHexDest - The treasury hex destination (from company config)
+ * @returns Object containing spell JSON and derived appId
  */
-export function buildMintNFT(
+export function buildMintNFTJSON(
   request: SpellRequest, 
-  treasuryHexDest: string // Passed from API lookup [5, 11]
-): { spellVars: Record<string, string>; appId: string } {
+  treasuryHexDest: string
+): { spell: any; appId: string } {
   // ----------------------------------------------------------------------------
   // Step 1: Validate input
   // ----------------------------------------------------------------------------
@@ -185,6 +178,124 @@ export function buildMintNFT(
   // Remaining supply (default to 1 unless specified)
   const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
   
+  // Compensation - Must be >= 1000 for Rust validation
+  const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
+  
+  // ----------------------------------------------------------------------------
+  // Step 5: Build the spell JSON object
+  // CRITICAL: ins array uses simple strings (not chain-tagged objects)
+  // The Prover extracts metadata from prev_txs for provenance verification
+  // ----------------------------------------------------------------------------
+  const spell = {
+    version: 11,
+    tx: {
+      // ✅ USE STRINGS HERE (The Prover extracts metadata from prev_txs)
+      ins: [
+        request.anchorUtxo,
+        request.fundingUtxo
+      ],
+      outs: [
+        {
+          // Numeric key 0 for NFT output
+          0: {
+            // camelCase content per Rust #[serde(rename_all = "camelCase")]
+            ticker: ticker,
+            remaining: remaining,
+            metadataHash: metadata.metadataHash,
+            scrollPolicy: metadata.scrollPolicy,
+            payPeriodSeconds: metadata.payPeriodSeconds,
+            compensationSats: compensationSats
+          }
+        }
+      ],
+      coins: [
+        {
+          amount: 1000,
+          dest: treasuryHexDest
+        }
+      ]
+    },
+    app_public_inputs: {
+      [`n/${appId}/${APP_VK}`]: null
+    }
+  };
+  
+  // ----------------------------------------------------------------------------
+  // Step 6: Logging (debug only, remove in production)
+  // ----------------------------------------------------------------------------
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[buildMintNFT.payroll] ✅ Spell JSON built:', {
+      appId,
+      ticker,
+      remaining,
+      scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
+      payPeriodSeconds: metadata.payPeriodSeconds,
+      compensationSats,
+      metadataHash: metadata.metadataHash.substring(0, 16) + '...',
+      anchorUtxo: request.anchorUtxo,
+      fundingUtxo: request.fundingUtxo,
+      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
+      hasMultiSig: !!request.multiSigSigners
+    });
+  }
+  
+  return { spell, appId };
+}
+
+// --------------------------------------------------------------------------------
+// Legacy Template Variables Version (Kept for backward compatibility)
+// --------------------------------------------------------------------------------
+
+/**
+ * Builds the template variables for creating a Charms Inc. Plan NFT (Authority Object).
+ * This returns variables that will be substituted into YAML templates via envsubst.
+ * 
+ * @param request - Validated spell request with payroll metadata
+ * @param treasuryHexDest - The treasury hex destination (from company config)
+ * @returns Object containing template variables and derived appId
+ */
+export function buildMintNFT(
+  request: SpellRequest, 
+  treasuryHexDest: string
+): { spellVars: Record<string, string>; appId: string } {
+  // ----------------------------------------------------------------------------
+  // Step 1: Validate input
+  // ----------------------------------------------------------------------------
+  validatePayrollRequest(request);
+  
+  // ----------------------------------------------------------------------------
+  // Step 2: Validate treasuryHexDest parameter
+  // ----------------------------------------------------------------------------
+  if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
+    throw new ValidationError('treasuryHexDest is required for NFT minting');
+  }
+  
+  // Validate hex destination format
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+    throw new ValidationError('treasuryHexDest must be a valid hex string (even number of hex characters)');
+  }
+  
+  // ----------------------------------------------------------------------------
+  // Step 3: Derive appId from anchor UTXO
+  // ----------------------------------------------------------------------------
+  const appId = deriveAppId(request.anchorUtxo!);
+  
+  // ----------------------------------------------------------------------------
+  // Step 4: Extract validated data
+  // ----------------------------------------------------------------------------
+  const output = request.outputs[0];
+  const metadata = output.nftMetadata!;
+  
+  // Use provided ticker or default
+  const ticker = metadata.ticker || DEFAULT_TICKER;
+  
+  // Remaining supply (default to 1 unless specified)
+  const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
+  
+  // Compensation - Must be >= 1000 for Rust validation
+  const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
+  
   // ----------------------------------------------------------------------------
   // Step 5: Build template variables for envsubst
   // ----------------------------------------------------------------------------
@@ -193,25 +304,24 @@ export function buildMintNFT(
     app_id: appId,
     app_vk: APP_VK,
     
-    // UTXO inputs for the YAML 'ins' block [Source 729]
+    // UTXO inputs for the YAML 'ins' block
     in_utxo_0: request.anchorUtxo!,
     funding_utxo: request.fundingUtxo!,
 
-    // NFT metadata - Casing must be camelCase for Rust serde [Source 38]
+    // NFT metadata - Casing must be camelCase for Rust serde
     ticker: ticker,
     remaining: remaining.toString(),
     metadataHash: metadata.metadataHash,
     scrollPolicy: (metadata.scrollPolicy ?? 0).toString(),
     payPeriodSeconds: (metadata.payPeriodSeconds ?? 0).toString(),
     
-    // CRITICAL: Must be >= 1000 to pass Rust validation [Source 39]
-    // Even if placeholder, "0" will cause a Condition Failed error.
-    compensationSats: Math.max(metadata.compensationSats || 0, 1000).toString(),
+    // CRITICAL: Must be >= 1000 to pass Rust validation
+    compensationSats: compensationSats.toString(),
 
-    // Bitcoin Destination - Must match ${dest_0} in mint-nft.yaml [Source 729]
+    // Bitcoin Destination - Must match ${dest_0} in mint-nft.yaml
     dest_0: treasuryHexDest,
-    amount_0: "1000" // Required for the coins array amount [Source 810]
-};
+    amount_0: "1000" // Required for the coins array amount
+  };
   
   // Add optional multi-sig fields if present
   if (request.multiSigSigners && request.multiSigSigners.length > 0) {

@@ -181,6 +181,161 @@ function calculateBatchMetrics(
 }
 
 // --------------------------------------------------------------------------------
+// Spell Builder (JSON Construction Version)
+// --------------------------------------------------------------------------------
+
+/**
+ * Builds the spell JSON object for a Batched Mint-Token Spell for Charms Inc. Payroll.
+ * This returns a structured JSON object that can be directly sent to the prover.
+ * 
+ * Implements dynamic batch minting that supports any number of workers by looping
+ * through the request.outputs.
+ * 
+ * @param request - Validated spell request with worker outputs and NFT return metadata
+ * @param appId - The existing appId from the saved plan (passed, not derived)
+ * @param treasuryHexDest - The treasury hex destination for change output (from company config)
+ * @returns Structured spell JSON object
+ */
+export function buildMintTokenJSON(
+  request: SpellRequest,
+  appId: string,
+  treasuryHexDest: string
+): any {
+  // ----------------------------------------------------------------------------
+  // Step 1: Validate request
+  // ----------------------------------------------------------------------------
+  validateBatchMintRequest(request);
+
+  // ----------------------------------------------------------------------------
+  // Step 2: Validate treasuryHexDest parameter
+  // ----------------------------------------------------------------------------
+  if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
+    throw new ValidationError('treasuryHexDest is required for batch token minting');
+  }
+  
+  // Validate hex destination format
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+    throw new ValidationError('treasuryHexDest must be a valid hex string (even number of hex characters)');
+  }
+
+  // ----------------------------------------------------------------------------
+  // Step 3: Separate outputs
+  // ----------------------------------------------------------------------------
+  const nftOutput = request.outputs.find(o => o.nftMetadata);
+  const workerOutputs = request.outputs.filter(o => o.tokenAmount !== undefined && o.tokenAmount > 0);
+
+  if (!nftOutput) {
+    throw new ValidationError('Missing NFT return output with nftMetadata');
+  }
+
+  if (workerOutputs.length === 0) {
+    throw new ValidationError('No worker outputs found with valid tokenAmount');
+  }
+
+  const metadata = nftOutput.nftMetadata!;
+
+  // ----------------------------------------------------------------------------
+  // Step 4: Calculate new remaining supply
+  // ----------------------------------------------------------------------------
+  const currentSupply = metadata.remaining;
+  const totalTokensToMint = workerOutputs.reduce((sum, w) => sum + (w.tokenAmount || 0), 0);
+  const newRemainingSupply = currentSupply - totalTokensToMint;
+
+  if (newRemainingSupply < 0) {
+    throw new ValidationError(
+      `Insufficient supply in Plan NFT. Attempting to mint ${totalTokensToMint} ` +
+      `tokens but only ${currentSupply} remain.`
+    );
+  }
+
+  // ----------------------------------------------------------------------------
+  // Step 5: Build dynamic outputs
+  // ----------------------------------------------------------------------------
+  // Worker tokens use numeric key "1" (fungible token output)
+  const outs: any[] = workerOutputs.map(w => ({ "1": w.tokenAmount }));
+
+  // NFT return output uses numeric key "0" (authority NFT output)
+  outs.push({
+    "0": {
+      ticker: metadata.ticker || DEFAULT_TICKER,
+      remaining: newRemainingSupply,
+      metadataHash: metadata.metadataHash,
+      scrollPolicy: metadata.scrollPolicy,
+      payPeriodSeconds: metadata.payPeriodSeconds,
+      compensationSats: Math.max(metadata.compensationSats || 0, MIN_OUTPUT_SATS)
+    }
+  });
+
+  // ----------------------------------------------------------------------------
+  // Step 6: Build dynamic coins (Bitcoin destinations)
+  // ----------------------------------------------------------------------------
+  const coins: any[] = [];
+
+  // Add worker destinations (convert addresses to hex)
+  for (const worker of workerOutputs) {
+    try {
+      const script = bitcoin.address.toOutputScript(worker.address, bitcoin.networks.testnet);
+      const destHex = Buffer.from(script).toString('hex');
+      coins.push({
+        amount: MIN_OUTPUT_SATS,
+        dest: destHex
+      });
+    } catch (error: any) {
+      throw new ValidationError(`Invalid worker address: ${worker.address} - ${error.message}`);
+    }
+  }
+
+  // Add treasury destination for change
+  coins.push({
+    amount: MIN_OUTPUT_SATS,
+    dest: treasuryHexDest
+  });
+
+  // ----------------------------------------------------------------------------
+  // Step 7: Build the spell JSON object
+  // CRITICAL: ins array uses simple strings (not chain-tagged objects)
+  // The Prover extracts metadata from prev_txs for provenance verification
+  // ----------------------------------------------------------------------------
+  const spell = {
+    version: 11,
+    tx: {
+      // ✅ USE STRINGS HERE (The Prover extracts metadata from prev_txs)
+      ins: [
+        request.authorityUtxo,
+        request.fundingUtxo
+      ],
+      outs: outs,
+      coins: coins
+    },
+    app_public_inputs: {
+      [`n/${appId}/${APP_VK}`]: null,
+      [`t/${appId}/${APP_VK}`]: null
+    }
+  };
+
+  // ----------------------------------------------------------------------------
+  // Step 8: Logging (debug only)
+  // ----------------------------------------------------------------------------
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[buildMintToken.payroll] ✅ Spell JSON built:', {
+      appId: appId.substring(0, 16) + '...',
+      workerCount: workerOutputs.length,
+      totalTokens: totalTokensToMint,
+      currentSupply,
+      newRemainingSupply,
+      scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
+      compensationSats: Math.max(metadata.compensationSats || 0, MIN_OUTPUT_SATS),
+      authorityUtxo: request.authorityUtxo,
+      fundingUtxo: request.fundingUtxo,
+      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...'
+    });
+  }
+
+  return spell;
+}
+
+// --------------------------------------------------------------------------------
 // Spell Builder (Template Variables Version)
 // --------------------------------------------------------------------------------
 

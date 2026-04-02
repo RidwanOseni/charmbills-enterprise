@@ -339,90 +339,54 @@ export default function EmployerDashboard() {
   };
   
   // ============================================================
-  // STAGE 2: New Hire (Assign Worker to Existing Department NFT)
-  // CRITICAL FIX: Ensure employerAddress is passed correctly [Source 227]
+  // STAGE 2: Add Worker to Registry (Administrative Action)
+  // CRITICAL FIX: This is now an administrative "Add" action that saves worker to database
   // ============================================================
   const handleHire = async () => {
-    if (!fullName || !selectedDeptId) {
-      setToast("❌ Please select a department and enter worker name.");
-      return;
-    }
-    
-    if (!bitcoinAddress) {
-      setToast("❌ Please enter worker's Bitcoin address.");
+    if (!fullName || !selectedDeptId || !bitcoinAddress) {
+      setToast("❌ Please fill in all worker details.");
       return;
     }
     
     setIsProcessing(true);
-    
+
     try {
       const dept = registeredDepts.find(d => d.appId === selectedDeptId);
       if (!dept) {
         throw new Error("Selected department not found");
       }
       
-      console.log("[HIRING] Hiring", fullName, "to", dept.department);
+      console.log("[HIRE ADMIN] Adding worker:", fullName, "to department:", dept.department);
       
-      const btcContext = await getBtcContext();
-      
-      if (!(window as any).LeatherProvider) {
-        throw new Error("Leather wallet not detected");
-      }
-      
-      const sigRes = await (window as any).LeatherProvider.request("signMessage", {
-        message: `Hire ${fullName} for ${dept.department}`,
-        paymentType: "p2tr",
-        network: "testnet"
-      });
-      
-      // CRITICAL FIX: Use the connected wallet address (address) as employerAddress [Source 227]
+      // Use a non-minting endpoint to just save the worker record
       const payload = {
-        authorityUtxo: dept.nftUtxoId,
-        authorityTxHex: btcContext.anchor.hex,
-        fundingUtxo: btcContext.fee.utxoId,
-        fundingValue: btcContext.fee.value,
-        employerAddress: address, // ✅ The connected wallet address
-        workers: [{ 
-          address: bitcoinAddress, 
-          periods: 1,
-          salarySats: parseInt(salary) || 5000000,
-          role: role || "Team Member"
-        }],
-        planMetadata: { 
-          ...dept, 
-          remaining: dept.remaining
-        },
-        encryptionEntropy: sigRes.result.signature
+        name: fullName,
+        role: role || "Team Member",
+        salary: parseInt(salary) || 5000000,
+        walletAddress: bitcoinAddress,
+        departmentId: selectedDeptId,
+        department: dept.department,
+        status: 'pending' // This triggers the "Needs Tokens" yellow badge
       };
       
-      console.log("[HIRING] Payload employerAddress:", payload.employerAddress);
+      console.log("[HIRE ADMIN] Payload:", payload);
       
-      const response = await axios.post('/api/payrollhiring/mint', payload, {
-        timeout: 180000,
-        baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
-      });
+      // Use a non-minting endpoint to just save the worker record
+      await api.post('/api/workers/add', payload);
       
-      const proverResult: ProverResult = response.data;
+      setToast(`✅ Worker added to registry. They'll receive tokens in the next run.`);
+      await refreshWorkers();
       
-      const signingResult = await signAndBroadcastPackage(proverResult, btcContext);
-      const txids = signingResult?.txids;
-      
-      if (txids && txids.length > 0) {
-        setToast(`✅ ${fullName} hired to ${dept.department}!`);
-        await refreshWorkers();
-        
-        setFullName('');
-        setRole('');
-        setSalary('');
-        setBitcoinAddress('');
-        setSelectedDeptId('');
-      } else {
-        setToast('⚠️ Hiring was cancelled or failed');
-      }
+      // Clear inputs
+      setFullName('');
+      setRole('');
+      setSalary('');
+      setBitcoinAddress('');
+      setSelectedDeptId('');
       
     } catch (err: any) {
-      console.error("[HIRING] Failed:", err.message);
-      setToast(`❌ Hire failed: ${err.message}`);
+      console.error("[HIRE ADMIN] Failed:", err.message);
+      setToast(`❌ Failed to add worker to registry: ${err.message}`);
     } finally {
       setIsProcessing(false);
       setTimeout(() => setToast(''), 4000);
@@ -431,7 +395,6 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // Batch Token Issuance (Pay Your Team - All at Once)
-  // CRITICAL FIX: Ensure employerAddress is passed correctly [Source 227]
   // ============================================================
   const handleIssueTokens = async () => {
     if (selectedWorkers.size === 0) {
@@ -452,29 +415,27 @@ export default function EmployerDashboard() {
     setIsProcessing(true);
 
     try {
-      const workerList = workers.filter(w => selectedWorkers.has(w.wallet));
+      const workerList = workers.filter(w => selectedWorkers.has(w.walletAddress));
       const periods = parseInt(selectedPeriods);
       
       const btcContext = await getBtcContext();
 
-      // CRITICAL FIX: Use the connected wallet address (address) as employerAddress [Source 227]
       const payload = {
         authorityUtxo: currentPlanNftUtxo,
         authorityTxHex: btcContext.anchor.hex,
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
-        employerAddress: address, // ✅ The connected wallet address
+        employerAddress: address,
         workers: workerList.map(w => ({ 
-          address: w.wallet, 
+          address: w.walletAddress, 
           periods,
-          salarySats: w.salarySats || 5000000,
+          salarySats: w.salary || 5000000,
           role: w.role || "Team Member"
         })),
         planMetadata: currentPlanMetadata,
         encryptionEntropy: "placeholder" // Will be handled by backend
       };
 
-      console.log("[BATCH MINT] Payload employerAddress:", payload.employerAddress);
       console.log("[BATCH MINT] Workers count:", payload.workers.length);
 
       const response = await axios.post('/api/payrollhiring/mint', payload, {
@@ -548,22 +509,27 @@ export default function EmployerDashboard() {
     fetchStats();
   }, [workers]);
 
-  // Fetch vault balance
+  // ============================================================
+  // FIX A: Update Company Vault Balance - Use connected wallet address
+  // ============================================================
   useEffect(() => {
     const fetchVaultBalance = async () => {
-      if (!walletConnected) return;
+      // If no hardcoded treasury, use the currently connected wallet address
+      const treasuryAddr = process.env.NEXT_PUBLIC_TREASURY_ADDRESS || address;
+      
+      if (!walletConnected || !treasuryAddr) return;
+
       try {
-        const treasuryAddr = process.env.NEXT_PUBLIC_TREASURY_ADDRESS;
-        if (treasuryAddr) {
-          const status = await getWalletStatus(treasuryAddr);
-          setVaultBalance(status.totalBalance);
-        }
+        // Use the getWalletStatus helper to fetch real-time Taproot balance
+        const status = await getWalletStatus(treasuryAddr);
+        setVaultBalance(status.totalBalance);
       } catch (error) {
         console.error('Failed to fetch vault balance:', error);
+        setVaultBalance(0);
       }
     };
     fetchVaultBalance();
-  }, [walletConnected]);
+  }, [walletConnected, address]); // ✅ Depend on address to update when wallet changes
   
   // Fetch initial data when wallet connects
   useEffect(() => {
@@ -605,13 +571,20 @@ export default function EmployerDashboard() {
     ? workers 
     : workers.filter((w: any) => w.department === selectedDept);
 
-  const filteredByStatus = statusFilter === 'all'
-    ? workers
-    : workers.filter((w: any) => {
-        if (statusFilter === 'Active') return w.currentPeriod?.status === 'active';
-        if (statusFilter === 'Needs Tokens') return w.currentPeriod?.status === 'pending' || !w.currentPeriod;
-        return true;
-      });
+  // ============================================================
+  // FIX B: Isolate Workers from Departments in the Registry
+  // Ensure we only show records with valid names (Department NFTs don't have names in worker table)
+  // ============================================================
+  const filteredByStatus = workers.filter((worker) => {
+    // 1. Ensure we only show records with a valid name (Department NFTs usually don't have this field)
+    if (!worker.name) return false;
+
+    // 2. Apply the UI filters
+    if (statusFilter === 'all') return true;
+    if (statusFilter === 'Active') return worker.status === 'active';
+    if (statusFilter === 'Needs Tokens') return worker.status === 'pending' || worker.status === 'Needs Tokens';
+    return true;
+  });
 
   const toggleWorkerSelection = (wallet: string) => {
     const newSelected = new Set(selectedWorkers);
@@ -627,7 +600,7 @@ export default function EmployerDashboard() {
     if (selectedWorkers.size === deptWorkers.length && deptWorkers.length > 0) {
       setSelectedWorkers(new Set());
     } else {
-      setSelectedWorkers(new Set(deptWorkers.map((w: any) => w.wallet)));
+      setSelectedWorkers(new Set(deptWorkers.map((w: any) => w.walletAddress)));
     }
   };
 
@@ -764,7 +737,7 @@ export default function EmployerDashboard() {
           <p className="text-foreground">Create departments, hire workers, and manage payroll with one-click batch payments</p>
         </div>
 
-        {/* Two-Column Layout: Setup Department + New Hire */}
+        {/* Two-Column Layout: Setup Department + Add Worker */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12">
           {/* Card 1: DEPARTMENT SETUP (STAGE 1) */}
           <Card className="p-8 bg-card border border-border rounded-xl">
@@ -863,15 +836,15 @@ export default function EmployerDashboard() {
             </div>
           </Card>
 
-          {/* Card 2: NEW HIRE (STAGE 2) */}
+          {/* Card 2: ADD WORKER TO REGISTRY (STAGE 2) - Administrative Action */}
           <Card className="p-8 bg-card border border-border rounded-xl">
             <div className="flex items-center gap-3 mb-6">
               <div className="p-2 bg-primary/10 rounded-lg">
                 <Users className="w-6 h-6 text-primary" />
               </div>
-              <h2 className="text-2xl font-bold text-primary">2. New Hire</h2>
+              <h2 className="text-2xl font-bold text-primary">2. Add Worker to Registry</h2>
             </div>
-            <p className="text-sm text-muted-foreground mb-4">Assign a worker to an existing department. Salaries are stored encrypted.</p>
+            <p className="text-sm text-muted-foreground mb-4">Add a worker to the department registry. They'll receive tokens in the next payroll run.</p>
 
             <div className="space-y-5">
               <div>
@@ -943,7 +916,7 @@ export default function EmployerDashboard() {
                 disabled={isProcessing || !selectedDeptId || !fullName || !bitcoinAddress}
                 className="w-full bg-secondary hover:bg-secondary/90 text-secondary-foreground font-semibold py-2 rounded-lg disabled:opacity-50"
               >
-                {isProcessing ? 'Processing (60-105 sec)...' : 'Assign Worker'}
+                {isProcessing ? 'Adding...' : 'Add Worker to Registry'}
               </Button>
             </div>
           </Card>
@@ -1013,11 +986,11 @@ export default function EmployerDashboard() {
                           <TableCell className="text-sm text-muted-foreground py-2">{worker.role}</TableCell>
                           <TableCell className="py-2">
                             <Badge className={`rounded-full px-2 py-0.5 text-xs ${
-                              worker.currentPeriod?.status === 'active'
+                              worker.status === 'active'
                                 ? 'bg-secondary/20 text-secondary'
                                 : 'bg-yellow-100 text-yellow-700'
                             }`}>
-                              {worker.currentPeriod?.status === 'active' ? 'Active' : 'Needs Tokens'}
+                              {worker.status === 'active' ? 'Active' : 'Needs Tokens'}
                             </Badge>
                           </TableCell>
                           <TableCell className="text-sm text-muted-foreground py-2">
@@ -1127,8 +1100,9 @@ export default function EmployerDashboard() {
                 </TableRow>
               </TableHeader>
               <TableBody>
+                {/* FIX C: Use walletAddress as key and ensure valid name filtering */}
                 {filteredByStatus.map((worker: any) => (
-                  <TableRow key={worker.walletAddress} className="border-b border-border hover:bg-muted/30 transition">
+                  <TableRow key={worker.walletAddress || worker.id} className="border-b border-border hover:bg-muted/30 transition">
                     <TableCell className="font-medium text-foreground">{worker.name || 'Unnamed'}</TableCell>
                     <TableCell className="text-foreground">{worker.role}</TableCell>
                     <TableCell>
@@ -1146,12 +1120,12 @@ export default function EmployerDashboard() {
                     <TableCell>
                       <Badge
                         className={`rounded-full px-3 py-1 text-sm ${
-                          worker.currentPeriod?.status === 'active'
+                          worker.status === 'active'
                             ? 'bg-secondary/20 text-secondary'
                             : 'bg-yellow-100 text-yellow-700'
                         }`}
                       >
-                        {worker.currentPeriod?.status === 'active' ? 'Active' : 'Needs Tokens'}
+                        {worker.status === 'active' ? 'Active' : 'Needs Tokens'}
                       </Badge>
                     </TableCell>
                     <TableCell className="text-foreground text-sm">
@@ -1180,7 +1154,7 @@ export default function EmployerDashboard() {
         {/* Helper Text */}
         <div className="mt-8 p-4 bg-muted/30 rounded-lg border border-border">
           <p className="text-sm text-foreground">
-            <span className="font-medium">✨ One NFT per department, unlimited workers.</span> Create a department NFT once, then hire as many workers as you need with different salaries. All workers under the same department share the same pay frequency.
+            <span className="font-medium">✨ One NFT per department, unlimited workers.</span> Create a department NFT once, then add as many workers as you need with different salaries. All workers under the same department share the same pay frequency.
           </p>
           <p className="text-sm text-foreground mt-2">
             <span className="font-medium">🔒 Salaries encrypted.</span> Only you and the worker can see payment details. The blockchain only enforces the pay period, not individual salaries.
