@@ -296,6 +296,7 @@ export default function EmployerDashboard() {
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
         employerAddress: address,
+        utxoAddress: address,
         department: setupDeptName.toLowerCase(),
         ticker: `${setupDeptName.substring(0, 3).toUpperCase()}-PAY`,
         role: "Department Authority",
@@ -426,6 +427,7 @@ export default function EmployerDashboard() {
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
         employerAddress: address,
+        utxoAddress: address,
         workers: workerList.map(w => ({ 
           address: w.walletAddress, 
           periods,

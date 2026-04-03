@@ -7,6 +7,7 @@ import { fetchTransactionHex } from '../lib/utxo-manager';
 import { SpellRequest, ProverResult } from '@shared/types';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 
 const db = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
 
@@ -22,6 +23,7 @@ interface CreatePayrollPlanRequest {
   fundingUtxo: string;          // Selected by HR wallet for fees
   fundingValue: number;         // Value of the funding UTXO in sats
   employerAddress: string;      // Where the Plan NFT will be sent
+  utxoAddress: string;          // The Bitcoin address associated with the anchor UTXO (for app_private_inputs)
   
   // Payroll configuration (Unified Departmental NFT Model)
   department: string;            // Department name (e.g., "Engineering")
@@ -63,6 +65,7 @@ interface CompanyRecord {
 
 function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPlanRequest {
   // Updated required fields - includes 'remaining' for department budget [14]
+  // Also includes 'utxoAddress' for app_private_inputs conversion
   const required = [
     // Bitcoin UTXO data - MUST BE PROVIDED BY FRONTEND [1, 2]
     'anchorUtxo', 
@@ -71,6 +74,7 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
     'fundingUtxo', 
     'fundingValue',
     'employerAddress',
+    'utxoAddress',              // REQUIRED for app_private_inputs conversion
     
     // Payroll configuration (Unified Departmental Model)
     'department',
@@ -129,6 +133,11 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
   
   if (!/^[0-9a-f]+:\d+$/i.test(body.fundingUtxo)) {
     throw new Error('fundingUtxo must be in format "txid:vout"');
+  }
+  
+  // Validate utxoAddress format (basic Bech32 check)
+  if (!body.utxoAddress.startsWith('tb1') && !body.utxoAddress.startsWith('bc1')) {
+    throw new Error('utxoAddress must be a valid Bech32 address (tb1... or bc1...)');
   }
   
   // Validate encryptionEntropy is a non-empty string [3]
@@ -267,6 +276,7 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
  * 6. REMOVED role and compensationSats from validation and record saving
  * 7. ADDED remaining field for department budget [14]
  * 8. FETCH funding UTXO hex from the blockchain (not just ID) [22]
+ * 9. ADDED utxoAddress field for app_private_inputs conversion
  */
 export async function createPayrollPlan(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -289,6 +299,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
       anchorUtxo: req.body.anchorUtxo ? `${req.body.anchorUtxo.substring(0, 20)}...` : 'missing',
       fundingUtxo: req.body.fundingUtxo ? `${req.body.fundingUtxo.substring(0, 20)}...` : 'missing',
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
+      utxoAddress: req.body.utxoAddress ? `${req.body.utxoAddress.substring(0, 20)}...` : 'missing',
       department: req.body.department,
       remaining: req.body.remaining,
       payPeriodSeconds: req.body.payPeriodSeconds,
@@ -308,6 +319,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
       fundingUtxo,
       fundingValue,
       employerAddress,
+      utxoAddress,               // NEW: Address associated with anchor UTXO
       department,
       payPeriodSeconds,
       scrollPolicy,
@@ -323,6 +335,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     
     console.log(`[PLANS API:${requestId}] ✅ Validation passed`);
     console.log(`[PLANS API:${requestId}] Department budget: ${remaining} pay periods`);
+    console.log(`[PLANS API:${requestId}] utxoAddress: ${utxoAddress.substring(0, 20)}...`);
     
     // ----------------------------------------------------------------------------
     // Step 2: Look up company in database - NO .env fallback [16, 17]
@@ -409,6 +422,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     // Step 7: Construct SpellRequest with dynamic signers [4, 5, 8]
     // NOTE: Pass remaining as the budget [14], compensationSats = 0 for Unified Model [15]
+    // CRITICAL: Include utxoAddress for app_private_inputs conversion
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔧 Building SpellRequest...`);
     
@@ -419,6 +433,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
       fundingUtxo,
       fundingUtxoValue: fundingValue,
       changeAddress: employerAddress,
+      utxoAddress: utxoAddress,      // REQUIRED: Address for app_private_inputs conversion
       feeRate: constants.DEFAULT_FEE_RATE,
       outputs: [{
         address: employerAddress,
@@ -437,6 +452,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     // Step 8: Generate unsigned transactions via prover
     // CRITICAL: Pass BOTH hex strings (anchor + funding) to the prover [22, 112]
+    // CRITICAL: Pass utxoAddress as the 5th parameter for app_private_inputs conversion
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] ⏳ Calling proverClient...`);
     
@@ -444,7 +460,8 @@ export async function createPayrollPlan(req: Request, res: Response) {
       request, 
       [cleanAnchorTxHex, fundingTxHex], // BOTH must be raw hex strings [112]
       company.treasuryHexDest,          // Pass treasuryHexDest from company lookup
-      undefined                         // appId not needed for mint-nft
+      undefined,                        // appId not needed for mint-nft
+      utxoAddress                       // Pass utxoAddress for app_private_inputs conversion
     );
     
     console.log(`[PLANS API:${requestId}] ✅ Transactions generated`);
@@ -457,7 +474,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     // Step 10: Derive Plan NFT UTXO from spellTxHex [9]
     // ----------------------------------------------------------------------------
-    const spellTx = require('bitcoinjs-lib').Transaction.fromHex(result.spellTxHex);
+    const spellTx = bitcoin.Transaction.fromHex(result.spellTxHex);
     const planUtxo = `${spellTx.getId()}:0`;
     
     // ----------------------------------------------------------------------------
@@ -497,6 +514,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     console.log(`[PLANS API:${requestId}] ✅ Success - Department: ${department}`);
     console.log(`[PLANS API:${requestId}] ✅ Success - Budget: ${remaining} pay periods`);
     console.log(`[PLANS API:${requestId}] ✅ Success - Treasury Hex: ${company.treasuryHexDest.substring(0, 30)}...`);
+    console.log(`[PLANS API:${requestId}] ✅ Success - utxoAddress: ${utxoAddress.substring(0, 20)}...`);
     console.log(`[PLANS API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json(response);

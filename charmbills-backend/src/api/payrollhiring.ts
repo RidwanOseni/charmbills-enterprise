@@ -25,6 +25,7 @@ interface WorkerAllocation {
 interface MintPayrollTokenRequest {
   authorityUtxo: string;      // Plan NFT UTXO from frontend scanner
   authorityTxHex: string;     // Plan NFT creation tx hex (for provenance)
+  utxoAddress: string;        // The Bitcoin address associated with the authority UTXO
   workers: WorkerAllocation[]; // Array of workers with their allocations, salaries, and roles
   employerAddress: string;     // Where to return the Plan NFT
   planMetadata: {
@@ -72,6 +73,7 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
   const required = [
     'authorityUtxo',
     'authorityTxHex',
+    'utxoAddress',
     'workers',
     'employerAddress',
     'planMetadata',
@@ -90,6 +92,11 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
   // Validate authorityUtxo format
   if (!/^[0-9a-f]+:\d+$/i.test(body.authorityUtxo)) {
     throw new Error('authorityUtxo must be in format "txid:vout"');
+  }
+  
+  // Validate utxoAddress format (basic Bech32 check)
+  if (!body.utxoAddress.startsWith('tb1') && !body.utxoAddress.startsWith('bc1')) {
+    throw new Error('utxoAddress must be a valid Bech32 address (tb1... or bc1...)');
   }
   
   // Validate authorityTxHex is a valid hex string
@@ -185,6 +192,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     // Log sanitized request
     console.log(`[HIRING API:${requestId}] Request summary:`, {
       authorityUtxo: req.body.authorityUtxo ? `${req.body.authorityUtxo.substring(0, 30)}...` : 'missing',
+      utxoAddress: req.body.utxoAddress ? `${req.body.utxoAddress.substring(0, 20)}...` : 'missing',
       workerCount: req.body.workers?.length || 0,
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
       hasPlanMetadata: !!req.body.planMetadata,
@@ -198,6 +206,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     const { 
       authorityUtxo,
       authorityTxHex,
+      utxoAddress,
       workers,
       employerAddress,
       planMetadata,
@@ -426,6 +435,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     // - employerAddress: Where to return the Plan NFT
     // - planMetadata: returnMetadata (with placeholder compensationSats)
     // - treasuryHexDest: company.treasuryHexDest
+    // - utxoAddress: The Bitcoin address associated with the authority UTXO (REQUIRED for app_private_inputs)
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] Calling batchPayroll...`);
     console.log(`[HIRING API:${requestId}] batchPayroll parameters:`, {
@@ -436,7 +446,8 @@ export async function mintPayrollToken(req: Request, res: Response) {
       appId: planMetadata.appId.substring(0, 16) + '...',
       employerAddress: employerAddress.substring(0, 20) + '...',
       returnMetadataCompensation: returnMetadata.compensationSats,
-      treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...'
+      treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...',
+      utxoAddress: utxoAddress.substring(0, 20) + '...'
     });
     
     const result = await batchPayroll(
@@ -446,8 +457,9 @@ export async function mintPayrollToken(req: Request, res: Response) {
       employerAddress,                         // changeAddress (for Bitcoin change)
       planMetadata.appId,                      // appId
       employerAddress,                         // employerAddress (where NFT returns)
-      returnMetadata,                          // planMetadata (with placeholder compensationSats) ✅
+      returnMetadata,                          // planMetadata (with placeholder compensationSats)
       company.treasuryHexDest,                 // treasuryHexDest
+      utxoAddress,                             // utxoAddress (REQUIRED - address associated with authority UTXO)
       undefined                                // multiSigSigners
     );
     
@@ -518,14 +530,15 @@ export async function batchHireWorkers(req: Request, res: Response) {
     const { 
       authorityUtxo,
       authorityTxHex,
+      utxoAddress,
       workers,
       employerAddress,
       planMetadata,
       encryptionEntropy
     } = req.body;
     
-    if (!authorityUtxo || !authorityTxHex || !workers || !employerAddress || !planMetadata) {
-      throw new Error('Missing required fields');
+    if (!authorityUtxo || !authorityTxHex || !utxoAddress || !workers || !employerAddress || !planMetadata) {
+      throw new Error('Missing required fields: authorityUtxo, authorityTxHex, utxoAddress, workers, employerAddress, planMetadata');
     }
     
     if (!Array.isArray(workers) || workers.length === 0) {
@@ -541,6 +554,7 @@ export async function batchHireWorkers(req: Request, res: Response) {
     }));
     
     req.body.workers = allocations;
+    req.body.utxoAddress = utxoAddress;
     req.body.encryptionEntropy = encryptionEntropy;
     return await mintPayrollToken(req, res);
     

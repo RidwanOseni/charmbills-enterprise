@@ -1,6 +1,7 @@
 import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execSync } from 'child_process';
 import { encode } from 'cbor-x';
 import { bytesToHex } from '@noble/hashes/utils';
 import { SpellRequest, ProverResult } from '@shared/types';
@@ -113,6 +114,21 @@ function encodeSpellToCborHex(spellObj: any): string {
     return spellHex;
 }
 
+// Helper: Convert Bitcoin address to hex-encoded script destination using Charms CLI
+// This uses the official 'charms util dest' command to ensure format matches the prover
+function addressToHexDest(address: string): string {
+    try {
+        console.log(`[PAYROLL PROVER] Converting address using charms util dest: ${address.substring(0, 20)}...`);
+        const output = execSync(`charms util dest --addr ${address}`, { encoding: 'utf8' });
+        const hexDest = output.trim();
+        console.log(`[PAYROLL PROVER] charms util dest output: ${hexDest.substring(0, 50)}...`);
+        return hexDest;
+    } catch (error: any) {
+        console.error(`[PAYROLL PROVER] charms util dest failed:`, error.message);
+        throw new Error(`Failed to convert address using charms util dest: ${error.message}`);
+    }
+}
+
 // --------------------------------------------------------------------------------
 // Main Prover Function - Direct API Relay Model (Production)
 // --------------------------------------------------------------------------------
@@ -121,7 +137,8 @@ export async function generateUnsignedTransactions(
     request: SpellRequest,
     prevTxHexes: string[],
     treasuryHexDest: string,
-    appId?: string
+    appId?: string,
+    utxoAddress?: string
 ): Promise<ProverResult> {
     console.log('\n[PAYROLL PROVER] ===== START =====');
     console.log(`[PAYROLL PROVER] Type: ${request.type}`);
@@ -139,6 +156,12 @@ export async function generateUnsignedTransactions(
     
     if (!treasuryHexDest) {
         throw new Error('treasuryHexDest is required for NFT minting');
+    }
+
+    // Use passed parameter or fallback to request.utxoAddress
+    const addressToUse = utxoAddress || request.utxoAddress;
+    if (!addressToUse) {
+        throw new Error('utxoAddress is required for app_private_inputs conversion. This should be the address associated with the anchor/authority UTXO.');
     }
 
     // ----------------------------------------------------------------------------
@@ -173,6 +196,11 @@ export async function generateUnsignedTransactions(
         console.error('[PAYROLL PROVER] Spell building failed:', error);
         throw new Error(`Failed to build spell: ${error.message}`);
     }
+    
+    // 👇 ADD THIS LOG HERE 👇
+    console.log('[PAYROLL PROVER] ===== spellObj STRUCTURE =====');
+    console.log(JSON.stringify(spellObj, null, 2));
+    console.log('[PAYROLL PROVER] ===== END spellObj STRUCTURE =====');
 
     // ----------------------------------------------------------------------------
     // Step 3: Clean prev_txs hex strings and wrap in chain-tagged objects
@@ -189,23 +217,24 @@ export async function generateUnsignedTransactions(
     });
 
     // ----------------------------------------------------------------------------
-    // Step 4: Build app_private_inputs
+    // Step 4: Build app_private_inputs with hex-encoded script destinations
+    // CRITICAL: Uses charms util dest to get the correct format (matches working script)
     // ----------------------------------------------------------------------------
     const appPrivateInputs: Record<string, string> = {};
+
+    // Convert the UTXO address to hex destination using charms util dest
+    const hexDest = addressToHexDest(addressToUse);
+    
+    // Add n/ path
     const appPath = `n/${finalAppId}/${APP_VK}`;
-    const privateUtxo = request.anchorUtxo || request.authorityUtxo;
+    appPrivateInputs[appPath] = hexDest;
+    console.log(`[PAYROLL PROVER] Added private input for ${appPath}: ${hexDest.substring(0, 50)}...`);
     
-    if (privateUtxo) {
-        appPrivateInputs[appPath] = privateUtxo;
-        console.log(`[PAYROLL PROVER] Added private input for ${appPath}: ${privateUtxo.substring(0, 30)}...`);
-    }
-    
-    if (request.type === 'mint-token' && request.anchorUtxo) {
+    // For mint-token, also add the t/ path with the same hex destination
+    if (request.type === 'mint-token') {
         const tokenAppPath = `t/${finalAppId}/${APP_VK}`;
-        if (request.authorityUtxo) {
-            appPrivateInputs[tokenAppPath] = request.authorityUtxo;
-            console.log(`[PAYROLL PROVER] Added private input for ${tokenAppPath}: ${request.authorityUtxo.substring(0, 30)}...`);
-        }
+        appPrivateInputs[tokenAppPath] = hexDest;
+        console.log(`[PAYROLL PROVER] Added private input for ${tokenAppPath}: ${hexDest.substring(0, 50)}...`);
     }
 
     console.log('[PAYROLL PROVER] app_private_inputs keys:', Object.keys(appPrivateInputs));
@@ -223,8 +252,6 @@ export async function generateUnsignedTransactions(
     // ----------------------------------------------------------------------------
     // Step 6: Encode spell to CBOR hex string
     // CRITICAL: The Prover API expects 'spell' to be a CBOR-encoded hex string
-    // Step A: Convert logical object to binary CBOR
-    // Step B: Convert binary to hex string for the JSON field
     // ----------------------------------------------------------------------------
     const spellHexString = encodeSpellToCborHex(spellObj);
 
@@ -253,6 +280,7 @@ export async function generateUnsignedTransactions(
     console.log('[PAYROLL PROVER] fee_rate:', requestBody.fee_rate);
     console.log('[PAYROLL PROVER] chain:', requestBody.chain);
     console.log('[PAYROLL PROVER] app_private_inputs value type:', typeof Object.values(requestBody.app_private_inputs)[0]);
+    console.log('[PAYROLL PROVER] app_private_inputs value first 50 chars:', Object.values(requestBody.app_private_inputs)[0]?.substring(0, 50));
     console.log('[PAYROLL PROVER] binaries value type:', typeof Object.values(requestBody.binaries)[0]);
     console.log('[PAYROLL PROVER] prev_txs[0] type:', typeof requestBody.prev_txs[0]);
     console.log('[PAYROLL PROVER] ===== END REQUEST BODY DEBUG =====');
@@ -385,6 +413,7 @@ export async function batchPayroll(
     employerAddress: string,
     planMetadata: any,
     treasuryHexDest: string,
+    utxoAddress: string,
     multiSigSigners?: string[]
 ): Promise<ProverResult> {
     const request: SpellRequest = {
@@ -395,6 +424,7 @@ export async function batchPayroll(
         fundingUtxoValue: fundingUtxo.value,
         changeAddress: changeAddress,
         feeRate: constants.DEFAULT_FEE_RATE,
+        utxoAddress: utxoAddress,
         outputs: [
             ...workers.map(w => ({ address: w.address, tokenAmount: w.amount })),
             { address: employerAddress, nftMetadata: planMetadata }
@@ -402,7 +432,7 @@ export async function batchPayroll(
         ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
     };
 
-    return generateUnsignedTransactions(request, [planUtxo, fundingUtxo.utxo], treasuryHexDest, appId);
+    return generateUnsignedTransactions(request, [planUtxo, fundingUtxo.utxo], treasuryHexDest, appId, utxoAddress);
 }
 
 export async function createEmploymentPlan(
@@ -417,6 +447,7 @@ export async function createEmploymentPlan(
     fundingUtxo: { utxo: string; value: number },
     changeAddress: string,
     treasuryHexDest: string,
+    utxoAddress: string,
     multiSigSigners?: string[]
 ): Promise<ProverResult> {
     const request: SpellRequest = {
@@ -426,6 +457,7 @@ export async function createEmploymentPlan(
         fundingUtxoValue: fundingUtxo.value,
         changeAddress: changeAddress,
         feeRate: constants.DEFAULT_FEE_RATE,
+        utxoAddress: utxoAddress,
         outputs: [{
             address: changeAddress,
             nftMetadata: {
@@ -440,5 +472,5 @@ export async function createEmploymentPlan(
         ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
     };
     
-    return generateUnsignedTransactions(request, [anchorUtxo, fundingUtxo.utxo], treasuryHexDest);
+    return generateUnsignedTransactions(request, [anchorUtxo, fundingUtxo.utxo], treasuryHexDest, undefined, utxoAddress);
 }

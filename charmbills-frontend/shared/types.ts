@@ -103,6 +103,7 @@ export interface SpellRequest {
   fundingUtxoValue: number;
   changeAddress: string;
   feeRate: number;
+  utxoAddress?: string;
   
   // Multi-signature support
   multiSigSigners?: string[];                    // For 2-of-3 treasury
