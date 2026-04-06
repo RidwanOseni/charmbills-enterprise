@@ -1,6 +1,6 @@
 [package]
 name = "subscription-engine"
-description = "A simple Charms app"
+description = "Charms Enterprise Payroll Engine"
 version = "0.12.0"
 edition = "2021"
 license = "MIT"
@@ -18,15 +18,17 @@ default = []
 charms-sdk = "0.12.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-sha2 = "0.10.9"
-ciborium = "0.2"
 hex = "0.4"
+sha2 = "0.10.9" # Required for contract validation logic [Source 10]
+
+# WASM Bridge specific dependencies
 wasm-bindgen = { version = "0.2", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1.7"
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
-strip = "symbols"
-panic = "abort"
+lto = "fat"            # Full Link-Time Optimization
+codegen-units = 1      # Maximize optimization impact
+strip = "symbols"      # Minimize WASM size for Prover API
+panic = "abort"        # Reduce binary overhead

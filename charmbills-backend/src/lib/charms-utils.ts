@@ -1,9 +1,17 @@
-import initWasm, { extractAndVerifySpell } from "@wasm/charms_lib";
+import * as path from 'path';
+import * as fs from 'fs';
 import axios from 'axios';
 import * as constants from '@shared/constants';
 
+// 1. USE REQUIRE: This is the most stable way for Node to load wasm-bindgen modules
+// Avoids import collision issues between default and named exports
+const CharmsLib = require("../charms/wasm/charms_lib");
+
 const MEMPOOL_API = "https://mempool.space/testnet4/api";
-const PROTOCOL_VERSION = 11; 
+const PROTOCOL_VERSION = 11;
+
+// Flag to track WASM bridge initialization status
+let wasmBridgeInitialized = false;
 
 /**
  * ADDITION: Calculates required fees for Scroll-enabled transactions.
@@ -19,13 +27,98 @@ export function calculateScrollFee(numInputs: number, totalSats: number): number
 }
 
 /**
+ * Robust initialization for the WASM bridge.
+ * Node.js 'target nodejs' builds initialize automatically on require.
+ * Fallback for 'bundler' target builds that need manual initialization.
+ * 
+ * @returns Promise<void>
+ */
+export async function initializeWasmBridge(): Promise<void> {
+    if (wasmBridgeInitialized) {
+        console.log("✅ Charms JS Bridge already initialized");
+        return;
+    }
+
+    try {
+        // 2. Node.js 'target nodejs' builds initialize automatically on require.
+        // We simply verify the required function exists on the export object.
+        if (typeof CharmsLib.process_spell_template === 'function') {
+            wasmBridgeInitialized = true;
+            console.log("✅ Charms JS Bridge active (Auto-initialized)");
+            return;
+        }
+
+        // 3. FALLBACK: If using a 'bundler' target build
+        if (typeof CharmsLib.default === 'function') {
+            const wasmPath = path.resolve(process.cwd(), 'src/charms/wasm/charms_lib_bg.wasm');
+            
+            if (!fs.existsSync(wasmPath)) {
+                throw new Error(`WASM file not found at: ${wasmPath}`);
+            }
+            
+            const wasmBuffer = fs.readFileSync(wasmPath);
+            await CharmsLib.default(wasmBuffer);
+            wasmBridgeInitialized = true;
+            console.log("✅ Charms JS Bridge initialized manually with buffer");
+            return;
+        }
+
+        throw new Error("process_spell_template not found in exports. Ensure WASM was built with --features wasm-bridge.");
+    } catch (error: any) {
+        console.error("❌ Charms JS Bridge initialization failed:", error.message);
+        throw error;
+    }
+}
+
+/**
+ * DYNAMIC WRAPPER: Resolves the "Captured Undefined" bug
+ * This function looks up the Rust symbol on the namespace AT CALL TIME,
+ * ensuring it isn't undefined even if called after initialization.
+ * 
+ * @param templateYaml - The YAML template string
+ * @param variablesJson - JSON string of variables to substitute
+ * @returns The processed spell result
+ */
+export function process_spell_template(templateYaml: string, variablesJson: string): string {
+    if (!wasmBridgeInitialized) {
+        throw new Error("WASM Bridge not initialized. Call initializeWasmBridge() first.");
+    }
+    
+    const fn = CharmsLib.process_spell_template;
+    if (typeof fn !== 'function') {
+        throw new Error("process_spell_template not found on CharmsLib namespace after initialization.");
+    }
+    
+    return fn(templateYaml, variablesJson);
+}
+
+/**
+ * Process a spell template with variables using the WASM bridge.
+ * This is an alias for process_spell_template for backward compatibility.
+ * 
+ * @param templateYaml - The YAML template string
+ * @param variablesJson - JSON string of variables to substitute
+ * @returns The processed spell result
+ */
+export function processSpellTemplate(templateYaml: string, variablesJson: string): string {
+    return process_spell_template(templateYaml, variablesJson);
+}
+
+// Re-export extractAndVerifySpell for the scanner from the same WASM module
+export const extractAndVerifySpell = CharmsLib.extractAndVerifySpell;
+
+// Export the bridge namespace for advanced use cases
+export { CharmsLib };
+
+/**
  * MODIFICATION: Scans addresses for Charms using v12 WASM initialization.
  * Focuses purely on trustless verification of existing tokens.
+ * Uses the same WASM module (no separate import needed)
  */
 export async function scanAddressForCharms(address: string) {
     try {
-        // Initialize WASM module for extraction 
-        await initWasm();
+        // Ensure WASM bridge is initialized (extractAndVerifySpell may need it)
+        await initializeWasmBridge();
 
         const utxoResponse = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
         const utxos = utxoResponse.data;
@@ -36,13 +129,13 @@ export async function scanAddressForCharms(address: string) {
                 const txHexResponse = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/hex`);
                 const txJson = { bitcoin: txHexResponse.data };
 
-                // Extract spell data from the transaction hex [7, 8]
+                // Extract spell data from the transaction hex
                 const spellData = extractAndVerifySpell(txJson, false);
 
                 if (spellData && spellData.tx) {
                     const outputCharms = spellData.tx.outs[utxo.vout];
                     
-                    // Check for valid Charms maps or objects [9]
+                    // Check for valid Charms maps or objects
                     if (outputCharms && (typeof outputCharms.size === 'number' || Object.keys(outputCharms).length > 0)) {
                         charmsAssets.push({
                             utxoId: `${utxo.txid}:${utxo.vout}`,
@@ -53,7 +146,7 @@ export async function scanAddressForCharms(address: string) {
                     }
                 }
             } catch (e: any) {
-                // Ignore non-charm UTXOs to minimize console noise [10]
+                // Ignore non-charm UTXOs to minimize console noise
                 continue;
             }
         }
@@ -208,5 +301,3 @@ export async function debugUtxos(address: string): Promise<any> {
     return [];
   }
 }
-
-// REMOVED: clearUsedUtxos function - Use utxo-manager.ts instead

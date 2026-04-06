@@ -3,7 +3,6 @@ import { Database } from 'sqlite3';
 import { generateUnsignedTransactions } from '../charms/proverClient'; 
 import { encryptPayrollData } from '@shared/encryption';
 import { pinToIPFS } from '../lib/ipfs-pinner';
-import { fetchTransactionHex } from '../lib/utxo-manager';
 import { SpellRequest, ProverResult } from '@shared/types';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
@@ -22,6 +21,7 @@ interface CreatePayrollPlanRequest {
   anchorValue: number;          // Value of the anchor UTXO in sats
   fundingUtxo: string;          // Selected by HR wallet for fees
   fundingValue: number;         // Value of the funding UTXO in sats
+  fundingTxHex: string;         // Raw transaction hex for the funding UTXO (from frontend)
   employerAddress: string;      // Where the Plan NFT will be sent
   utxoAddress: string;          // The Bitcoin address associated with the anchor UTXO (for app_private_inputs)
   
@@ -66,13 +66,16 @@ interface CompanyRecord {
 function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPlanRequest {
   // Updated required fields - includes 'remaining' for department budget [14]
   // Also includes 'utxoAddress' for app_private_inputs conversion
+  // Also includes 'fundingTxHex' for funding UTXO hex from frontend
+  // CRITICAL: anchorTxHex is now REQUIRED - must be provided by frontend
   const required = [
     // Bitcoin UTXO data - MUST BE PROVIDED BY FRONTEND [1, 2]
     'anchorUtxo', 
-    'anchorTxHex', 
+    'anchorTxHex',              // MANDATORY - The transaction hex that created the anchor UTXO
     'anchorValue',
     'fundingUtxo', 
     'fundingValue',
+    'fundingTxHex',             // MANDATORY - The transaction hex that created the funding UTXO
     'employerAddress',
     'utxoAddress',              // REQUIRED for app_private_inputs conversion
     
@@ -121,9 +124,13 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
     throw new Error('remaining must be a positive number (total pay periods budget)');
   }
   
-  // Validate hex strings
+  // Validate hex strings - BOTH anchor and funding hexes must be valid
   if (!/^[0-9a-f]+$/i.test(body.anchorTxHex.replace(/\s/g, ''))) {
     throw new Error('anchorTxHex contains invalid hex characters');
+  }
+  
+  if (!/^[0-9a-f]+$/i.test(body.fundingTxHex.replace(/\s/g, ''))) {
+    throw new Error('fundingTxHex contains invalid hex characters');
   }
   
   // Validate UTXO format
@@ -275,8 +282,9 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
  * 5. Company treasuryHexDest is fetched from database, NOT .env [16, 17, 18, 19]
  * 6. REMOVED role and compensationSats from validation and record saving
  * 7. ADDED remaining field for department budget [14]
- * 8. FETCH funding UTXO hex from the blockchain (not just ID) [22]
+ * 8. USE fundingTxHex directly from frontend (no blockchain fetch) [22]
  * 9. ADDED utxoAddress field for app_private_inputs conversion
+ * 10. CRITICAL FIX: BOTH anchorTxHex AND fundingTxHex are now passed to prover
  */
 export async function createPayrollPlan(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -297,7 +305,11 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // Log sanitized request (no sensitive data)
     console.log(`[PLANS API:${requestId}] Request summary:`, {
       anchorUtxo: req.body.anchorUtxo ? `${req.body.anchorUtxo.substring(0, 20)}...` : 'missing',
+      hasAnchorTxHex: !!req.body.anchorTxHex,
+      anchorTxHexLength: req.body.anchorTxHex?.length || 0,
       fundingUtxo: req.body.fundingUtxo ? `${req.body.fundingUtxo.substring(0, 20)}...` : 'missing',
+      hasFundingTxHex: !!req.body.fundingTxHex,
+      fundingTxHexLength: req.body.fundingTxHex?.length || 0,
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
       utxoAddress: req.body.utxoAddress ? `${req.body.utxoAddress.substring(0, 20)}...` : 'missing',
       department: req.body.department,
@@ -318,8 +330,9 @@ export async function createPayrollPlan(req: Request, res: Response) {
       anchorValue,
       fundingUtxo,
       fundingValue,
+      fundingTxHex,
       employerAddress,
-      utxoAddress,               // NEW: Address associated with anchor UTXO
+      utxoAddress,               // Address associated with anchor UTXO
       department,
       payPeriodSeconds,
       scrollPolicy,
@@ -332,8 +345,12 @@ export async function createPayrollPlan(req: Request, res: Response) {
     
     // Clean hex - remove whitespace
     const cleanAnchorTxHex = anchorTxHex.replace(/\s/g, '');
+    const cleanFundingTxHex = fundingTxHex.replace(/\s/g, '');
     
+    // DEBUG: Log hex lengths to verify both are present
     console.log(`[PLANS API:${requestId}] ✅ Validation passed`);
+    console.log(`[PLANS API:${requestId}] Anchor hex length: ${cleanAnchorTxHex.length} chars`);
+    console.log(`[PLANS API:${requestId}] Funding hex length: ${cleanFundingTxHex.length} chars`);
     console.log(`[PLANS API:${requestId}] Department budget: ${remaining} pay periods`);
     console.log(`[PLANS API:${requestId}] utxoAddress: ${utxoAddress.substring(0, 20)}...`);
     
@@ -358,24 +375,10 @@ export async function createPayrollPlan(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 3: Fetch funding UTXO hex from the blockchain
-    // CRITICAL: Frontend provides only the UTXO ID, prover needs the full hex [22]
+    // Step 3: Use funding UTXO hex directly from frontend
+    // CRITICAL: Frontend provides the full hex, no need to fetch from blockchain [22]
     // ----------------------------------------------------------------------------
-    console.log(`[PLANS API:${requestId}] 🔍 Fetching funding UTXO hex...`);
-    
-    const fundingTxid = fundingUtxo.split(':')[0];
-    let fundingTxHex: string;
-    
-    try {
-      fundingTxHex = await fetchTransactionHex(fundingTxid);
-      console.log(`[PLANS API:${requestId}] ✅ Funding UTXO hex fetched (length: ${fundingTxHex.length} chars)`);
-    } catch (error: any) {
-      console.error(`[PLANS API:${requestId}] ❌ Failed to fetch funding UTXO hex:`, error.message);
-      return res.status(400).json({ 
-        error: `Failed to fetch funding transaction hex: ${error.message}`,
-        fundingTxid
-      });
-    }
+    console.log(`[PLANS API:${requestId}] ✅ Using funding UTXO hex from frontend (length: ${cleanFundingTxHex.length} chars)`);
     
     // ----------------------------------------------------------------------------
     // Step 4: Encrypt using wallet-provided entropy (Backend acts as blind relay) [3, 4]
@@ -426,7 +429,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔧 Building SpellRequest...`);
     
-    const request: SpellRequest = {
+    const spellRequest: SpellRequest = {
       type: 'mint-nft',
       anchorUtxo,
       anchorValue,
@@ -451,17 +454,18 @@ export async function createPayrollPlan(req: Request, res: Response) {
     
     // ----------------------------------------------------------------------------
     // Step 8: Generate unsigned transactions via prover
-    // CRITICAL: Pass BOTH hex strings (anchor + funding) to the prover [22, 112]
-    // CRITICAL: Pass utxoAddress as the 5th parameter for app_private_inputs conversion
+    // CRITICAL FIX: BOTH hex strings (anchor + funding) MUST be passed to the prover
+    // The API requires prev_txs to contain transactions that create BOTH input UTXOs
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] ⏳ Calling proverClient...`);
+    console.log(`[PLANS API:${requestId}] Passing BOTH anchorTxHex and fundingTxHex to prover`);
     
     const result = await generateUnsignedTransactions(
-      request, 
-      [cleanAnchorTxHex, fundingTxHex], // BOTH must be raw hex strings [112]
-      company.treasuryHexDest,          // Pass treasuryHexDest from company lookup
-      undefined,                        // appId not needed for mint-nft
-      utxoAddress                       // Pass utxoAddress for app_private_inputs conversion
+      spellRequest, 
+      [cleanAnchorTxHex, cleanFundingTxHex], // BOTH raw hex strings from frontend (anchor FIRST, funding SECOND)
+      company.treasuryHexDest,               // Pass treasuryHexDest from company lookup
+      undefined,                             // appId not needed for mint-nft
+      utxoAddress                            // Pass utxoAddress for app_private_inputs conversion
     );
     
     console.log(`[PLANS API:${requestId}] ✅ Transactions generated`);
@@ -537,8 +541,6 @@ export async function createPayrollPlan(req: Request, res: Response) {
       statusCode = 502;
     } else if (error.message.includes('IPFS')) {
       statusCode = 503;
-    } else if (error.message.includes('fetch funding transaction')) {
-      statusCode = 400;
     }
     
     return res.status(statusCode).json({

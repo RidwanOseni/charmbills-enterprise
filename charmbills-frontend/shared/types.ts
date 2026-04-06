@@ -104,6 +104,11 @@ export interface SpellRequest {
   changeAddress: string;
   feeRate: number;
   utxoAddress?: string;
+
+  planMetadata?: {
+    anchorUtxo?: string;
+    [key: string]: any;
+  };
   
   // Multi-signature support
   multiSigSigners?: string[];                    // For 2-of-3 treasury

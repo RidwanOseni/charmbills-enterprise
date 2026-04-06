@@ -12,6 +12,42 @@ use wasm_bindgen::prelude::*;
 use std::collections::HashMap;
 
 // --------------------------------------------------------------------------------
+// WASM Bridge Panic Hook and Initialization
+// This ensures Rust panics show up in Node.js console logs
+// --------------------------------------------------------------------------------
+
+#[cfg(feature = "wasm-bridge")]
+#[wasm_bindgen(start)]
+pub fn start() {
+    // This ensures Rust panics show up in your 'npm run dev' logs
+    console_error_panic_hook::set_once();
+}
+
+// --------------------------------------------------------------------------------
+// Strict Type-Marshalling Bridge Variables Structure
+// This replaces the find-and-replace logic with typed marshalling
+// --------------------------------------------------------------------------------
+
+#[cfg(feature = "wasm-bridge")]
+#[derive(Deserialize)]
+pub struct BridgeVariables {
+    pub type_name: String,           // "mint-nft" or "mint-token"
+    pub anchor_utxo: String,
+    pub funding_utxo: String,
+    pub ticker: String,
+    pub remaining: String,
+    pub metadata_hash: String,
+    pub scroll_policy: String,
+    pub pay_period_seconds: String,
+    pub compensation_sats: String,
+    pub treasury_dest: String,
+    pub app_id: String,
+    pub app_vk: String,
+    pub worker_dests: Option<Vec<String>>,   // For batch hiring
+    pub token_amounts: Option<Vec<String>>,  // For batch hiring
+}
+
+// --------------------------------------------------------------------------------
 // NFT Content Structure for Payroll
 // --------------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -57,7 +93,6 @@ impl NftContent {
 // --------------------------------------------------------------------------------
 // Main App Contract Entry Point
 // --------------------------------------------------------------------------------
-// REMOVED: #[cfg_attr(feature = "wasm-bridge", wasm_bindgen)]
 // This function is for the Charms ZK-VM, not for JavaScript.
 // wasm-bindgen cannot handle the complex Charms SDK types (App, Transaction, Data).
 pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
@@ -73,55 +108,105 @@ pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
 // NFT Contract Logic
 // --------------------------------------------------------------------------------
 fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
+    // =========================================================================
+    // DEBUG: Log the witness and expected identity to identify mismatch
+    // This helps debug the "app_contract assertion failed" error
+    // =========================================================================
     let w_str = match w.value::<String>() {
-        Ok(val) => val,
-        Err(_) => return false,
+        Ok(val) => {
+            eprintln!("\n--- [ZK-DEBUG] NFT Contract Debug ---");
+            eprintln!("Witness (w_str): {:?}", val);
+            eprintln!("Expected App Identity: {:?}", app.identity.to_string());
+            val
+        },
+        Err(e) => {
+            eprintln!("❌ Error: Failed to decode witness as String: {:?}", e);
+            return false;
+        },
     };
     
-    if hash(&w_str) != app.identity {
+    // Compare the witness with the app identity (SHA256 hash of the anchor UTXO)
+    let witness_hash = hash(&w_str);
+    eprintln!("Witness Hash: {:?}", witness_hash.to_string());
+    eprintln!("App Identity:  {:?}", app.identity.to_string());
+    
+    if witness_hash != app.identity {
+        eprintln!("❌ Error: Witness hash does not match App Identity!");
+        eprintln!("   Expected: {}", app.identity.to_string());
+        eprintln!("   Got:      {}", witness_hash.to_string());
         return false;
     }
+    eprintln!("✅ Witness hash matches App Identity");
     
+    // Try to parse witness as UTXO ID for minting detection
     let w_utxo_id = match UtxoId::from_str(&w_str) {
-        Ok(id) => id,
-        Err(_) => return false,
+        Ok(id) => {
+            eprintln!("✅ Parsed witness as UTXO ID: {:?}", id);
+            id
+        },
+        Err(e) => {
+            eprintln!("⚠️  Witness is not a valid UTXO ID (this may be fine): {:?}", e);
+            // Return false because for NFT minting, witness must be a UTXO ID
+            return false;
+        },
     };
     
+    // Check if this is an NFT minting transaction (witness UTXO appears in inputs)
     let is_nft_minting = tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id);
+    eprintln!("Is NFT Minting Transaction: {}", is_nft_minting);
     
     if is_nft_minting {
+        // Verify witness UTXO is actually in inputs (redundant check but safe)
         if !tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id) {
+            eprintln!("❌ Error: Witness UTXO not found in transaction inputs");
             return false;
         }
+        eprintln!("✅ Witness UTXO found in transaction inputs");
     }
     
+    // Collect NFT outputs from the transaction
     let nft_outputs: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
+    eprintln!("NFT Outputs found: {}", nft_outputs.len());
     
     if nft_outputs.is_empty() {
+        eprintln!("❌ Error: No NFT outputs found");
         return false;
     }
     
+    // For NFT minting, there should be exactly one NFT output
     if is_nft_minting && nft_outputs.len() != 1 {
+        eprintln!("❌ Error: NFT minting requires exactly 1 NFT output, got {}", nft_outputs.len());
         return false;
     }
     
+    // Validate each NFT output's content
     for (i, data) in nft_outputs.iter().enumerate() {
         let content: NftContent = match data.value() {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(e) => {
+                eprintln!("❌ Error: Failed to decode NFT content at index {}: {:?}", i, e);
+                return false;
+            },
         };
         
+        eprintln!("NFT Output {}: ticker={}, remaining={}, scrollPolicy={}", 
+                  i, content.ticker, content.remaining, content.scroll_policy);
+        
         if !content.validate() {
+            eprintln!("❌ Error: NFT content validation failed at index {}", i);
             return false;
         }
         
         if is_nft_minting && i == 0 {
             if content.ticker.is_empty() {
+                eprintln!("❌ Error: NFT ticker is empty");
                 return false;
             }
+            eprintln!("✅ NFT content validated successfully");
         }
     }
     
+    eprintln!("✅ NFT Contract Satisfied!\n");
     true
 }
 
@@ -213,95 +298,103 @@ pub(crate) fn hash(data: &str) -> B32 {
 }
 
 // --------------------------------------------------------------------------------
-// WASM Bridge Functions for Template Processing
-// These are ONLY included when building with 'wasm-bridge' feature
-// These functions use standard types (String, HashMap) that are compatible with wasm-bindgen
+// WASM Bridge Functions for Strict Type-Marshalling
+// This replaces the find-and-replace logic with typed marshalling
+// Handles both NFT creation and Batch Hiring by converting JS strings into SDK binary types
 // --------------------------------------------------------------------------------
 
 #[cfg(feature = "wasm-bridge")]
-fn substitute_variables(
-    mut value: serde_yaml::Value,
-    vars: &HashMap<String, String>
-) -> serde_yaml::Value {
-    match &mut value {
-        serde_yaml::Value::String(s) => {
-            for (key, val) in vars {
-                let pattern = format!("{{{{{}}}}}", key);
-                if s.contains(&pattern) {
-                    *s = s.replace(&pattern, val);
-                }
-            }
-            value
-        }
-        serde_yaml::Value::Mapping(map) => {
-            for (_, v) in map.iter_mut() {
-                *v = substitute_variables(v.clone(), vars);
-            }
-            value
-        }
-        serde_yaml::Value::Sequence(seq) => {
-            for item in seq.iter_mut() {
-                *item = substitute_variables(item.clone(), vars);
-            }
-            value
-        }
-        _ => value,
-    }
-}
-
-#[cfg(feature = "wasm-bridge")]
-fn transform_identity_keys(mut value: serde_yaml::Value) -> serde_yaml::Value {
-    match &mut value {
-        serde_yaml::Value::Mapping(map) => {
-            let mut new_map = serde_yaml::Mapping::new();
-            
-            for (key, val) in map.iter() {
-                if let serde_yaml::Value::String(key_str) = key {
-                    let parts: Vec<&str> = key_str.split('/').collect();
-                    if parts.len() == 3 && (parts[0] == "n" || parts[0] == "t") {
-                        let array_key = serde_yaml::Value::Sequence(vec![
-                            serde_yaml::Value::String(parts[0].to_string()),
-                            serde_yaml::Value::String(parts[1].to_string()),
-                            serde_yaml::Value::String(parts[2].to_string()),
-                        ]);
-                        new_map.insert(array_key, val.clone());
-                    } else {
-                        new_map.insert(key.clone(), transform_identity_keys(val.clone()));
-                    }
-                } else {
-                    new_map.insert(key.clone(), transform_identity_keys(val.clone()));
-                }
-            }
-            
-            serde_yaml::Value::Mapping(new_map)
-        }
-        serde_yaml::Value::Sequence(seq) => {
-            let new_seq: Vec<serde_yaml::Value> = seq
-                .iter()
-                .map(|item| transform_identity_keys(item.clone()))
-                .collect();
-            serde_yaml::Value::Sequence(new_seq)
-        }
-        _ => value,
-    }
-}
-
-#[cfg(feature = "wasm-bridge")]
 #[wasm_bindgen]
-pub fn process_spell_template(template_yaml: &str, variables_json: &str) -> Result<String, JsValue> {
-    let vars: HashMap<String, String> = serde_json::from_str(variables_json)
-        .map_err(|e| JsValue::from_str(&format!("JSON Parse Error: {}", e)))?;
+pub fn process_spell_template(_template_yaml: &str, variables_json: &str) -> Result<String, JsValue> {
+    // 1. Parse the typed variables from Node.js
+    let vars: BridgeVariables = serde_json::from_str(variables_json)
+        .map_err(|e| JsValue::from_str(&format!("Input Parse Error: {}", e)))?;
 
-    let mut yaml_val: serde_yaml::Value = serde_yaml::from_str(template_yaml)
-        .map_err(|e| JsValue::from_str(&format!("YAML Parse Error: {}", e)))?;
+    // 2. Marshall Binary Types (Solves "expected bytes" error)
+    // Convert string UTXOs to UtxoId (binary type)
+    let anchor_id = UtxoId::from_str(&vars.anchor_utxo)
+        .map_err(|_| JsValue::from_str("Invalid anchor UTXO format. Expected 'txid:vout'"))?;
+    
+    let funding_id = UtxoId::from_str(&vars.funding_utxo)
+        .map_err(|_| JsValue::from_str("Invalid funding UTXO format. Expected 'txid:vout'"))?;
+    
+    // Convert hex destination string to bytes
+    let treasury_dest = hex::decode(&vars.treasury_dest)
+        .map_err(|_| JsValue::from_str("Invalid treasury dest hex string"))?;
 
-    yaml_val = substitute_variables(yaml_val, &vars);
-    yaml_val = transform_identity_keys(yaml_val);
+    // 3. Parse numeric values from strings
+    let remaining = vars.remaining.parse::<u64>()
+        .map_err(|_| JsValue::from_str("Invalid remaining: must be a number"))?;
+    
+    let scroll_policy = vars.scroll_policy.parse::<u8>()
+        .map_err(|_| JsValue::from_str("Invalid scrollPolicy: must be 0 or 1"))?;
+    
+    let pay_period_seconds = vars.pay_period_seconds.parse::<u64>()
+        .map_err(|_| JsValue::from_str("Invalid payPeriodSeconds: must be a number"))?;
+    
+    let compensation_sats = vars.compensation_sats.parse::<u64>()
+        .map_err(|_| JsValue::from_str("Invalid compensationSats: must be a number"))?;
 
-    let json_val = serde_json::to_value(&yaml_val)
-        .map_err(|e| JsValue::from_str(&format!("JSON Conversion Error: {}", e)))?;
+    // 4. Build Typed Outputs (Solves "expected integer" error)
+    let mut outs = Vec::new();
+    
+    if vars.type_name == "mint-nft" {
+        // Single NFT output
+        outs.push(serde_json::json!({
+            "0": {
+                "ticker": vars.ticker,
+                "remaining": remaining,
+                "metadataHash": vars.metadata_hash,
+                "scrollPolicy": scroll_policy,
+                "payPeriodSeconds": pay_period_seconds,
+                "compensationSats": compensation_sats
+            }
+        }));
+    } else {
+        // Handle Batch Hiring: M workers + 1 NFT return
+        // Worker outputs use key "1" (fungible token output)
+        if let (Some(dests), Some(amounts)) = (vars.worker_dests, vars.token_amounts) {
+            if dests.len() != amounts.len() {
+                return Err(JsValue::from_str("worker_dests and token_amounts length mismatch"));
+            }
+            for (i, amount_str) in amounts.iter().enumerate() {
+                let amount = amount_str.parse::<u64>()
+                    .map_err(|_| JsValue::from_str(&format!("Invalid token amount at index {}: must be a number", i)))?;
+                outs.push(serde_json::json!({ "1": amount }));
+            }
+        }
+        
+        // NFT return output uses key "0" (authority NFT output)
+        outs.push(serde_json::json!({
+            "0": {
+                "ticker": vars.ticker,
+                "remaining": remaining,
+                "metadataHash": vars.metadata_hash,
+                "scrollPolicy": scroll_policy,
+                "payPeriodSeconds": pay_period_seconds,
+                "compensationSats": compensation_sats
+            }
+        }));
+    }
 
-    serde_json::to_string(&json_val)
+    // 5. Generate Final Marshall Object
+    let spell = serde_json::json!({
+        "version": 11,
+        "tx": {
+            "ins": [anchor_id, funding_id],
+            "outs": outs,
+            "coins": [{
+                "amount": 1000,
+                "dest": treasury_dest
+            }]
+        },
+        "app_public_inputs": {
+            format!("n/{}/{}", vars.app_id, vars.app_vk): serde_json::Value::Null
+        }
+    });
+
+    // 6. Serialize to JSON string for return to Node.js
+    serde_json::to_string(&spell)
         .map_err(|e| JsValue::from_str(&format!("Serialization Error: {}", e)))
 }
 
@@ -408,58 +501,52 @@ mod tests {
 
     #[cfg(feature = "wasm-bridge")]
     #[test]
-    fn test_transform_identity_keys() {
-        let input = serde_yaml::from_str(r#"
-app_public_inputs:
-  "n/abc123/vk456": null
-  "t/def789/vk000": null
-"#).unwrap();
-        
-        let transformed = transform_identity_keys(input);
-        
-        let yaml_string = serde_yaml::to_string(&transformed).unwrap();
-        assert!(yaml_string.contains("- n"));
-        assert!(yaml_string.contains("- abc123"));
-        assert!(yaml_string.contains("- vk456"));
-        assert!(!yaml_string.contains("n/abc123/vk456"));
-    }
-
-    #[cfg(feature = "wasm-bridge")]
-    #[test]
-    fn test_process_spell_template_with_identity_transform() {
-        let template = r#"
-version: 11
-tx:
-  ins:
-    - "{{anchor_utxo}}"
-    - "{{funding_utxo}}"
-  outs:
-    - 0:
-        ticker: "{{ticker}}"
-        remaining: {{remaining}}
-  coins:
-    - amount: 1000
-      dest: "{{treasury_hex_dest}}"
-app_public_inputs:
-  "n/{{app_id}}/{{vk}}": null
-"#;
-        
-        let vars = serde_json::json!({
+    fn test_bridge_variables_deserialization() {
+        let json = r#"{
+            "type_name": "mint-nft",
             "anchor_utxo": "abc123:0",
             "funding_utxo": "def456:1",
             "ticker": "TEST-PAY",
             "remaining": "100",
-            "treasury_hex_dest": "5120abc...",
-            "app_id": "test123",
-            "vk": "vk456"
-        });
+            "metadata_hash": "hash123",
+            "scroll_policy": "0",
+            "pay_period_seconds": "1209600",
+            "compensation_sats": "5000000",
+            "treasury_dest": "5120abc",
+            "app_id": "app123",
+            "app_vk": "vk456"
+        }"#;
         
-        let result = process_spell_template(template, &vars.to_string()).unwrap();
+        let vars: BridgeVariables = serde_json::from_str(json).unwrap();
+        assert_eq!(vars.type_name, "mint-nft");
+        assert_eq!(vars.anchor_utxo, "abc123:0");
+        assert_eq!(vars.ticker, "TEST-PAY");
+        assert_eq!(vars.remaining, "100");
+    }
+
+    #[cfg(feature = "wasm-bridge")]
+    #[test]
+    fn test_bridge_variables_with_workers() {
+        let json = r#"{
+            "type_name": "mint-token",
+            "anchor_utxo": "abc123:0",
+            "funding_utxo": "def456:1",
+            "ticker": "TEST-PAY",
+            "remaining": "97",
+            "metadata_hash": "hash123",
+            "scroll_policy": "0",
+            "pay_period_seconds": "1209600",
+            "compensation_sats": "1000",
+            "treasury_dest": "5120abc",
+            "app_id": "app123",
+            "app_vk": "vk456",
+            "worker_dests": ["addr1", "addr2", "addr3"],
+            "token_amounts": ["1", "1", "1"]
+        }"#;
         
-        assert!(result.contains(r#"[["n","test123","vk456"],null]"#) || 
-                result.contains(r#"[["n","test123","vk456"],null]"#));
-        assert!(!result.contains(r#""n/test123/vk456""#));
-        assert!(result.contains("TEST-PAY"));
-        assert!(result.contains("abc123:0"));
+        let vars: BridgeVariables = serde_json::from_str(json).unwrap();
+        assert_eq!(vars.type_name, "mint-token");
+        assert_eq!(vars.worker_dests.as_ref().unwrap().len(), 3);
+        assert_eq!(vars.token_amounts.as_ref().unwrap().len(), 3);
     }
 }

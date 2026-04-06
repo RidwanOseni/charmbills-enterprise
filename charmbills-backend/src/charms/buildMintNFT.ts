@@ -20,6 +20,32 @@ class ValidationError extends Error {
 }
 
 // --------------------------------------------------------------------------------
+// Helper: Converts "txid:vout" string to 36-byte Uint8Array (Byte String)
+// 32-byte Hash + 4-byte LE Index - matches working payload structure
+// Returns Uint8Array to ensure CBOR Byte String encoding, not Sequence
+// --------------------------------------------------------------------------------
+function utxoTo36Bytes(utxoId: string): Uint8Array {
+  const [txid, vout] = utxoId.split(':');
+  if (!txid || vout === undefined) {
+    throw new ValidationError(`Invalid UTXO format: ${utxoId} (expected "txid:vout")`);
+  }
+  const txidBytes = Buffer.from(txid, 'hex');
+  if (txidBytes.length !== 32) {
+    throw new ValidationError(`Invalid txid length: expected 32 bytes, got ${txidBytes.length}`);
+  }
+  const voutBuf = Buffer.alloc(4);
+  voutBuf.writeUInt32LE(parseInt(vout, 10)); // Little-Endian is mandatory
+  return new Uint8Array(Buffer.concat([txidBytes, voutBuf]));
+}
+
+// --------------------------------------------------------------------------------
+// Helper: Converts hex string to Uint8Array (Byte String)
+// --------------------------------------------------------------------------------
+function hexToBytes(hex: string): Uint8Array {
+  return new Uint8Array(Buffer.from(hex, 'hex'));
+}
+
+// --------------------------------------------------------------------------------
 // App ID Derivation
 // --------------------------------------------------------------------------------
 
@@ -49,15 +75,12 @@ export function deriveAppId(utxoId: string): string {
 
 /**
  * Validates that the request contains all required fields for payroll NFT minting
- * UPDATED: Removed compensationSats validation - now enforced at Scroll Settlement Layer
  */
 function validatePayrollRequest(request: SpellRequest): void {
-  // Check request type
   if (request.type !== 'mint-nft') {
     throw new ValidationError(`Expected type 'mint-nft', got '${request.type}'`);
   }
   
-  // Check anchor UTXO
   if (!request.anchorUtxo) {
     throw new ValidationError('anchorUtxo is required for payroll NFT minting');
   }
@@ -68,12 +91,10 @@ function validatePayrollRequest(request: SpellRequest): void {
     );
   }
   
-  // v0.12 FIX: Check funding UTXO (now required and must be in spell inputs)
   if (!request.fundingUtxo) {
     throw new ValidationError('fundingUtxo is required for payroll NFT minting in v0.12');
   }
   
-  // Check outputs
   if (!request.outputs || request.outputs.length !== 1) {
     throw new ValidationError(`Expected exactly 1 output, got ${request.outputs?.length || 0}`);
   }
@@ -84,18 +105,15 @@ function validatePayrollRequest(request: SpellRequest): void {
     throw new ValidationError('Output address is required');
   }
   
-  // Check NFT metadata
   const metadata = output.nftMetadata;
   if (!metadata) {
     throw new ValidationError('nftMetadata is required for payroll NFT minting');
   }
   
-  // Required enforcement fields (must be present and valid)
   if (!metadata.metadataHash) {
     throw new ValidationError('metadataHash is required (SHA256 of encrypted IPFS JSON)');
   }
   
-  // Validate metadataHash format (64 hex chars = 32 bytes)
   if (!/^[a-f0-9]{64}$/i.test(metadata.metadataHash)) {
     throw new ValidationError(`metadataHash must be 64 hex characters, got ${metadata.metadataHash.length}`);
   }
@@ -112,37 +130,31 @@ function validatePayrollRequest(request: SpellRequest): void {
     throw new ValidationError(`payPeriodSeconds must be positive, got ${metadata.payPeriodSeconds}`);
   }
   
-  // ----------------------------------------------------------------------------
-  // REMOVED: compensationSats validation - no longer enforced on-chain
-  // Salary enforcement now happens at Scroll Settlement Layer
-  // ----------------------------------------------------------------------------
-  
-  // Optional fields with defaults
   if (metadata.remaining !== undefined && metadata.remaining <= 0) {
     throw new ValidationError(`remaining must be positive if provided, got ${metadata.remaining}`);
   }
 }
 
 // --------------------------------------------------------------------------------
-// Spell Builder (JSON Construction Version)
+// Strict Type-Marshalling Builder for Rust Bridge
+// Returns typed variables that the Rust bridge will process
+// The Rust bridge handles the YAML/Protocol structure
 // --------------------------------------------------------------------------------
 
 /**
- * Builds the spell JSON object for creating a Charms Inc. Plan NFT (Authority Object).
- * This returns a structured JSON object that can be directly sent to the prover.
- * 
- * UNIFIED DEPARTMENTAL NFT MODEL:
- * - compensationSats is now a placeholder (1000) since salary is enforced at Scroll Settlement Layer
- * - One NFT per department handles multiple workers with different salaries
+ * Builds typed variables for the Rust bridge to process.
+ * This replaces the YAML template approach with direct typed marshalling.
  * 
  * @param request - Validated spell request with payroll metadata
  * @param treasuryHexDest - The treasury hex destination (from company config)
- * @returns Object containing spell JSON and derived appId
+ * @returns Object containing typed variables and derived appId
  */
-export function buildMintNFTJSON(
+export function buildMintNFTVarsWithTemplate(
   request: SpellRequest, 
   treasuryHexDest: string
-): { spell: any; appId: string } {
+): { variables: Record<string, string>; appId: string } {
+  console.log('🚀 [NEW CODE] buildMintNFTVarsWithTemplate IS RUNNING - Version 3.0');
+  
   // ----------------------------------------------------------------------------
   // Step 1: Validate input
   // ----------------------------------------------------------------------------
@@ -155,10 +167,9 @@ export function buildMintNFTJSON(
     throw new ValidationError('treasuryHexDest is required for NFT minting');
   }
   
-  // Validate hex destination format (should be hex string, starts with '5120' for Taproot)
   const hexRegex = /^[0-9a-fA-F]+$/;
   if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
-    throw new ValidationError('treasuryHexDest must be a valid hex string (even number of hex characters)');
+    throw new ValidationError('treasuryHexDest must be a valid hex string');
   }
   
   // ----------------------------------------------------------------------------
@@ -172,33 +183,100 @@ export function buildMintNFTJSON(
   const output = request.outputs[0];
   const metadata = output.nftMetadata!;
   
-  // Use provided ticker or default
   const ticker = metadata.ticker || DEFAULT_TICKER;
-  
-  // Remaining supply (default to 1 unless specified)
   const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
-  
-  // Compensation - Must be >= 1000 for Rust validation
   const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
   
   // ----------------------------------------------------------------------------
-  // Step 5: Build the spell JSON object
-  // CRITICAL: ins array uses simple strings (not chain-tagged objects)
-  // The Prover extracts metadata from prev_txs for provenance verification
+  // Step 5: Build typed variables for Rust bridge
+  // The Rust bridge expects specific field names matching BridgeVariables struct
   // ----------------------------------------------------------------------------
+  const variables: Record<string, string> = {
+    type_name: "mint-nft",
+    app_id: String(appId),
+    app_vk: String(APP_VK),
+    anchor_utxo: String(request.anchorUtxo!),
+    funding_utxo: String(request.fundingUtxo!),
+    ticker: String(ticker),
+    remaining: String(remaining),
+    metadata_hash: String(metadata.metadataHash),
+    scroll_policy: String(metadata.scrollPolicy),
+    pay_period_seconds: String(metadata.payPeriodSeconds),
+    compensation_sats: String(compensationSats),
+    treasury_dest: String(treasuryHexDest)
+  };
+  
+  // ----------------------------------------------------------------------------
+  // Step 6: Logging (debug only)
+  // ----------------------------------------------------------------------------
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[buildMintNFT.payroll] ✅ Typed variables built for Rust bridge:', {
+      type_name: variables.type_name,
+      appId: appId.substring(0, 16) + '...',
+      ticker,
+      remaining,
+      scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
+      payPeriodSeconds: metadata.payPeriodSeconds,
+      compensationSats,
+      metadataHash: metadata.metadataHash.substring(0, 16) + '...',
+      anchorUtxo: request.anchorUtxo,
+      fundingUtxo: request.fundingUtxo,
+      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
+      variableCount: Object.keys(variables).length
+    });
+  }
+  
+  return { variables, appId };
+}
+
+// --------------------------------------------------------------------------------
+// Legacy Builder - Direct JSON Construction (Kept for backward compatibility)
+// --------------------------------------------------------------------------------
+
+/**
+ * Builds the spell JSON object directly (legacy approach).
+ * Used by older prover client versions.
+ */
+export function buildMintNFTJSON(
+  request: SpellRequest, 
+  treasuryHexDest: string
+): { spell: any; appId: string } {
+  validatePayrollRequest(request);
+  
+  if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
+    throw new ValidationError('treasuryHexDest is required for NFT minting');
+  }
+  
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+    throw new ValidationError('treasuryHexDest must be a valid hex string');
+  }
+  
+  const appId = deriveAppId(request.anchorUtxo!);
+  const output = request.outputs[0];
+  const metadata = output.nftMetadata!;
+  
+  const ticker = metadata.ticker || DEFAULT_TICKER;
+  const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
+  const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
+  
+  const anchorInputBytes = utxoTo36Bytes(request.anchorUtxo!);
+  const fundingInputBytes = utxoTo36Bytes(request.fundingUtxo!);
+  const destBytes = hexToBytes(treasuryHexDest);
+  
+  const appIdBytes = hexToBytes(appId);
+  const appVkBytes = hexToBytes(APP_VK);
+  
+  const appPublicInputs = new Map();
+  appPublicInputs.set(["n", appIdBytes, appVkBytes], null);
+  
   const spell = {
-    version: 11,
+    version: 12,
     tx: {
-      // ✅ USE STRINGS HERE (The Prover extracts metadata from prev_txs)
-      ins: [
-        request.anchorUtxo,
-        request.fundingUtxo
-      ],
+      ins: [anchorInputBytes, fundingInputBytes],
       outs: [
         {
-          // Numeric key 0 for NFT output
-          0: {
-            // camelCase content per Rust #[serde(rename_all = "camelCase")]
+          "0": {
             ticker: ticker,
             remaining: remaining,
             metadataHash: metadata.metadataHash,
@@ -211,31 +289,22 @@ export function buildMintNFTJSON(
       coins: [
         {
           amount: 1000,
-          dest: treasuryHexDest
+          dest: destBytes
         }
       ]
     },
-    app_public_inputs: {
-      [`n/${appId}/${APP_VK}`]: null
-    }
+    app_public_inputs: appPublicInputs
   };
   
-  // ----------------------------------------------------------------------------
-  // Step 6: Logging (debug only, remove in production)
-  // ----------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
-    console.log('[buildMintNFT.payroll] ✅ Spell JSON built:', {
+    console.log('[buildMintNFT.payroll] ✅ Legacy spell JSON built:', {
       appId,
       ticker,
       remaining,
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       payPeriodSeconds: metadata.payPeriodSeconds,
       compensationSats,
-      metadataHash: metadata.metadataHash.substring(0, 16) + '...',
-      anchorUtxo: request.anchorUtxo,
-      fundingUtxo: request.fundingUtxo,
-      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
-      hasMultiSig: !!request.multiSigSigners
+      metadataHash: metadata.metadataHash.substring(0, 16) + '...'
     });
   }
   
@@ -243,97 +312,110 @@ export function buildMintNFTJSON(
 }
 
 // --------------------------------------------------------------------------------
-// Legacy Template Variables Version (Kept for backward compatibility)
+// Legacy Variable Builders - Kept for backward compatibility
 // --------------------------------------------------------------------------------
 
-/**
- * Builds the template variables for creating a Charms Inc. Plan NFT (Authority Object).
- * This returns variables that will be substituted into YAML templates via envsubst.
- * 
- * @param request - Validated spell request with payroll metadata
- * @param treasuryHexDest - The treasury hex destination (from company config)
- * @returns Object containing template variables and derived appId
- */
-export function buildMintNFT(
+export function buildMintNFTVars(
   request: SpellRequest, 
   treasuryHexDest: string
-): { spellVars: Record<string, string>; appId: string } {
-  // ----------------------------------------------------------------------------
-  // Step 1: Validate input
-  // ----------------------------------------------------------------------------
+): { variables: Record<string, string>; appId: string } {
   validatePayrollRequest(request);
   
-  // ----------------------------------------------------------------------------
-  // Step 2: Validate treasuryHexDest parameter
-  // ----------------------------------------------------------------------------
   if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
     throw new ValidationError('treasuryHexDest is required for NFT minting');
   }
   
-  // Validate hex destination format
   const hexRegex = /^[0-9a-fA-F]+$/;
   if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
-    throw new ValidationError('treasuryHexDest must be a valid hex string (even number of hex characters)');
+    throw new ValidationError('treasuryHexDest must be a valid hex string');
   }
   
-  // ----------------------------------------------------------------------------
-  // Step 3: Derive appId from anchor UTXO
-  // ----------------------------------------------------------------------------
   const appId = deriveAppId(request.anchorUtxo!);
-  
-  // ----------------------------------------------------------------------------
-  // Step 4: Extract validated data
-  // ----------------------------------------------------------------------------
   const output = request.outputs[0];
   const metadata = output.nftMetadata!;
-  
-  // Use provided ticker or default
   const ticker = metadata.ticker || DEFAULT_TICKER;
-  
-  // Remaining supply (default to 1 unless specified)
   const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
-  
-  // Compensation - Must be >= 1000 for Rust validation
   const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
   
-  // ----------------------------------------------------------------------------
-  // Step 5: Build template variables for envsubst
-  // ----------------------------------------------------------------------------
-  const spellVars: Record<string, string> = {
-    // App identifiers
+  const variables: Record<string, string> = {
     app_id: appId,
     app_vk: APP_VK,
-    
-    // UTXO inputs for the YAML 'ins' block
+    anchor_utxo: String(request.anchorUtxo!),
+    funding_utxo: String(request.fundingUtxo!),
+    ticker: String(ticker),
+    remaining: String(remaining),
+    metadataHash: String(metadata.metadataHash),
+    scrollPolicy: String(metadata.scrollPolicy),
+    payPeriodSeconds: String(metadata.payPeriodSeconds),
+    compensationSats: String(compensationSats),
+    treasury_dest: String(treasuryHexDest)
+  };
+  
+  if (request.multiSigSigners && request.multiSigSigners.length > 0) {
+    variables.multi_sig_signers = String(request.multiSigSigners.join(','));
+    variables.multi_sig_threshold = String(request.multiSigThreshold || 2);
+  }
+  
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[buildMintNFT.payroll] ✅ Legacy variables built:', {
+      appId,
+      ticker,
+      remaining,
+      scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
+      payPeriodSeconds: metadata.payPeriodSeconds,
+      compensationSats,
+      metadataHash: metadata.metadataHash.substring(0, 16) + '...',
+      variableCount: Object.keys(variables).length
+    });
+  }
+  
+  return { variables, appId };
+}
+
+export function buildMintNFT(
+  request: SpellRequest, 
+  treasuryHexDest: string
+): { spellVars: Record<string, string>; appId: string } {
+  validatePayrollRequest(request);
+  
+  if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
+    throw new ValidationError('treasuryHexDest is required for NFT minting');
+  }
+  
+  const hexRegex = /^[0-9a-fA-F]+$/;
+  if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
+    throw new ValidationError('treasuryHexDest must be a valid hex string');
+  }
+  
+  const appId = deriveAppId(request.anchorUtxo!);
+  const output = request.outputs[0];
+  const metadata = output.nftMetadata!;
+  const ticker = metadata.ticker || DEFAULT_TICKER;
+  const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
+  const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
+  
+  const spellVars: Record<string, string> = {
+    app_id: appId,
+    app_vk: APP_VK,
     in_utxo_0: request.anchorUtxo!,
     funding_utxo: request.fundingUtxo!,
-
-    // NFT metadata - Casing must be camelCase for Rust serde
     ticker: ticker,
     remaining: remaining.toString(),
     metadataHash: metadata.metadataHash,
     scrollPolicy: (metadata.scrollPolicy ?? 0).toString(),
     payPeriodSeconds: (metadata.payPeriodSeconds ?? 0).toString(),
-    
-    // CRITICAL: Must be >= 1000 to pass Rust validation
     compensationSats: compensationSats.toString(),
-
-    // Bitcoin Destination - Must match ${dest_0} in mint-nft.yaml
     dest_0: treasuryHexDest,
-    amount_0: "1000" // Required for the coins array amount
+    amount_0: "1000"
   };
   
-  // Add optional multi-sig fields if present
   if (request.multiSigSigners && request.multiSigSigners.length > 0) {
     spellVars.multi_sig_signers = request.multiSigSigners.join(',');
     spellVars.multi_sig_threshold = (request.multiSigThreshold || 2).toString();
   }
   
-  // ----------------------------------------------------------------------------
-  // Step 6: Logging (debug only, remove in production)
-  // ----------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
-    console.log('[buildMintNFT.payroll] ✅ Template variables built:', {
+    console.log('[buildMintNFT.payroll] ✅ Legacy template variables built:', {
       appId,
       ticker,
       remaining,
@@ -341,10 +423,7 @@ export function buildMintNFT(
       payPeriodSeconds: metadata.payPeriodSeconds,
       compensationSats: spellVars.compensationSats,
       metadataHash: metadata.metadataHash.substring(0, 16) + '...',
-      anchorUtxo: request.anchorUtxo,
-      fundingUtxo: request.fundingUtxo,
-      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
-      hasMultiSig: !!request.multiSigSigners
+      variableCount: Object.keys(spellVars).length
     });
   }
   
@@ -355,25 +434,19 @@ export function buildMintNFT(
 // Helper: Create payroll plan request
 // --------------------------------------------------------------------------------
 
-/**
- * Creates a properly formatted SpellRequest for payroll plan creation
- * 
- * @param params - Payroll plan parameters
- * @returns Formatted SpellRequest ready for proverClient
- */
 export function createPayrollPlanRequest(params: {
   anchorUtxo: string;
   anchorValue: number;
   fundingUtxo: string;
   fundingValue: number;
   changeAddress: string;
-  employerAddress: string;  // Where the NFT will be sent
+  employerAddress: string;
   ticker?: string;
-  metadataHash: string;      // SHA256 of encrypted IPFS JSON
-  scrollPolicy: 0 | 1;       // 0=Time, 1=Proof
+  metadataHash: string;
+  scrollPolicy: 0 | 1;
   payPeriodSeconds: number;
-  compensationSats?: number;  // Optional - now only used in IPFS metadata
-  remaining?: number;        // Optional, defaults to 1
+  compensationSats?: number;
+  remaining?: number;
   feeRate?: number;
   multiSigSigners?: string[];
   multiSigThreshold?: number;
@@ -413,7 +486,7 @@ export function createPayrollPlanRequest(params: {
           metadataHash,
           scrollPolicy,
           payPeriodSeconds,
-          compensationSats: compensationSats || 0 // Placeholder - not enforced on-chain
+          compensationSats: compensationSats || 0
         }
       }
     ],
@@ -428,9 +501,6 @@ export function createPayrollPlanRequest(params: {
 // Testing helpers (only used in development)
 // --------------------------------------------------------------------------------
 
-/**
- * Creates a test request using environment variables (for CLI testing only)
- */
 export function createTestPayrollRequest(): SpellRequest {
   if (process.env.NODE_ENV === 'production') {
     throw new Error('createTestPayrollRequest should not be used in production');
@@ -447,7 +517,6 @@ export function createTestPayrollRequest(): SpellRequest {
     throw new Error('Missing test environment variables');
   }
   
-  // Example test values
   return createPayrollPlanRequest({
     anchorUtxo,
     anchorValue,
@@ -456,11 +525,11 @@ export function createTestPayrollRequest(): SpellRequest {
     changeAddress,
     employerAddress,
     metadataHash: crypto.createHash('sha256').update('test-cid').digest('hex'),
-    scrollPolicy: 0, // Time-based for employees
-    payPeriodSeconds: 1209600, // 2 weeks
-    compensationSats: 0, // Placeholder - not enforced
+    scrollPolicy: 0,
+    payPeriodSeconds: 1209600,
+    compensationSats: 0,
     ticker: 'PAY-TEST',
-    remaining: 100, // Department supply (100 tokens for hiring)
+    remaining: 100,
     multiSigSigners: ['key1', 'key2', 'key3'],
     multiSigThreshold: 2
   });

@@ -295,6 +295,7 @@ export default function EmployerDashboard() {
         anchorValue: btcContext.anchor.value,
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
+        fundingTxHex: btcContext.fee.hex,
         employerAddress: address,
         utxoAddress: address,
         department: setupDeptName.toLowerCase(),
@@ -426,6 +427,7 @@ export default function EmployerDashboard() {
         authorityTxHex: btcContext.anchor.hex,
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
+        fundingTxHex: btcContext.fee.hex,
         employerAddress: address,
         utxoAddress: address,
         workers: workerList.map(w => ({ 

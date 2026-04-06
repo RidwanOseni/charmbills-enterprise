@@ -1,5 +1,5 @@
 // Core Protocol Constants
-export const HARDCODED_APP_VK = "1ab8c4e4eb66d3ea057d70909d362b463ec8d9a288d7713f24f5382b02de8989";
+export const HARDCODED_APP_VK = "8e53ade8824e05fc31361802c86669b4bc62d5c1a190e5845bedf0f2be69610c";
 export const PROVER_API_URL = "https://v11.charms.dev/spells/prove";
 export const DEFAULT_FEE_RATE = 2;
 export const MIN_OUTPUT_SATS = 1000;
