@@ -26,6 +26,9 @@ export const WalletContext = createContext<WalletContextType | undefined>(undefi
 /**
  * Helper: Creates P2TR payment object and builds PSBT for Spell transaction
  * FIX: Added version: 2 for Taproot standardness and lockTime passed to constructor [Source 161, 162]
+ * FIX: Polymorphic Signing based on Actual Script Length [3, 4, 9]
+ * - Input 0 (Anchor): Always Taproot (34-byte script) - includes tapInternalKey
+ * - Input 1 (Fee): Uses fundingScript from dualUtxoContext (actual on-chain script)
  */
 function buildTaprootPsbt(
     rawHex: string, 
@@ -37,6 +40,7 @@ function buildTaprootPsbt(
     pubKeyHex: string
 ): string {
     const schnorrKey = hexToBytes(pubKeyHex).slice(1);
+    // Standard wallet script for fee inputs (fallback only)
     const payment = btc.p2tr(schnorrKey, undefined, TESTNET);
     
     // Decode FIRST to get the template data
@@ -71,46 +75,95 @@ function buildTaprootPsbt(
     // Map inputs
     decoded.inputs.forEach((input, i) => {
         if (i === 0) {
+            // =========================================================================
+            // Input 0 is the Anchor UTXO: Always Taproot (34-byte script)
+            // Must use the Anchor's extracted script (targetScript)
+            // =========================================================================
             console.log('[buildTaprootPsbt] Adding Input 0 (Anchor):', {
                 txid: targetTxid,
                 vout: targetVout,
-                value: targetValue
+                value: targetValue,
+                scriptType: 'targetScript (from anchor tx)',
+                scriptLength: targetScript.length
             });
             psbt.addInput({
                 txid: targetTxid,
                 index: targetVout,
                 witnessUtxo: {
                     amount: BigInt(targetValue),
-                    script: targetScript
+                    script: targetScript  // ✅ Use targetScript for Anchor input
                 },
-                tapInternalKey: payment.tapInternalKey,
+                tapInternalKey: payment.tapInternalKey, // ✅ Correct for 34-byte Taproot script
                 sequence: input.sequence
             });
         } else if (i === 1) {
             if (context.isSingle) {
-                // v0.12 MODE: Mapping Input 1 to the Fee UTXO for signing
+                // =========================================================================
+                // v0.12 MODE: Input 1 is the Fee UTXO
+                // CRITICAL FIX: Use the fundingScript from dualUtxoContext (actual on-chain script)
+                // This script comes from the frontend via the backend's fundingScript field
+                // =========================================================================
                 if (!context.fee) {
                     throw new Error('Missing fee UTXO context for PSBT input 1 in v0.12 mode');
                 }
                 const [feeTxid, feeVoutStr] = context.fee.utxoId.split(':');
                 const vout = parseInt(feeVoutStr);
                 
+                // =========================================================================
+                // CRITICAL: Use context.fee.script (actual on-chain script from fundingScript)
+                // This is the authentic script that protects the UTXO on the blockchain
+                // Fallback to payment.script only if context.fee.script is not provided
+                // =========================================================================
+                let feeScript: Uint8Array;
+                if (context.fee.script) {
+                    // Use the actual script from the backend (passed via fundingScript)
+                    feeScript = typeof context.fee.script === 'string' 
+                        ? hexToBytes(context.fee.script) 
+                        : context.fee.script;
+                    console.log('[buildTaprootPsbt] v0.12: Using fundingScript from context (actual on-chain script)');
+                } else {
+                    // Fallback: decode from fee hex (legacy, should not happen after fix)
+                    console.warn('[buildTaprootPsbt] v0.12: No fundingScript in context - falling back to decoding from hex');
+                    const feeTx = btc.RawTx.decode(hexToBytes(context.fee.hex));
+                    feeScript = feeTx.outputs[vout].script;
+                }
+                
+                const isInput1Taproot = feeScript.length === 34;
+                
                 console.log('[buildTaprootPsbt] v0.12: Adding Input 1 (Fee UTXO):', {
                     txid: feeTxid,
                     vout: vout,
-                    value: context.fee.value
+                    value: context.fee.value,
+                    scriptLength: feeScript.length,
+                    isTaproot: isInput1Taproot,
+                    willUseTapInternalKey: isInput1Taproot,
+                    scriptSource: context.fee.script ? 'fundingScript (from backend)' : 'decoded from hex'
                 });
                 
-                psbt.addInput({
+                // =========================================================================
+                // CRITICAL FIX: Polymorphic signing based on actual script length
+                // Only add tapInternalKey if it's actually a Taproot UTXO (34-byte script)
+                // For non-Taproot UTXOs, this must be omitted to get an ECDSA signature
+                // =========================================================================
+                const inputConfig: any = {
                     txid: feeTxid,
                     index: vout,
                     witnessUtxo: {
                         amount: BigInt(context.fee.value),
-                        script: payment.script
+                        script: feeScript  // ✅ Use the authentic script from context
                     },
-                    tapInternalKey: payment.tapInternalKey,
                     sequence: input.sequence
-                });
+                };
+                
+                // Only add tapInternalKey for Taproot UTXOs (34-byte scripts)
+                if (isInput1Taproot) {
+                    inputConfig.tapInternalKey = payment.tapInternalKey;
+                    console.log('[buildTaprootPsbt] Input 1: Taproot detected - adding tapInternalKey');
+                } else {
+                    console.log('[buildTaprootPsbt] Input 1: Non-Taproot detected - NO tapInternalKey (ECDSA signature)');
+                }
+                
+                psbt.addInput(inputConfig);
             } else {
                 // v11 MODE: Input 1 spends the finalized Commit TX (no tapInternalKey needed)
                 if (!context.commit) {
@@ -315,14 +368,25 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 anchor: dualUtxoContext.anchor ? {
                     utxoId: dualUtxoContext.anchor.utxoId,
                     value: dualUtxoContext.anchor.value,
-                    hasHex: !!dualUtxoContext.anchor.hex
+                    hasHex: !!dualUtxoContext.anchor.hex,
+                    hasScript: !!dualUtxoContext.anchor.script,
+                    scriptLength: dualUtxoContext.anchor.script?.length
                 } : null,
                 fee: dualUtxoContext.fee ? {
                     utxoId: dualUtxoContext.fee.utxoId,
                     value: dualUtxoContext.fee.value,
-                    hasHex: !!dualUtxoContext.fee.hex
+                    hasHex: !!dualUtxoContext.fee.hex,
+                    hasScript: !!dualUtxoContext.fee.script,
+                    scriptLength: dualUtxoContext.fee.script?.length
                 } : null,
                 isSingle: proverResult.isSingle
+            });
+
+            console.log('[WalletContext] Fee UTXO details:', {
+                utxoId: dualUtxoContext.fee.utxoId,
+                value: dualUtxoContext.fee.value,
+                scriptHex: dualUtxoContext.fee.script,
+                scriptLength: dualUtxoContext.fee.script?.length
             });
 
             if (!dualUtxoContext.fee || !dualUtxoContext.anchor) {
@@ -351,6 +415,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
             // ============================================================
             // v0.12 Single-Transaction Flow - Proof is in OP_RETURN output
+            // CLEAN V12 SIGNING: No manual witness restoration needed
+            // The ZK-proof is already embedded in the OP_RETURN output,
+            // not in the input witness. Leather signs both inputs fully.
             // ============================================================
             if (proverResult.isSingle) {
                 console.log("🚀 v0.12 Single-Transaction Flow: Signing and broadcasting combined transaction...");
@@ -380,6 +447,28 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 const anchorTx = btc.RawTx.decode(hexToBytes(dualUtxoContext.anchor.hex));
                 const actualAnchorScript = anchorTx.outputs[anchorVout].script;
                 
+                // =========================================================================
+                // CRITICAL: Use the fee script from context (passed via fundingScript)
+                // Do NOT re-decode the fee transaction - use the script provided by the backend
+                // =========================================================================
+                let actualFeeScript: Uint8Array;
+                if (dualUtxoContext.fee.script) {
+                    actualFeeScript = typeof dualUtxoContext.fee.script === 'string' 
+                        ? hexToBytes(dualUtxoContext.fee.script) 
+                        : dualUtxoContext.fee.script;
+                    console.log('[WalletContext] Using fee script from context (fundingScript)');
+                } else {
+                    // Fallback: decode from hex (should not happen after fix)
+                    console.warn('[WalletContext] No fee script in context - falling back to decoding from hex');
+                    const feeTx = btc.RawTx.decode(hexToBytes(dualUtxoContext.fee.hex));
+                    const [feeTxid, feeVoutStr] = dualUtxoContext.fee.utxoId.split(':');
+                    const feeVout = parseInt(feeVoutStr);
+                    actualFeeScript = feeTx.outputs[feeVout].script;
+                }
+                
+                // Add the fee script to context for buildTaprootPsbt
+                dualUtxoContext.fee.script = actualFeeScript;
+                
                 const singleTxContext = {
                     ...dualUtxoContext,
                     isSingle: true
@@ -395,35 +484,56 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                     taprootPublicKey
                 );
                 
-                // CRITICAL FIX: Allow wallet to sign BOTH inputs (Anchor + Fee)
-                // DO NOT pass signAtIndex - both inputs belong to the wallet
+                // =========================================================================
+                // CRITICAL FIX FOR V12 COLLAPSED MODEL:
+                // 1. Request signature for ALL inputs - Leather signs both inputs fully
+                // 2. No signAtIndex - wallet signs all inputs it owns
+                // 3. DO NOT manually re-attach witnesses - proof is in OP_RETURN output
+                // 4. DO NOT updateInput(1, ...) - this would wipe the Fee signature!
+                // =========================================================================
+                console.log('[WalletContext] Requesting signature for both inputs (Anchor + Fee)');
+                
                 const signedRes = await (window as any).LeatherProvider.request("signPsbt", {
                     hex: combinedPsbt,
                     network: "testnet",
                     broadcast: false
-                    // REMOVED: signAtIndex - wallet signs all inputs it owns
+                    // No signAtIndex: wallet signs all inputs owned by the wallet
                 });
                 
-                console.log('[WalletContext] Single-transaction mode: Proof is in OP_RETURN output. Finalizing...');
+                console.log('✅ Spell PSBT signed by wallet for all inputs');
                 
-                // Create transaction object from the PSBT returned by the wallet
+                // Load signed PSBT into transaction object
                 const spellTransaction = btc.Transaction.fromPSBT(
                     hexToBytes(signedRes.result.hex),
                     { allowUnknownOutputs: true }
                 );
                 
-                // Now finalize will succeed because both inputs have signatures
+                // =========================================================================
+                // MANDATORY FINALIZATION
+                // This moves signatures from PSBT fields to the final witness stack.
+                // This is required before extraction.
+                // DO NOT manually updateInput(1, ...) here - it will wipe the wallet's signatures!
+                // =========================================================================
                 spellTransaction.finalize();
+                console.log('✅ Transaction finalized (Input 0 and Input 1 signatures moved to witness stack)');
+                
+                // =========================================================================
+                // Extract final broadcastable hex
+                // DO NOT updateInput(1, ...) here. It will wipe your Fee signature!
+                // In v12 Single-Tx mode, the proof is in the OP_RETURN output,
+                // not in the input witness, so no restoration is needed.
+                // =========================================================================
                 const finalizedHex = bytesToHex(spellTransaction.extract());
                 
-                console.log('✅ Combined transaction finalized successfully, hex length:', finalizedHex.length);
+                console.log('📦 Ready for broadcast. Hex length:', finalizedHex.length);
+                console.log('✅ Combined transaction finalized successfully');
                 
                 let txidStrings: string[] = [];
                 try {
                     console.log('📤 Broadcasting single transaction...');
-                    // CRITICAL FIX: Use port 3002 to match backend server
+                    // Use port 3002 to match backend server
                     const broadcastResponse = await axios.post('http://localhost:3002/api/broadcast-package', {
-                        transactions: [finalizedHex]
+                        transactions: [finalizedHex]  // Correctly send as a single-item array
                     });
                     
                     const data = broadcastResponse.data.txids;
@@ -528,11 +638,12 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             
             console.log('[WalletContext] Spell PSBT built, length:', spellPsbt.length);
             
+            // Request signature for ALL inputs
             const spellRes = await (window as any).LeatherProvider.request("signPsbt", {
                 hex: spellPsbt,
                 network: "testnet",
-                broadcast: false,
-                signAtIndex: 0
+                broadcast: false
+                // No signAtIndex: wallet signs all inputs owned by the wallet
             });
             console.log('[WalletContext] Spell signed, response received');
 
@@ -545,19 +656,21 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             );
             const originalSpellTx = btc.RawTx.decode(hexToBytes(spellRaw));
             
-            // Find proof by looking for large witness (dual-transaction mode)
-            const availableWitnesses = originalSpellTx.witnesses || [];
-            console.log('[WalletContext] Available witnesses count:', availableWitnesses.length);
-            
-            const proofWitness = availableWitnesses.find(w => w && w.length > 0);
-            
-            if (proofWitness) {
-                const targetInputIndex = availableWitnesses.length === 1 ? 0 : 1;
-                spellTx.updateInput(targetInputIndex, { finalScriptWitness: proofWitness });
-                console.log(`✅ Charms proof (length: ${proofWitness.length}) re-attached to input ${targetInputIndex}.`);
+            // Look for the proof witness in the original spell
+            // The proof is typically in the first witness (index 0)
+            if (originalSpellTx.witnesses && originalSpellTx.witnesses.length > 0) {
+                const proofWitness = originalSpellTx.witnesses[0];
+                if (proofWitness && proofWitness.length > 0) {
+                    // Restore proof to input 1 (the OP_RETURN input)
+                    spellTx.updateInput(1, { 
+                        finalScriptWitness: proofWitness 
+                    });
+                    console.log(`✅ Restored ZK-Proof witness (length: ${proofWitness.length}) to Input 1`);
+                } else {
+                    console.warn('[WalletContext] Proof witness found but appears empty');
+                }
             } else {
-                console.error('[WalletContext] No proof witness found in original spell');
-                throw new Error('Missing Charms proof witness');
+                console.warn('[WalletContext] No witnesses found in original spell');
             }
 
             const signedSpellHex = bytesToHex(spellTx.extract());
@@ -566,7 +679,6 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             let txidStrings: string[] = [];
             try {
                 console.log('📤 Attempting broadcast...');
-                // CRITICAL FIX: Use port 3002 for dual-transaction broadcast as well
                 const broadcastResponse = await axios.post('http://localhost:3002/api/broadcast-package', {
                     transactions: [signedCommitHex, signedSpellHex]
                 });

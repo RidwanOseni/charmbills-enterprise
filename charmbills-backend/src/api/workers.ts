@@ -18,6 +18,60 @@ export async function getWorkers(req: Request, res: Response) {
 }
 
 /**
+ * POST /api/workers/add
+ * Adds a new worker to the registry (administrative action, no minting)
+ * This creates a pending worker record that will receive tokens in the next payroll run
+ * FIX: Align with schema.ts - uses planId instead of department/departmentId
+ */
+export async function addWorker(req: Request, res: Response) {
+    // Destructure using 'planId' (which contains the department ID/appId)
+    const { name, walletAddress, planId, role, engagementType, salarySats, status } = req.body;
+    
+    // Validate required fields - name, walletAddress, and planId are required
+    if (!name || !walletAddress || !planId) {
+        console.error('[WORKERS API] Missing required fields:', { name, walletAddress, planId });
+        return res.status(400).json({ error: 'Missing required fields: name, walletAddress, and planId are required' });
+    }
+    
+    console.log('[WORKERS API] Adding worker:', { name, walletAddress, planId, role, engagementType, salarySats });
+    
+    // Use provided values or defaults
+    const workerRole = role || 'Team Member';
+    const workerEngagementType = engagementType || 'full-time';
+    const workerStatus = status || 'pending';
+    const workerSalary = salarySats || 1000; // Minimal sats per period
+    
+    // FIX: Use planId (not department/departmentId) to match schema.ts
+    db.run(
+        `INSERT INTO workers (name, walletAddress, planId, role, engagementType, status, salarySats, updatedAt) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            name, 
+            walletAddress, 
+            planId, 
+            workerRole, 
+            workerEngagementType, 
+            workerStatus, 
+            workerSalary,
+            new Date().toISOString()
+        ],
+        function(this: any, err: Error | null) {
+            if (err) {
+                console.error('[WORKERS API] Database error:', err);
+                return res.status(500).json({ error: err.message });
+            }
+            
+            console.log(`[WORKERS API] ✅ Worker added successfully with ID: ${this.lastID}`);
+            res.status(201).json({ 
+                success: true, 
+                id: this.lastID,
+                message: 'Worker added to registry successfully'
+            });
+        }
+    );
+}
+
+/**
  * GET /api/dashboard/stats
  * Calculates "Next Payroll Run" based on the earliest expiration in the cache [3]
  */

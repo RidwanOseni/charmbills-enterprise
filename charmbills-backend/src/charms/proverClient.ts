@@ -565,6 +565,12 @@ export async function generateUnsignedTransactions(
                 finalIsSingleMode = true;
                 console.log('[PAYROLL PROVER] Response: Single transaction mode (object response)');
             }
+
+            const fs = require('fs');
+            if (finalSpellTxHex) {
+                fs.writeFileSync('/tmp/full-tx.hex', finalSpellTxHex);
+                console.log('[PAYROLL PROVER] Saved full transaction hex to /tmp/full-tx.hex');
+            }
     
             console.log('[PAYROLL PROVER] Successfully extracted hexes:', {
                 commit: finalCommitTxHex ? finalCommitTxHex.substring(0, 10) + '...' : 'undefined',

@@ -104,6 +104,7 @@ export interface SpellRequest {
   changeAddress: string;
   feeRate: number;
   utxoAddress?: string;
+  fundingScript?: string;
 
   planMetadata?: {
     anchorUtxo?: string;

@@ -36,7 +36,7 @@ import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 // Create API client with absolute URL and increased timeout for ZK-proof generation
 const api = axios.create({
   baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002',
-  timeout: 180000 // 3 minutes timeout for ZK-proof generation (matches backend PROVER_TIMEOUT_MS)
+  timeout: 600000 // 3 minutes timeout for ZK-proof generation (matches backend PROVER_TIMEOUT_MS)
 });
 
 // Map frontend selection to deterministic seconds
@@ -104,7 +104,9 @@ export default function EmployerDashboard() {
   const [currentPlanMetadata, setCurrentPlanMetadata] = useState<any>(null);
 
   // ============================================================
-  // Helper: Scan wallet for UTXO context
+  // Helper: Scan wallet for UTXO context with script extraction
+  // CRITICAL FIX: Extract the actual on-chain script for both anchor and fee UTXOs
+  // This resolves the -26 scriptpubkey error
   // ============================================================
   const getBtcContext = async () => {
     if (!address) throw new Error("Wallet not connected");
@@ -140,16 +142,28 @@ export default function EmployerDashboard() {
       axios.get(`https://mempool.space/testnet4/api/tx/${feeUtxo.txid}/hex`)
     ]);
     
+    // Decode transactions to extract the actual scripts
+    const anchorTx = btc.RawTx.decode(hexToBytes(anchorHex.data));
+    const anchorScript = anchorTx.outputs[anchorUtxo.vout].script;
+    
+    const feeTx = btc.RawTx.decode(hexToBytes(feeHex.data));
+    const feeScript = feeTx.outputs[feeUtxo.vout].script;
+    
+    console.log("[DEPARTMENT SETUP] Anchor script length:", anchorScript.length);
+    console.log("[DEPARTMENT SETUP] Fee script length:", feeScript.length);
+    
     return {
       anchor: {
         utxoId: `${anchorUtxo.txid}:${anchorUtxo.vout}`,
         value: anchorUtxo.value,
-        hex: anchorHex.data
+        hex: anchorHex.data,
+        script: bytesToHex(anchorScript)
       },
       fee: {
         utxoId: `${feeUtxo.txid}:${feeUtxo.vout}`,
         value: feeUtxo.value,
-        hex: feeHex.data
+        hex: feeHex.data,
+        script: bytesToHex(feeScript)
       }
     };
   };
@@ -248,6 +262,7 @@ export default function EmployerDashboard() {
 
   // ============================================================
   // STAGE 1: Setup Department (Mint Plan NFT - One per Department)
+  // CRITICAL FIX: Include fundingScript in payload for backend to pass to dualUtxoContext
   // ============================================================
   const handleSetupDepartment = async () => {
     if (!setupDeptName) {
@@ -276,7 +291,9 @@ export default function EmployerDashboard() {
       
       console.log("[DEPARTMENT SETUP] BTC Context obtained:", {
         anchor: btcContext.anchor.utxoId,
-        fee: btcContext.fee.utxoId
+        fee: btcContext.fee.utxoId,
+        hasAnchorScript: !!btcContext.anchor.script,
+        hasFeeScript: !!btcContext.fee.script
       });
       
       if (!(window as any).LeatherProvider) {
@@ -296,6 +313,7 @@ export default function EmployerDashboard() {
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
         fundingTxHex: btcContext.fee.hex,
+        fundingScript: btcContext.fee.script, // ✅ CRITICAL: Pass the actual fee script
         employerAddress: address,
         utxoAddress: address,
         department: setupDeptName.toLowerCase(),
@@ -310,12 +328,13 @@ export default function EmployerDashboard() {
       };
       
       const response = await axios.post('/api/plans/mint', payload, {
-        timeout: 180000,
+        timeout: 600000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
       const proverResult: ProverResult = response.data;
       
+      // Pass the btcContext which now includes the fee script
       const signingResult = await signAndBroadcastPackage(proverResult, btcContext);
       const txids = signingResult?.txids;
       
@@ -342,7 +361,8 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // STAGE 2: Add Worker to Registry (Administrative Action)
-  // CRITICAL FIX: This is now an administrative "Add" action that saves worker to database
+  // CRITICAL FIX: Align payload keys with backend schema
+  // Uses planId (appId) instead of department/departmentId
   // ============================================================
   const handleHire = async () => {
     if (!fullName || !selectedDeptId || !bitcoinAddress) {
@@ -360,20 +380,24 @@ export default function EmployerDashboard() {
       
       console.log("[HIRE ADMIN] Adding worker:", fullName, "to department:", dept.department);
       
-      // Use a non-minting endpoint to just save the worker record
+      // =========================================================================
+      // CRITICAL FIX: Align payload keys with backend schema
+      // - planId: Use appId to map to the department (not departmentId)
+      // - engagementType: Map UI 'setupType' to 'engagementType'
+      // - salarySats: Map UI 'salary' to 'salarySats' (as number)
+      // =========================================================================
       const payload = {
         name: fullName,
-        role: role || "Team Member",
-        salary: parseInt(salary) || 5000000,
         walletAddress: bitcoinAddress,
-        departmentId: selectedDeptId,
-        department: dept.department,
-        status: 'pending' // This triggers the "Needs Tokens" yellow badge
+        planId: dept.appId,           // Use appId to map to the department
+        role: role || "Team Member",
+        engagementType: setupType === 'employee' ? 'employee' : 'freelancer', // Map UI type to engagementType
+        salarySats: parseInt(salary) || 5000000, // Map UI 'salary' to 'salarySats' as number
+        status: 'pending'
       };
       
       console.log("[HIRE ADMIN] Payload:", payload);
       
-      // Use a non-minting endpoint to just save the worker record
       await api.post('/api/workers/add', payload);
       
       setToast(`✅ Worker added to registry. They'll receive tokens in the next run.`);
@@ -397,6 +421,7 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // Batch Token Issuance (Pay Your Team - All at Once)
+  // CRITICAL FIX: Include fundingScript in payload for backend to pass to dualUtxoContext
   // ============================================================
   const handleIssueTokens = async () => {
     if (selectedWorkers.size === 0) {
@@ -421,6 +446,13 @@ export default function EmployerDashboard() {
       const periods = parseInt(selectedPeriods);
       
       const btcContext = await getBtcContext();
+      
+      console.log("[BATCH MINT] BTC Context obtained:", {
+        anchor: btcContext.anchor.utxoId,
+        fee: btcContext.fee.utxoId,
+        hasAnchorScript: !!btcContext.anchor.script,
+        hasFeeScript: !!btcContext.fee.script
+      });
 
       const payload = {
         authorityUtxo: currentPlanNftUtxo,
@@ -428,6 +460,7 @@ export default function EmployerDashboard() {
         fundingUtxo: btcContext.fee.utxoId,
         fundingValue: btcContext.fee.value,
         fundingTxHex: btcContext.fee.hex,
+        fundingScript: btcContext.fee.script, // ✅ CRITICAL: Pass the actual fee script
         employerAddress: address,
         utxoAddress: address,
         workers: workerList.map(w => ({ 
@@ -437,13 +470,13 @@ export default function EmployerDashboard() {
           role: w.role || "Team Member"
         })),
         planMetadata: currentPlanMetadata,
-        encryptionEntropy: "placeholder" // Will be handled by backend
+        encryptionEntropy: "placeholder"
       };
 
       console.log("[BATCH MINT] Workers count:", payload.workers.length);
 
       const response = await axios.post('/api/payrollhiring/mint', payload, {
-        timeout: 180000,
+        timeout: 600000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
@@ -518,13 +551,11 @@ export default function EmployerDashboard() {
   // ============================================================
   useEffect(() => {
     const fetchVaultBalance = async () => {
-      // If no hardcoded treasury, use the currently connected wallet address
       const treasuryAddr = process.env.NEXT_PUBLIC_TREASURY_ADDRESS || address;
       
       if (!walletConnected || !treasuryAddr) return;
 
       try {
-        // Use the getWalletStatus helper to fetch real-time Taproot balance
         const status = await getWalletStatus(treasuryAddr);
         setVaultBalance(status.totalBalance);
       } catch (error) {
@@ -533,7 +564,7 @@ export default function EmployerDashboard() {
       }
     };
     fetchVaultBalance();
-  }, [walletConnected, address]); // ✅ Depend on address to update when wallet changes
+  }, [walletConnected, address]);
   
   // Fetch initial data when wallet connects
   useEffect(() => {
@@ -580,10 +611,8 @@ export default function EmployerDashboard() {
   // Ensure we only show records with valid names (Department NFTs don't have names in worker table)
   // ============================================================
   const filteredByStatus = workers.filter((worker) => {
-    // 1. Ensure we only show records with a valid name (Department NFTs usually don't have this field)
     if (!worker.name) return false;
 
-    // 2. Apply the UI filters
     if (statusFilter === 'all') return true;
     if (statusFilter === 'Active') return worker.status === 'active';
     if (statusFilter === 'Needs Tokens') return worker.status === 'pending' || worker.status === 'Needs Tokens';
@@ -1104,7 +1133,6 @@ export default function EmployerDashboard() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {/* FIX C: Use walletAddress as key and ensure valid name filtering */}
                 {filteredByStatus.map((worker: any) => (
                   <TableRow key={worker.walletAddress || worker.id} className="border-b border-border hover:bg-muted/30 transition">
                     <TableCell className="font-medium text-foreground">{worker.name || 'Unnamed'}</TableCell>

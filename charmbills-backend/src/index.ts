@@ -3,7 +3,7 @@ import cors from 'cors';
 import { Database } from 'sqlite3';
 import { createPayrollPlan, getPlans, getPlanById } from './api/plans';
 import { mintPayrollToken, batchHireWorkers, getHiringQuote } from './api/payrollhiring';
-import { getWorkers, getDashboardStats, getWorkerMetadata } from './api/workers';
+import { getWorkers, getDashboardStats, getWorkerMetadata, addWorker } from './api/workers';
 import { broadcastPackage, checkRpcHealth, getNodeInfo } from './api/broadcast-package';
 import { getPendingApprovals, terminateWorker, approveTermination } from './api/treasury';
 import { 
@@ -78,6 +78,7 @@ app.post('/api/payrollhiring/quote', getHiringQuote);
 // WORKER ROUTES
 // ============================================================
 app.get('/api/workers', getWorkers);
+app.post('/api/workers/add', addWorker);  // ✅ ADDED: Route for adding worker to registry
 app.get('/api/dashboard/stats', getDashboardStats);
 app.get('/api/worker-metadata/:address', getWorkerMetadata);
 app.post('/api/workers/terminate', terminateWorker);

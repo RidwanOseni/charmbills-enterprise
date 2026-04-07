@@ -22,6 +22,7 @@ interface CreatePayrollPlanRequest {
   fundingUtxo: string;          // Selected by HR wallet for fees
   fundingValue: number;         // Value of the funding UTXO in sats
   fundingTxHex: string;         // Raw transaction hex for the funding UTXO (from frontend)
+  fundingScript?: string;       // The actual on-chain scriptPubKey for the funding UTXO (for wallet signing)
   employerAddress: string;      // Where the Plan NFT will be sent
   utxoAddress: string;          // The Bitcoin address associated with the anchor UTXO (for app_private_inputs)
   
@@ -68,6 +69,7 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
   // Also includes 'utxoAddress' for app_private_inputs conversion
   // Also includes 'fundingTxHex' for funding UTXO hex from frontend
   // CRITICAL: anchorTxHex is now REQUIRED - must be provided by frontend
+  // NOTE: fundingScript is optional - not required for prover, but needed for wallet signing
   const required = [
     // Bitcoin UTXO data - MUST BE PROVIDED BY FRONTEND [1, 2]
     'anchorUtxo', 
@@ -285,6 +287,7 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
  * 8. USE fundingTxHex directly from frontend (no blockchain fetch) [22]
  * 9. ADDED utxoAddress field for app_private_inputs conversion
  * 10. CRITICAL FIX: BOTH anchorTxHex AND fundingTxHex are now passed to prover
+ * 11. ADDED fundingScript to accept the actual on-chain script for wallet signing
  */
 export async function createPayrollPlan(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -310,6 +313,8 @@ export async function createPayrollPlan(req: Request, res: Response) {
       fundingUtxo: req.body.fundingUtxo ? `${req.body.fundingUtxo.substring(0, 20)}...` : 'missing',
       hasFundingTxHex: !!req.body.fundingTxHex,
       fundingTxHexLength: req.body.fundingTxHex?.length || 0,
+      hasFundingScript: !!req.body.fundingScript,
+      fundingScriptLength: req.body.fundingScript?.length || 0,
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
       utxoAddress: req.body.utxoAddress ? `${req.body.utxoAddress.substring(0, 20)}...` : 'missing',
       department: req.body.department,
@@ -331,13 +336,14 @@ export async function createPayrollPlan(req: Request, res: Response) {
       fundingUtxo,
       fundingValue,
       fundingTxHex,
+      fundingScript,           // Optional - actual on-chain script for wallet signing
       employerAddress,
-      utxoAddress,               // Address associated with anchor UTXO
+      utxoAddress,             // Address associated with anchor UTXO
       department,
       payPeriodSeconds,
       scrollPolicy,
-      remaining,           // Department budget [14]
-      encryptionEntropy,   // From wallet signature - NON-CUSTODIAL [3]
+      remaining,               // Department budget [14]
+      encryptionEntropy,       // From wallet signature - NON-CUSTODIAL [3]
       multiSigRequired,
       multiSigSigners,
       multiSigThreshold
@@ -351,6 +357,11 @@ export async function createPayrollPlan(req: Request, res: Response) {
     console.log(`[PLANS API:${requestId}] ✅ Validation passed`);
     console.log(`[PLANS API:${requestId}] Anchor hex length: ${cleanAnchorTxHex.length} chars`);
     console.log(`[PLANS API:${requestId}] Funding hex length: ${cleanFundingTxHex.length} chars`);
+    if (fundingScript) {
+      console.log(`[PLANS API:${requestId}] Funding script provided (length: ${fundingScript.length} chars)`);
+    } else {
+      console.log(`[PLANS API:${requestId}] ⚠️ No fundingScript provided - wallet may fail to sign Input 1`);
+    }
     console.log(`[PLANS API:${requestId}] Department budget: ${remaining} pay periods`);
     console.log(`[PLANS API:${requestId}] utxoAddress: ${utxoAddress.substring(0, 20)}...`);
     
@@ -426,6 +437,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // Step 7: Construct SpellRequest with dynamic signers [4, 5, 8]
     // NOTE: Pass remaining as the budget [14], compensationSats = 0 for Unified Model [15]
     // CRITICAL: Include utxoAddress for app_private_inputs conversion
+    // CRITICAL: Include fundingScript if provided (for wallet signing context)
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔧 Building SpellRequest...`);
     
@@ -438,6 +450,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
       changeAddress: employerAddress,
       utxoAddress: utxoAddress,      // REQUIRED: Address for app_private_inputs conversion
       feeRate: constants.DEFAULT_FEE_RATE,
+      fundingScript: fundingScript,   // Pass through the actual fee script for wallet signing
       outputs: [{
         address: employerAddress,
         nftMetadata: {
