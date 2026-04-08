@@ -385,12 +385,13 @@ export default function EmployerDashboard() {
       // - planId: Use appId to map to the department (not departmentId)
       // - engagementType: Map UI 'setupType' to 'engagementType'
       // - salarySats: Map UI 'salary' to 'salarySats' (as number)
+      // - role: Send the role value from input (will be saved to database)
       // =========================================================================
       const payload = {
         name: fullName,
         walletAddress: bitcoinAddress,
         planId: dept.appId,           // Use appId to map to the department
-        role: role || "Team Member",
+        role: role || "Team Member",   // FIX: Send the role value to database
         engagementType: setupType === 'employee' ? 'employee' : 'freelancer', // Map UI type to engagementType
         salarySats: parseInt(salary) || 5000000, // Map UI 'salary' to 'salarySats' as number
         status: 'pending'
@@ -466,7 +467,7 @@ export default function EmployerDashboard() {
         workers: workerList.map(w => ({ 
           address: w.walletAddress, 
           periods,
-          salarySats: w.salary || 5000000,
+          salarySats: w.salarySats || 5000000,
           role: w.role || "Team Member"
         })),
         planMetadata: currentPlanMetadata,
@@ -602,6 +603,7 @@ export default function EmployerDashboard() {
 
   // Worker filtering and selection helpers
   const totalWorkers = workers.length;
+  // FIX: Filter workers by department using the 'department' field from API (p.ticker)
   const deptWorkers = selectedDept === 'all' 
     ? workers 
     : workers.filter((w: any) => w.department === selectedDept);
@@ -911,7 +913,7 @@ export default function EmployerDashboard() {
               </div>
 
               <div>
-                <Label className="text-sm font-medium text-foreground block mb-2">Role (Optional)</Label>
+                <Label className="text-sm font-medium text-foreground block mb-2">Role</Label>
                 <Input
                   placeholder="e.g., Senior Engineer"
                   value={role}
@@ -1136,17 +1138,11 @@ export default function EmployerDashboard() {
                 {filteredByStatus.map((worker: any) => (
                   <TableRow key={worker.walletAddress || worker.id} className="border-b border-border hover:bg-muted/30 transition">
                     <TableCell className="font-medium text-foreground">{worker.name || 'Unnamed'}</TableCell>
-                    <TableCell className="text-foreground">{worker.role}</TableCell>
+                    <TableCell className="text-foreground">{worker.role || 'Team Member'}</TableCell>
+                    {/* FIX: Display the department name from API (p.ticker as department) */}
                     <TableCell>
-                      <Badge className={`rounded-full px-3 py-1 text-xs ${
-                        worker.engagementType === 'freelancer'
-                          ? 'bg-accent/20 text-accent'
-                          : 'bg-primary/10 text-primary'
-                      }`}>
-                        {worker.engagementType === 'freelancer' ? 'Freelancer' : 
-                         worker.department ? 
-                         worker.department.charAt(0).toUpperCase() + worker.department.slice(1) : 
-                         'Engineering'}
+                      <Badge className="rounded-full px-3 py-1 text-xs bg-primary/10 text-primary">
+                        {worker.department ? worker.department.charAt(0).toUpperCase() + worker.department.slice(1) : 'General'}
                       </Badge>
                     </TableCell>
                     <TableCell>
@@ -1161,7 +1157,7 @@ export default function EmployerDashboard() {
                       </Badge>
                     </TableCell>
                     <TableCell className="text-foreground text-sm">
-                      {worker.currentPeriod?.validTo ? new Date(worker.currentPeriod.validTo).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}
+                      {worker.lastMintedPeriod ? new Date(worker.lastMintedPeriod).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}
                     </TableCell>
                     <TableCell className="text-right flex gap-2 justify-end">
                       <button className="px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground rounded-lg transition border border-border">

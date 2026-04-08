@@ -4,11 +4,23 @@ const db = new (require('sqlite3').Database)('./payroll.db');
 /**
  * GET /api/workers
  * Fetches all workers for the Workforce Registry table
- * Includes name field from IPFS enrichment to display properly in dashboard
+ * Includes name field from IPFS enrichment and department ticker from plans table
  */
 export async function getWorkers(req: Request, res: Response) {
-    // Select the 'name' field so it appears in the Registry card
-    db.all('SELECT walletAddress, name, engagementType, status, lastMintedPeriod FROM workers', [], (err: Error | null, rows: any[]) => {
+    const query = `
+        SELECT 
+            w.walletAddress, 
+            w.name, 
+            w.role,
+            w.engagementType, 
+            w.status, 
+            w.lastMintedPeriod,
+            p.department as department 
+        FROM workers w
+        LEFT JOIN plans p ON w.planId = p.appId
+    `;
+
+    db.all(query, [], (err: Error | null, rows: any[]) => {
         if (err) {
             console.error('[WORKERS API] Database error:', err);
             return res.status(500).json({ error: err.message });
