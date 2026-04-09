@@ -36,6 +36,7 @@ interface MintPayrollTokenRequest {
     scrollPolicy: number;
     payPeriodSeconds: number;
     compensationSats: number;
+    anchorUtxo: string;        // Original anchor UTXO that created the appId (for witness)
   };
   encryptionEntropy: string;   // REQUIRED: From wallet signature
 }
@@ -154,6 +155,11 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
     throw new Error('planMetadata.metadataHash is required');
   }
   
+  // Validate anchorUtxo in planMetadata (required for mint-token witness)
+  if (!body.planMetadata.anchorUtxo || typeof body.planMetadata.anchorUtxo !== 'string') {
+    throw new Error('planMetadata.anchorUtxo is required for mint-token witness');
+  }
+  
   // Validate encryptionEntropy is a non-empty string
   if (typeof body.encryptionEntropy !== 'string' || body.encryptionEntropy.length === 0) {
     throw new Error('encryptionEntropy must be a non-empty string from wallet signature');
@@ -197,6 +203,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       employerAddress: req.body.employerAddress ? `${req.body.employerAddress.substring(0, 20)}...` : 'missing',
       hasPlanMetadata: !!req.body.planMetadata,
       appId: req.body.planMetadata?.appId ? `${req.body.planMetadata.appId.substring(0, 16)}...` : 'missing',
+      hasAnchorUtxoInMetadata: !!req.body.planMetadata?.anchorUtxo,
       hasEncryptionEntropy: !!req.body.encryptionEntropy
     });
     
@@ -217,6 +224,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     const cleanAuthorityTxHex = authorityTxHex.replace(/\s/g, '');
     
     console.log(`[HIRING API:${requestId}] ✅ Validation passed`);
+    console.log(`[HIRING API:${requestId}] planMetadata.anchorUtxo: ${planMetadata.anchorUtxo.substring(0, 30)}...`);
     
     // ----------------------------------------------------------------------------
     // Step 2: Safely handle encryption entropy - FIX TS2345
@@ -410,9 +418,11 @@ export async function mintPayrollToken(req: Request, res: Response) {
     // CRITICAL FIX: Use placeholder (>= 1000) for the Authority NFT return output [Source 269]
     // The REAL salary is stored in IPFS and DB, but the on-chain NFT needs the placeholder
     // to satisfy the Rust contract validation (compensation_sats >= 1000)
+    // CRITICAL FIX: Include anchorUtxo from original planMetadata for mint-token witness
     // ----------------------------------------------------------------------------
     const returnMetadata = {
       ...planMetadata,
+      anchorUtxo: planMetadata.anchorUtxo,   // CRITICAL: Pass through anchorUtxo for witness
       compensationSats: Math.max(planMetadata.compensationSats || 0, constants.MIN_OUTPUT_SATS || 1000)
     };
     
@@ -420,6 +430,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       appId: returnMetadata.appId.substring(0, 16) + '...',
       remaining: returnMetadata.remaining,
       compensationSats: returnMetadata.compensationSats,
+      anchorUtxo: returnMetadata.anchorUtxo ? returnMetadata.anchorUtxo.substring(0, 30) + '...' : 'missing',
       isPlaceholder: returnMetadata.compensationSats === (constants.MIN_OUTPUT_SATS || 1000)
     });
     
@@ -433,7 +444,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     // - changeAddress: employerAddress (or treasury address for change)
     // - appId: planMetadata.appId
     // - employerAddress: Where to return the Plan NFT
-    // - planMetadata: returnMetadata (with placeholder compensationSats)
+    // - planMetadata: returnMetadata (with placeholder compensationSats AND anchorUtxo)
     // - treasuryHexDest: company.treasuryHexDest
     // - utxoAddress: The Bitcoin address associated with the authority UTXO (REQUIRED for app_private_inputs)
     // ----------------------------------------------------------------------------
@@ -446,6 +457,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       appId: planMetadata.appId.substring(0, 16) + '...',
       employerAddress: employerAddress.substring(0, 20) + '...',
       returnMetadataCompensation: returnMetadata.compensationSats,
+      returnMetadataHasAnchorUtxo: !!returnMetadata.anchorUtxo,
       treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...',
       utxoAddress: utxoAddress.substring(0, 20) + '...'
     });
@@ -457,7 +469,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       employerAddress,                         // changeAddress (for Bitcoin change)
       planMetadata.appId,                      // appId
       employerAddress,                         // employerAddress (where NFT returns)
-      returnMetadata,                          // planMetadata (with placeholder compensationSats)
+      returnMetadata,                          // planMetadata (with placeholder compensationSats AND anchorUtxo)
       company.treasuryHexDest,                 // treasuryHexDest
       utxoAddress,                             // utxoAddress (REQUIRED - address associated with authority UTXO)
       undefined                                // multiSigSigners
@@ -489,6 +501,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`  Tokens: ${totalTokens}`);
     console.log(`  Remaining: ${newRemainingSupply}`);
     console.log(`  Return NFT compensationSats: ${returnMetadata.compensationSats}`);
+    console.log(`  Return NFT anchorUtxo: ${returnMetadata.anchorUtxo ? returnMetadata.anchorUtxo.substring(0, 30) + '...' : 'missing'}`);
     console.log(`[HIRING API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json(response);

@@ -591,7 +591,8 @@ export default function EmployerDashboard() {
             metadataHash: plan.metadataHash,
             scrollPolicy: plan.scrollPolicy,
             payPeriodSeconds: plan.payPeriodSeconds,
-            compensationSats: plan.compensationSats
+            compensationSats: plan.compensationSats,
+            anchorUtxo: plan.anchorUtxo
           });
         }
       } catch (error) {

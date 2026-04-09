@@ -64,6 +64,11 @@ function validateBatchMintRequest(request: SpellRequest): void {
     throw new ValidationError('authorityUtxo is required for batch token minting');
   }
 
+  // CRITICAL FIX: Check anchor UTXO for witness pre-image
+  if (!request.anchorUtxo) {
+    throw new ValidationError('anchorUtxo is required for batch token minting witness');
+  }
+
   // v0.12 FIX: Check funding UTXO (now required and must be in spell inputs)
   if (!request.fundingUtxo) {
     throw new ValidationError('fundingUtxo is required for batch token minting in v0.12');
@@ -190,6 +195,9 @@ function calculateBatchMetrics(
  * Builds typed variables for the Rust bridge to process batch token minting.
  * This replaces the YAML template approach with direct typed marshalling.
  * 
+ * CRITICAL FIX: Uses anchorUtxo (original App Identity) instead of authorityUtxo (current Plan NFT)
+ * The witness pre-image must be the UTXO that created the appId, not the current Plan NFT.
+ * 
  * @param request - Validated spell request with worker outputs and NFT return metadata
  * @param appId - The existing appId from the saved plan (passed, not derived)
  * @param treasuryHexDest - The treasury hex destination for change output (from company config)
@@ -233,12 +241,17 @@ export function buildMintTokenVars(
   // ----------------------------------------------------------------------------
   // Step 5: Build typed variables for Rust bridge
   // The Rust bridge expects specific field names matching BridgeVariables struct
+  // 
+  // CRITICAL FIX: Use anchorUtxo (original App Identity) NOT authorityUtxo
+  // The witness pre-image must be the UTXO that created the appId
   // ----------------------------------------------------------------------------
   const variables: Record<string, any> = {
     type_name: "mint-token",
     app_id: String(appId),
     app_vk: String(APP_VK),
-    anchor_utxo: String(request.authorityUtxo!), // Plan NFT acts as authority
+    // CRITICAL FIX: Use original anchor, NOT authorityUtxo
+    // request.anchorUtxo must be the "txid:vout" that created the appId
+    anchor_utxo: String(request.anchorUtxo!),
     funding_utxo: String(request.fundingUtxo!),
     ticker: String(metadata.ticker || DEFAULT_TICKER),
     remaining: String(newRemainingSupply),
@@ -270,7 +283,7 @@ export function buildMintTokenVars(
       newRemainingSupply,
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       compensationSats: Math.max(metadata.compensationSats || 0, MIN_OUTPUT_SATS),
-      authorityUtxo: request.authorityUtxo,
+      anchorUtxo: request.anchorUtxo,
       fundingUtxo: request.fundingUtxo,
       treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
       workerDestsCount: variables.worker_dests.length,
@@ -372,7 +385,7 @@ export function buildMintTokenVarsLegacy(
   const templateYaml = `version: 12
 tx:
   ins:
-    - "{{plan_utxo}}"
+    - "{{anchor_utxo}}"
     - "{{funding_utxo}}"
   outs:
 ${outsYaml}  coins:
@@ -388,7 +401,7 @@ app_public_inputs:
   const variables: Record<string, string> = {
     app_id: String(appId),
     app_vk: String(APP_VK),
-    plan_utxo: String(request.authorityUtxo!),
+    anchor_utxo: String(request.anchorUtxo!),
     funding_utxo: String(request.fundingUtxo!),
     ticker: String(metadata.ticker || DEFAULT_TICKER),
     remaining: String(newRemainingSupply),
@@ -422,7 +435,7 @@ app_public_inputs:
       newRemainingSupply,
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       compensationSats: Math.max(metadata.compensationSats || 0, MIN_OUTPUT_SATS),
-      authorityUtxo: request.authorityUtxo,
+      anchorUtxo: request.anchorUtxo,
       fundingUtxo: request.fundingUtxo,
       treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
       variableCount: Object.keys(variables).length
@@ -539,7 +552,7 @@ export function buildMintTokenJSON(
   const spell = {
     version: 12,
     tx: {
-      ins: [ request.authorityUtxo!, request.fundingUtxo! ],
+      ins: [ request.anchorUtxo!, request.fundingUtxo! ],
       outs: outs,
       coins: coins
     },
@@ -561,7 +574,7 @@ export function buildMintTokenJSON(
       newRemainingSupply,
       scrollPolicy: metadata.scrollPolicy === 0 ? 'Time' : 'Proof',
       compensationSats: Math.max(metadata.compensationSats || 0, MIN_OUTPUT_SATS),
-      authorityUtxo: request.authorityUtxo,
+      anchorUtxo: request.anchorUtxo,
       fundingUtxo: request.fundingUtxo,
       treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
       workerCoinsCount: workerOutputs.length
@@ -659,6 +672,7 @@ export function createSingleHireRequest(
   return {
     type: 'mint-token',
     authorityUtxo,
+    anchorUtxo: authorityUtxo,
     fundingUtxo: fundingUtxo.utxo,
     fundingUtxoValue: fundingUtxo.value,
     changeAddress,
@@ -681,6 +695,7 @@ export function createBatchHireRequest(
   return {
     type: 'mint-token',
     authorityUtxo,
+    anchorUtxo: authorityUtxo,
     fundingUtxo: fundingUtxo.utxo,
     fundingUtxoValue: fundingUtxo.value,
     changeAddress,
@@ -710,6 +725,7 @@ export function createCustomBatchHireRequest(
   return {
     type: 'mint-token',
     authorityUtxo,
+    anchorUtxo: authorityUtxo,
     fundingUtxo: fundingUtxo.utxo,
     fundingUtxoValue: fundingUtxo.value,
     changeAddress,

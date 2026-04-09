@@ -8,6 +8,7 @@ import * as constants from '@shared/constants';
 import { initializeWasmBridge, process_spell_template } from '../lib/charms-utils';
 import { buildMintNFTVarsWithTemplate } from './buildMintNFT';
 import { buildMintTokenVars } from './buildMintToken';
+import { fetchTransactionHex } from '../lib/utxo-manager';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from 'tiny-secp256k1';
 bitcoin.initEccLib(ecc);
@@ -130,9 +131,14 @@ function utxoTo36Bytes(utxoId: string): Uint8Array {
     return result;
 }
 
+// Helper: Convert UTXO ID to CBOR-wrapped hex witness
+function utxoIdToHexWitness(utxoId: string): string {
+    const witnessCbor = encode(utxoId);
+    return bytesToHex(witnessCbor);
+}
+
 // Helper: Convert Bitcoin address to Hex Script Destination (for app_private_inputs)
 // This fixes the "Invalid character 'G'" error by using hex instead of base64
-// NOTE: This function is kept for potential future use, but NOT used for witness encoding
 function addressToHexDest(address: string): string {
     // Converts a standard address into the hex script format required for witnesses
     try {
@@ -162,6 +168,12 @@ function getWasmBuffer(): Buffer {
     console.log(`[PAYROLL PROVER] WASM loaded: ${wasmBuffer.length} bytes`);
     
     return wasmBuffer;
+}
+
+// Helper: Get WASM binary as Base64
+function getWasmBase64(): string {
+    const wasmBuffer = getWasmBuffer();
+    return wasmBuffer.toString('base64');
 }
 
 // Helper: Convert string to numeric byte array for witness
@@ -262,108 +274,171 @@ export async function generateUnsignedTransactions(
         spellObj.version = 12;
         console.log('[PAYROLL PROVER] spell.version is now', spellObj.version);
         
-        // DEBUG: Log raw tx.outs before patching
-        console.log('[PAYROLL PROVER] DEBUG - Raw tx.outs before patching:', 
-            JSON.stringify(spellObj.tx?.outs, (key, value) => {
-                if (value instanceof Uint8Array) return `Uint8Array(${value.length})`;
-                return value;
-            }, 2));
+        // =========================================================================
+        // BRANCH LOGIC: mint-nft vs mint-token
+        // For mint-nft: Keep ALL original patching logic (tx.outs Map, tx.ins conversion, etc.)
+        // For mint-token: Restore Binary Patching (Uint8Arrays for binary data)
+        // =========================================================================
         
-        // ----------------------------------------------------------------------------
-        // THE MANDATORY KEY RE-PATCH USING MAP (String "0" -> Integer 0)
-        // This resolves the "expected integer" error at column 895
-        // Using Map ensures numeric keys are preserved through CBOR encoding
-        // ----------------------------------------------------------------------------
-        console.log('[PAYROLL PROVER] Patching tx.outs string keys to integer keys using Map...');
-        if (spellObj.tx && Array.isArray(spellObj.tx.outs)) {
-            spellObj.tx.outs = spellObj.tx.outs.map((out: any) => {
-                const patchedOutMap = new Map(); // Use a Map to allow numeric keys
-                for (const [key, val] of Object.entries(out)) {
-                    const numericKey = parseInt(key, 10);
-                    if (!isNaN(numericKey)) {
-                        // Map allows the key to remain a number 0
-                        patchedOutMap.set(numericKey, val);
-                        console.log(`[PAYROLL PROVER] DEBUG - Mapped key: "${key}" -> ${numericKey}, value type: ${typeof val}`);
+        if (request.type === 'mint-nft') {
+            // =========================================================================
+            // NFT MINTING PATH - Keep ALL original patching logic
+            // =========================================================================
+            console.log('[PAYROLL PROVER] NFT PATH: Applying original patching logic...');
+            
+            // DEBUG: Log raw tx.outs before patching
+            console.log('[PAYROLL PROVER] DEBUG - Raw tx.outs before patching:', 
+                JSON.stringify(spellObj.tx?.outs, (key, value) => {
+                    if (value instanceof Uint8Array) return `Uint8Array(${value.length})`;
+                    return value;
+                }, 2));
+            
+            // Patching tx.outs string keys to integer keys using Map
+            console.log('[PAYROLL PROVER] Patching tx.outs string keys to integer keys using Map...');
+            if (spellObj.tx && Array.isArray(spellObj.tx.outs)) {
+                spellObj.tx.outs = spellObj.tx.outs.map((out: any) => {
+                    const patchedOutMap = new Map();
+                    for (const [key, val] of Object.entries(out)) {
+                        const numericKey = parseInt(key, 10);
+                        if (!isNaN(numericKey)) {
+                            patchedOutMap.set(numericKey, val);
+                            console.log(`[PAYROLL PROVER] DEBUG - Mapped key: "${key}" -> ${numericKey}, value type: ${typeof val}`);
+                        } else {
+                            patchedOutMap.set(key, val);
+                            console.log(`[PAYROLL PROVER] DEBUG - Mapped key: "${key}" (string), value type: ${typeof val}`);
+                        }
+                    }
+                    return patchedOutMap;
+                });
+                console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.outs.length} tx.outs entries to Maps`);
+            }
+            
+            // Patch Inputs: Bridge returns "txid:vout" strings - convert to 36-byte Uint8Array
+            console.log('[PAYROLL PROVER] Patching tx.ins from UTXO strings to 36-byte Uint8Array...');
+            if (spellObj.tx && Array.isArray(spellObj.tx.ins)) {
+                spellObj.tx.ins = spellObj.tx.ins.map((utxoId: string) => {
+                    const result = new Uint8Array(utxoTo36Bytes(utxoId));
+                    console.log(`[PAYROLL PROVER] DEBUG - Converted UTXO: ${utxoId} -> ${result.length} bytes`);
+                    return result;
+                });
+                console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.ins.length} tx.ins entries`);
+            }
+            
+            // Patch Destinations: Bridge returns numeric Arrays (already decoded hex)
+            console.log('[PAYROLL PROVER] Patching tx.coins dest from numeric arrays to Uint8Array...');
+            if (spellObj.tx && Array.isArray(spellObj.tx.coins)) {
+                spellObj.tx.coins = spellObj.tx.coins.map((coin: any) => ({
+                    ...coin,
+                    dest: new Uint8Array(coin.dest)
+                }));
+                console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.coins.length} tx.coins dest entries`);
+            }
+            
+            // Key re-patch for app_public_inputs
+            if (spellObj.app_public_inputs && typeof spellObj.app_public_inputs === 'object') {
+                console.log('[PAYROLL PROVER] Patching app_public_inputs keys to CBOR arrays...');
+                const patchedPublicInputs = new Map();
+                for (const [key, value] of Object.entries(spellObj.app_public_inputs)) {
+                    const parts = (key as string).split('/');
+                    if (parts.length === 3 && (parts[0] === 'n' || parts[0] === 't')) {
+                        const [tag, idHex, vkHex] = parts;
+                        const complexKey = [tag, hexToBytes(idHex), hexToBytes(vkHex)];
+                        patchedPublicInputs.set(complexKey, value);
+                        console.log(`[PAYROLL PROVER] Patched key: ${key} -> [${tag}, <${idHex.length} bytes>, <${vkHex.length} bytes>]`);
                     } else {
-                        patchedOutMap.set(key, val);
-                        console.log(`[PAYROLL PROVER] DEBUG - Mapped key: "${key}" (string), value type: ${typeof val}`);
+                        patchedPublicInputs.set(key, value);
                     }
                 }
-                return patchedOutMap;
-            });
-            console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.outs.length} tx.outs entries to Maps`);
-        }
-        
-        // DEBUG: Log tx.outs after patching to verify Map structure
-        if (spellObj.tx?.outs && spellObj.tx.outs.length > 0) {
-            console.log('[PAYROLL PROVER] DEBUG - First tx.outs entry after patching (Map):');
-            const firstOut = spellObj.tx.outs[0];
-            for (const [key, value] of firstOut.entries()) {
-                console.log(`  Key: ${key} (${typeof key}), Value: ${JSON.stringify(value).substring(0, 100)}`);
+                spellObj.app_public_inputs = patchedPublicInputs;
+                console.log('[PAYROLL PROVER] app_public_inputs patched to Map with array keys');
             }
-        }
-        
-        // ----------------------------------------------------------------------------
-        // THE FINAL TRANSPORT CASTS
-        // Patch Inputs: Bridge returns "txid:vout" strings - convert to 36-byte Uint8Array
-        // The utxoTo36Bytes function now properly reverses txid bytes to Little-Endian
-        // ----------------------------------------------------------------------------
-        console.log('[PAYROLL PROVER] Patching tx.ins from UTXO strings to 36-byte Uint8Array...');
-        if (spellObj.tx && Array.isArray(spellObj.tx.ins)) {
-            spellObj.tx.ins = spellObj.tx.ins.map((utxoId: string) => {
-                const result = new Uint8Array(utxoTo36Bytes(utxoId));
-                console.log(`[PAYROLL PROVER] DEBUG - Converted UTXO: ${utxoId} -> ${result.length} bytes`);
-                return result;
-            });
-            console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.ins.length} tx.ins entries`);
-        }
-        
-        // ----------------------------------------------------------------------------
-        // Patch Destinations: Bridge returns numeric Arrays (already decoded hex)
-        // We only need to cast the Array to a Uint8Array for the CBOR encoder.
-        // DO NOT use hexToBytes here - the bridge already decoded the hex!
-        // ----------------------------------------------------------------------------
-        console.log('[PAYROLL PROVER] Patching tx.coins dest from numeric arrays to Uint8Array...');
-        if (spellObj.tx && Array.isArray(spellObj.tx.coins)) {
-            spellObj.tx.coins = spellObj.tx.coins.map((coin: any) => ({
-                ...coin,
-                dest: new Uint8Array(coin.dest)
-            }));
-            console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.coins.length} tx.coins dest entries`);
-        }
-        
-        // ----------------------------------------------------------------------------
-        // THE KEY RE-PATCH (JSON strings -> CBOR Arrays)
-        // This resolves the "expected array" error at column 1177
-        // JSON cannot represent arrays as keys, so we must convert after parsing
-        // ----------------------------------------------------------------------------
-        if (spellObj.app_public_inputs && typeof spellObj.app_public_inputs === 'object') {
-            console.log('[PAYROLL PROVER] Patching app_public_inputs keys to CBOR arrays...');
-            const patchedPublicInputs = new Map();
-            for (const [key, value] of Object.entries(spellObj.app_public_inputs)) {
-                // Split the string key "n/appId/appVk" back into components
-                const parts = (key as string).split('/');
-                if (parts.length === 3 && (parts[0] === 'n' || parts[0] === 't')) {
-                    const [tag, idHex, vkHex] = parts;
-                    // Create a CBOR-compatible Array key with actual bytes
-                    const complexKey = [tag, hexToBytes(idHex), hexToBytes(vkHex)];
-                    patchedPublicInputs.set(complexKey, value);
-                    console.log(`[PAYROLL PROVER] Patched key: ${key} -> [${tag}, <${idHex.length} bytes>, <${vkHex.length} bytes>]`);
-                } else {
-                    // Fallback for any other key format (should not happen)
-                    patchedPublicInputs.set(key, value);
+            
+        } else if (request.type === 'mint-token') {
+            // =========================================================================
+            // TOKEN MINTING PATH - Restore Binary Patching
+            // tx.ins: MUST be 36-byte Uint8Arrays (Byte Strings)
+            // tx.outs: MUST be a Map with INTEGER keys
+            // tx.coins.dest: MUST be Uint8Arrays (Byte Strings)
+            // app_public_inputs: MUST be Map with Uint8Array keys
+            // =========================================================================
+            console.log('[PAYROLL PROVER] TOKEN PATH: Restoring Binary Parity...');
+            
+            // 1. tx.ins: MUST be 36-byte Uint8Arrays (Byte Strings)
+            // Use your existing utxoTo36Bytes helper [Source 789]
+            console.log('[PAYROLL PROVER] Converting tx.ins to 36-byte Uint8Arrays...');
+            if (!request.authorityUtxo || !request.fundingUtxo) {
+                throw new Error('Missing authorityUtxo or fundingUtxo for tx.ins');
+            }
+            spellObj.tx.ins = [
+                utxoTo36Bytes(request.authorityUtxo),
+                utxoTo36Bytes(request.fundingUtxo)
+            ];
+            console.log(`[PAYROLL PROVER] tx.ins converted to Uint8Arrays (${spellObj.tx.ins[0].length} bytes each)`);
+            
+            // 2. tx.outs: MUST be a Map with INTEGER keys [Source 110]
+            console.log('[PAYROLL PROVER] Converting tx.outs to Map with integer keys...');
+            if (spellObj.tx && Array.isArray(spellObj.tx.outs)) {
+                spellObj.tx.outs = spellObj.tx.outs.map((out: any) => {
+                    const outMap = new Map();
+                    Object.entries(out).forEach(([key, val]) => {
+                        const numericKey = parseInt(key, 10);
+                        if (!isNaN(numericKey)) {
+                            outMap.set(numericKey, val);
+                            console.log(`[PAYROLL PROVER] Mapped key: "${key}" -> ${numericKey}`);
+                        } else {
+                            outMap.set(key, val);
+                            console.log(`[PAYROLL PROVER] Kept key as string: "${key}"`);
+                        }
+                    });
+                    return outMap;
+                });
+                console.log(`[PAYROLL PROVER] Converted ${spellObj.tx.outs.length} tx.outs entries to Maps with integer keys`);
+            }
+            
+            // 3. tx.coins.dest: MUST be Uint8Arrays (Byte Strings)
+            // Reconstruct with Parallel Coin Mapping using Uint8Array
+            console.log('[PAYROLL PROVER] Reconstructing tx.coins with Uint8Array dest...');
+            if (request.outputs && request.outputs.length > 0) {
+                const newCoins = [];
+                for (let i = 0; i < request.outputs.length; i++) {
+                    const out = request.outputs[i];
+                    const destHex = addressToHexDest(out.address);
+                    const destUint8 = new Uint8Array(Buffer.from(destHex, 'hex'));
+                    console.log(`[PAYROLL PROVER] Mapping Coin ${i} to: ${out.address.substring(0, 20)}... (dest length: ${destUint8.length})`);
+                    newCoins.push({
+                        amount: constants.MIN_OUTPUT_SATS,
+                        dest: destUint8
+                    });
                 }
+                spellObj.tx.coins = newCoins;
+                console.log(`[PAYROLL PROVER] Reconstructed tx.coins array with ${spellObj.tx.coins.length} entries`);
             }
-            spellObj.app_public_inputs = patchedPublicInputs;
-            console.log('[PAYROLL PROVER] app_public_inputs patched to Map with array keys');
+            
+            // 4. app_public_inputs: MUST be Map with Uint8Array keys [Source 110]
+            console.log('[PAYROLL PROVER] Converting app_public_inputs to Map with Uint8Array keys...');
+            const appIdBytes = new Uint8Array(Buffer.from(finalAppId!, 'hex'));
+            const appVkBytes = new Uint8Array(Buffer.from(APP_VK, 'hex'));
+            const publicInputsMap = new Map();
+            
+            // Format: ["tag", identity_bytes, vk_bytes]
+            publicInputsMap.set(["n", appIdBytes, appVkBytes], null);
+            publicInputsMap.set(["t", appIdBytes, appVkBytes], null);
+            spellObj.app_public_inputs = publicInputsMap;
+            console.log('[PAYROLL PROVER] app_public_inputs converted to Map with Uint8Array keys');
         }
         
         // DEBUG: Log the final spellObj structure before CBOR encoding
         console.log('[PAYROLL PROVER] DEBUG - Final spellObj structure summary:');
         console.log(`  version: ${spellObj.version}`);
         console.log(`  tx.ins length: ${spellObj.tx?.ins?.length || 0}, type: ${spellObj.tx?.ins?.constructor?.name}`);
+        if (spellObj.tx?.ins && spellObj.tx.ins.length > 0) {
+            console.log(`  tx.ins[0] type: ${spellObj.tx.ins[0] instanceof Uint8Array ? 'Uint8Array' : typeof spellObj.tx.ins[0]}, isArray: ${Array.isArray(spellObj.tx.ins[0])}`);
+        }
         console.log(`  tx.outs length: ${spellObj.tx?.outs?.length || 0}, type: ${spellObj.tx?.outs?.constructor?.name}`);
         console.log(`  tx.coins length: ${spellObj.tx?.coins?.length || 0}, type: ${spellObj.tx?.coins?.constructor?.name}`);
+        if (spellObj.tx?.coins && spellObj.tx.coins.length > 0) {
+            console.log(`  tx.coins[0].dest type: ${spellObj.tx.coins[0]?.dest instanceof Uint8Array ? 'Uint8Array' : typeof spellObj.tx.coins[0]?.dest}, isArray: ${Array.isArray(spellObj.tx.coins[0]?.dest)}`);
+        }
         console.log(`  app_public_inputs type: ${spellObj.app_public_inputs?.constructor?.name}`);
         
     } catch (error: any) {
@@ -374,7 +449,6 @@ export async function generateUnsignedTransactions(
     // ----------------------------------------------------------------------------
     // Step 5: Wrap for Transport - CBOR Encoding
     // Convert the spell object to CBOR hex string
-    // cbor-x will correctly encode Map with array keys as CBOR arrays
     // ----------------------------------------------------------------------------
     try {
         console.log('[PAYROLL PROVER] STEP 2: CBOR encoding for transport...');
@@ -391,32 +465,22 @@ export async function generateUnsignedTransactions(
 
     // ----------------------------------------------------------------------------
     // Step 6: Prepare Asset Encoding
-    // CRITICAL: app_private_inputs MUST be Hex (fixes 'G' character error)
-    // binaries MUST stay Base64 (working payload uses base64 for WASM)
     // =========================================================================
     // UNIVERSAL AUTHORITY WITNESS FOR PHASE 1 AND PHASE 2
-    // For both mint-nft and mint-token, the witness must be the Anchor UTXO
-    // This matches the AppId derivation used by the protocol
     // =========================================================================
-    const wasmBuffer = getWasmBuffer();
-    const wasmBase64 = wasmBuffer.toString('base64');
+    const wasmBase64 = getWasmBase64();
     console.log(`[PAYROLL PROVER] WASM base64 length: ${wasmBase64.length}`);
     
     // Universal Authority: Use Anchor UTXO for both phases
-    // The identity to prove is always the anchor UTXO that created the App
     let identityToProve: string;
     
     if (request.type === 'mint-nft') {
-        // Phase 1: Authority is the fresh Anchor UTXO
         if (!request.anchorUtxo) {
             throw new Error('No anchorUtxo available for mint-nft witness');
         }
         identityToProve = request.anchorUtxo;
         console.log(`[PAYROLL PROVER] mint-nft: Using anchorUtxo as witness`);
     } else {
-        // Phase 2: Authority is the original Anchor UTXO saved in Plan Metadata
-        // The planMetadata contains the original anchorUtxo from Phase 1
-        // Note: Do NOT use utxoAddress (the worker/employer address)
         identityToProve = (request as any).planMetadata?.anchorUtxo || request.anchorUtxo;
         if (!identityToProve) {
             throw new Error('No anchorUtxo available for mint-token witness. Ensure planMetadata.anchorUtxo is provided.');
@@ -424,33 +488,18 @@ export async function generateUnsignedTransactions(
         console.log(`[PAYROLL PROVER] mint-token: Using planMetadata.anchorUtxo as witness`);
     }
     
-    // =========================================================================
-    // CRITICAL FIX: CBOR Encode the witness string FIRST, then convert to hex
-    // This adds the mandatory CBOR string prefix (0x78) so the API correctly
-    // identifies it as a text string rather than an integer.
-    // Without this, a witness starting with '4' (ASCII 0x34) gets decoded as
-    // CBOR integer -21, causing "invalid type: integer, expected str" error.
-    // =========================================================================
-    const witnessCbor = encode(identityToProve);
-    const witnessHex = bytesToHex(witnessCbor);
+    const witnessHex = utxoIdToHexWitness(identityToProve);
     console.log(`[PAYROLL PROVER] Identity to prove: ${identityToProve}`);
-    console.log(`[PAYROLL PROVER] Witness CBOR length: ${witnessCbor.length} bytes`);
     console.log(`[PAYROLL PROVER] Witness hex (CBOR-wrapped): ${witnessHex.substring(0, 50)}...`);
-    console.log(`[PAYROLL PROVER] Witness hex length: ${witnessHex.length}`);
 
     // ----------------------------------------------------------------------------
-    // Step 7: Clean prev_txs hex strings and validate lengths
-    // CRITICAL: The API requires valid transaction hexes that create the input UTXOs
+    // Step 7: Clean prev_txs hex strings
     // ----------------------------------------------------------------------------
     const cleanedPrevTxs = prevTxHexes.map(hex => hex.replace(/\s/g, '').toLowerCase());
     console.log(`[PAYROLL PROVER] Cleaned ${cleanedPrevTxs.length} prev_txs`);
     
-    // DEBUG: Log each prev_txs length to verify they are valid transaction hexes
     cleanedPrevTxs.forEach((hex, i) => {
         console.log(`[PAYROLL PROVER] prev_txs[${i}] length: ${hex.length} characters`);
-        if (hex.length < 100) {
-            console.warn(`[WARNING] prev_txs[${i}] looks too short to be a valid transaction!`);
-        }
         if (hex.length > 0) {
             console.log(`[PAYROLL PROVER] prev_txs[${i}] prefix: ${hex.substring(0, 50)}...`);
         }
@@ -458,9 +507,6 @@ export async function generateUnsignedTransactions(
 
     // ----------------------------------------------------------------------------
     // Step 8: Build the final request body for Prover API
-    // spell: Hex-encoded CBOR (after Rust type-marshalling and key patching)
-    // app_private_inputs: CBOR-wrapped hex string (fixes integer vs string error)
-    // binaries: Base64 strings (must stay base64)
     // ----------------------------------------------------------------------------
     const requestBody: any = {
         spell: spellHex,
@@ -476,7 +522,7 @@ export async function generateUnsignedTransactions(
         chain: "bitcoin"
     };
 
-    // Add token app_private_inputs for mint-token (authority for the token app)
+    // Add token app_private_inputs for mint-token
     if (request.type === 'mint-token') {
         requestBody.app_private_inputs[`t/${finalAppId}/${APP_VK}`] = witnessHex;
         console.log(`[PAYROLL PROVER] Added token app_private_inputs for mint-token`);
@@ -497,17 +543,6 @@ export async function generateUnsignedTransactions(
     console.log('[PAYROLL PROVER] change_address:', requestBody.change_address);
     console.log('[PAYROLL PROVER] fee_rate:', requestBody.fee_rate);
     console.log('[PAYROLL PROVER] chain:', requestBody.chain);
-    
-    // FIX: Type assertion for Object.values to avoid TypeScript error
-    const appPrivateValue = Object.values(requestBody.app_private_inputs)[0] as string;
-    const binariesValue = Object.values(requestBody.binaries)[0] as string;
-    
-    console.log('[PAYROLL PROVER] app_private_inputs value type:', typeof appPrivateValue);
-    console.log('[PAYROLL PROVER] app_private_inputs value first 50 chars:', appPrivateValue?.substring(0, 50));
-    console.log('[PAYROLL PROVER] binaries value type:', typeof binariesValue);
-    console.log('[PAYROLL PROVER] binaries value first 50 chars:', binariesValue?.substring(0, 50));
-    console.log('[PAYROLL PROVER] prev_txs[0] type:', typeof requestBody.prev_txs[0]);
-    console.log('[PAYROLL PROVER] ===== END REQUEST BODY DEBUG =====');
     
     const requestBodySize = JSON.stringify(requestBody).length;
     console.log(`[PAYROLL PROVER] Request body JSON size: ${requestBodySize} bytes`);
@@ -566,9 +601,9 @@ export async function generateUnsignedTransactions(
                 console.log('[PAYROLL PROVER] Response: Single transaction mode (object response)');
             }
 
-            const fs = require('fs');
+            const fsModule = require('fs');
             if (finalSpellTxHex) {
-                fs.writeFileSync('/tmp/full-tx.hex', finalSpellTxHex);
+                fsModule.writeFileSync('/tmp/full-tx.hex', finalSpellTxHex);
                 console.log('[PAYROLL PROVER] Saved full transaction hex to /tmp/full-tx.hex');
             }
     
@@ -646,10 +681,44 @@ export async function batchPayroll(
     utxoAddress?: string,
     multiSigSigners?: string[]
 ): Promise<ProverResult> {
+    // =========================================================================
+    // CRITICAL FIX: Extract TXIDs and fetch raw transaction hexes
+    // =========================================================================
+    
+    // Extract TXIDs from the "txid:vout" strings
+    const [planTxid] = planUtxo.split(':');
+    const [fundingTxid] = fundingUtxo.utxo.split(':');
+
+    console.log('[PAYROLL PROVER] Fetching required hexes for Provenance...');
+    console.log(`[PAYROLL PROVER] Plan TXID: ${planTxid}`);
+    console.log(`[PAYROLL PROVER] Funding TXID: ${fundingTxid}`);
+    
+    const planHex = await fetchTransactionHex(planTxid);
+    const fundingHex = await fetchTransactionHex(fundingTxid);
+    
+    console.log(`[PAYROLL PROVER] Plan hex length: ${planHex.length} chars`);
+    console.log(`[PAYROLL PROVER] Funding hex length: ${fundingHex.length} chars`);
+
+    // =========================================================================
+    // CRITICAL FIX: Populate anchorUtxo from planMetadata for authority witness
+    // The anchorUtxo must be the original UTXO that created the appId (from Phase 1)
+    // planMetadata contains anchorUtxo from the plans DB lookup
+    // =========================================================================
+    const anchorUtxoFromMetadata = planMetadata?.anchorUtxo;
+    
+    if (!anchorUtxoFromMetadata) {
+        console.error('[PAYROLL PROVER] ❌ planMetadata.anchorUtxo is missing!');
+        console.error('[PAYROLL PROVER] planMetadata keys:', Object.keys(planMetadata || {}));
+        throw new Error('planMetadata.anchorUtxo is required for mint-token witness. Ensure the plan record contains the original anchorUtxo from Phase 1.');
+    }
+    
+    console.log(`[PAYROLL PROVER] ✅ Using anchorUtxo from planMetadata: ${anchorUtxoFromMetadata}`);
+
     const request: SpellRequest = {
         type: 'mint-token',
         authorityUtxo: planUtxo,
-        anchorUtxo: planUtxo,
+        // CRITICAL: Pull the original creation anchor from DB metadata
+        anchorUtxo: anchorUtxoFromMetadata,
         fundingUtxo: fundingUtxo.utxo,
         fundingUtxoValue: fundingUtxo.value,
         changeAddress: changeAddress,
@@ -658,12 +727,12 @@ export async function batchPayroll(
             ...workers.map(w => ({ address: w.address, tokenAmount: w.amount })),
             { address: employerAddress, nftMetadata: planMetadata }
         ],
-        // Pass planMetadata to provide the original anchorUtxo for Phase 2 witness
+        // Ensure planMetadata is passed for internal use (witness fallback)
         planMetadata: planMetadata,
         ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
     } as any;
 
-    return generateUnsignedTransactions(request, [planUtxo, fundingUtxo.utxo], treasuryHexDest, appId, utxoAddress);
+    return generateUnsignedTransactions(request, [planHex, fundingHex], treasuryHexDest, appId, utxoAddress);
 }
 
 export async function createEmploymentPlan(
@@ -681,6 +750,20 @@ export async function createEmploymentPlan(
     utxoAddress?: string,
     multiSigSigners?: string[]
 ): Promise<ProverResult> {
+    // Extract TXIDs from the "txid:vout" strings
+    const [anchorTxid] = anchorUtxo.split(':');
+    const [fundingTxid] = fundingUtxo.utxo.split(':');
+
+    console.log('[PAYROLL PROVER] Fetching required hexes for createEmploymentPlan...');
+    console.log(`[PAYROLL PROVER] Anchor TXID: ${anchorTxid}`);
+    console.log(`[PAYROLL PROVER] Funding TXID: ${fundingTxid}`);
+    
+    const anchorHex = await fetchTransactionHex(anchorTxid);
+    const fundingHex = await fetchTransactionHex(fundingTxid);
+    
+    console.log(`[PAYROLL PROVER] Anchor hex length: ${anchorHex.length} chars`);
+    console.log(`[PAYROLL PROVER] Funding hex length: ${fundingHex.length} chars`);
+
     const request: SpellRequest = {
         type: 'mint-nft',
         anchorUtxo: anchorUtxo,
@@ -702,5 +785,5 @@ export async function createEmploymentPlan(
         ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
     };
     
-    return generateUnsignedTransactions(request, [anchorUtxo, fundingUtxo.utxo], treasuryHexDest, undefined, utxoAddress);
+    return generateUnsignedTransactions(request, [anchorHex, fundingHex], treasuryHexDest, undefined, utxoAddress);
 }

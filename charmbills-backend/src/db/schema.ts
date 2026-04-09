@@ -5,6 +5,7 @@ import { Database } from 'sqlite3';
 export interface PlanCache {
   appId: string;
   nftUtxoId: string;
+  anchorUtxo: string;
   ticker: string;
   employerAddress: string;
   department?: string;
@@ -85,6 +86,7 @@ export async function initDatabase(db: Database): Promise<void> {
         CREATE TABLE IF NOT EXISTS plans (
             appId TEXT PRIMARY KEY,
             nftUtxoId TEXT UNIQUE NOT NULL,
+            anchorUtxo TEXT NOT NULL,
             ticker TEXT NOT NULL,
             employerAddress TEXT NOT NULL,
             department TEXT,

@@ -207,6 +207,7 @@ async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRec
 async function savePlanRecord(
   appId: string,
   planUtxo: string,
+  anchorUtxo: string,
   employerAddress: string,
   department: string,
   payPeriodSeconds: number,
@@ -216,11 +217,12 @@ async function savePlanRecord(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     db.run(
-      `INSERT INTO plans (appId, nftUtxoId, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt, updatedAt) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO plans (appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt, updatedAt) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         appId, 
         planUtxo, 
+        anchorUtxo,
         constants.PAYROLL_NFT_TICKER, 
         employerAddress,
         department, 
@@ -502,10 +504,11 @@ export async function createPayrollPlan(req: Request, res: Response) {
     await savePlanRecord(
       appId,
       planUtxo,
+      anchorUtxo,
       employerAddress,
       department,
       payPeriodSeconds,
-      remaining,        // Save department budget
+      remaining,
       metadataHash,
       scrollPolicy
     );
@@ -575,7 +578,7 @@ export async function getPlans(req: Request, res: Response) {
   try {
     const { department, employerAddress, limit = '50', offset = '0' } = req.query;
     
-    let query = 'SELECT appId, nftUtxoId, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE 1=1';
+    let query = 'SELECT appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE 1=1';
     const params: any[] = [];
     
     if (department) {
@@ -597,21 +600,22 @@ export async function getPlans(req: Request, res: Response) {
         return res.status(500).json({ error: err.message });
       }
       
-      // Sanitize response - remove any sensitive data
-      const sanitizedRows = rows.map(row => ({
+      // Return full data including anchorUtxo (required for mint-token witness)
+      const rowsWithAnchor = rows.map(row => ({
         appId: row.appId,
         nftUtxoId: row.nftUtxoId,
+        anchorUtxo: row.anchorUtxo,
         ticker: row.ticker,
-        employerAddress: row.employerAddress ? row.employerAddress.substring(0, 20) + '...' : null,
+        employerAddress: row.employerAddress,
         department: row.department,
         payPeriodSeconds: row.payPeriodSeconds,
         remaining: row.remaining,
-        metadataHash: row.metadataHash.substring(0, 16) + '...',
+        metadataHash: row.metadataHash,
         scrollPolicy: row.scrollPolicy,
         createdAt: row.createdAt
       }));
       
-      res.json(sanitizedRows);
+      res.json(rowsWithAnchor);
     });
   } catch (error: any) {
     console.error('[PLANS API] Error in getPlans:', error);
@@ -636,7 +640,7 @@ export async function getPlanById(req: Request, res: Response) {
     }
     
     db.get(
-      'SELECT appId, nftUtxoId, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE appId = ?',
+      'SELECT appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE appId = ?',
       [appId],
       (err: Error | null, row: any) => {
         if (err) {
@@ -648,21 +652,22 @@ export async function getPlanById(req: Request, res: Response) {
           return res.status(404).json({ error: 'Plan not found' });
         }
         
-        // Sanitize response
-        const sanitizedRow = {
+        // Return full data including anchorUtxo (required for mint-token witness)
+        const rowWithAnchor = {
           appId: row.appId,
           nftUtxoId: row.nftUtxoId,
+          anchorUtxo: row.anchorUtxo,
           ticker: row.ticker,
-          employerAddress: row.employerAddress ? row.employerAddress.substring(0, 20) + '...' : null,
+          employerAddress: row.employerAddress,
           department: row.department,
           payPeriodSeconds: row.payPeriodSeconds,
           remaining: row.remaining,
-          metadataHash: row.metadataHash.substring(0, 16) + '...',
+          metadataHash: row.metadataHash,
           scrollPolicy: row.scrollPolicy,
           createdAt: row.createdAt
         };
         
-        res.json(sanitizedRow);
+        res.json(rowWithAnchor);
       }
     );
   } catch (error: any) {
