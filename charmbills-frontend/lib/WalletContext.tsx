@@ -694,6 +694,31 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 } else {
                     console.warn('⚠️ Broadcast returned unexpected response format');
                 }
+                // =========================================================================
+                // CRITICAL FIX: Update backend with actual broadcasted txid
+                // This ensures the worker portal shows the correct token UTXO
+                // =========================================================================
+                if (txidStrings.length > 0) {
+                    const actualTxid = txidStrings[0];
+                    console.log(`[WalletContext] Updating backend with actual txid: ${actualTxid}`);
+                    
+                    try {
+                        // Get the worker's planId from somewhere - you may need to pass it
+                        // For now, we'll use a placeholder - you need to get the actual planId
+                        const workerRecord = await axios.get(`http://localhost:3002/api/workers/${address}`);
+                        const planId = workerRecord.data.planId;
+                        
+                        await axios.post('http://localhost:3002/api/workers/update-token-utxo', {
+                            walletAddress: address,
+                            planId: planId,
+                            actualTxid: actualTxid,
+                            voutIndex: 0  // Worker token is always at output index 0
+                        });
+                        console.log('[WalletContext] ✅ Backend updated with actual txid');
+                    } catch (updateError: any) {
+                        console.error('[WalletContext] Failed to update backend:', updateError.message);
+                    }
+                }
             } catch (broadcastErr: any) {
                 console.warn('⚠️ Broadcast deferred (Transaction likely requires more signatures):', broadcastErr.message);
             }

@@ -174,23 +174,32 @@ export async function broadcastPackage(req: Request, res: Response) {
 
     const result = rpcResponse.data.result;
     console.log(`[BROADCAST:${requestId}] Broadcast successful via ${rpcMethod}:`, result);
-    
+
     // ----------------------------------------------------------------------------
     // Step 8: Parse and return transaction IDs
     // ----------------------------------------------------------------------------
     let txids: string[] = [];
     if (isSingle) {
-      // sendrawtransaction returns a single txid string
-      txids = [result];
+        // sendrawtransaction returns a single txid string
+        txids = [result];
+        console.log(`[BROADCAST:${requestId}] Single txid: ${result}`);
     } else if (Array.isArray(result)) {
-      txids = result;
+        txids = result;
+        console.log(`[BROADCAST:${requestId}] Multiple txids: ${result.join(', ')}`);
     } else if (typeof result === 'string') {
-      txids = [result];
+        txids = [result];
     } else if (result && typeof result === 'object') {
-      txids = result.txids || [result];
+        txids = result.txids || [result];
     }
-    
+
     console.log(`[BROADCAST:${requestId}] Transaction IDs:`, txids);
+
+    // CRITICAL FIX: Log the actual broadcasted txid for the token UTXO
+    // The worker's token UTXO is at index 0 of the transaction outputs
+    if (txids.length > 0) {
+        console.log(`[BROADCAST:${requestId}] ✅ IMPORTANT - Actual broadcasted txid: ${txids[0]}`);
+        console.log(`[BROADCAST:${requestId}] Worker token UTXO will be: ${txids[0]}:0`);
+    }
     console.log(`[BROADCAST:${requestId}] ===== SUCCESS =====\n`);
     
     return res.status(200).json({

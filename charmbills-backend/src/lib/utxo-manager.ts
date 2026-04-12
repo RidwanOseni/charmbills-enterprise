@@ -19,6 +19,10 @@ const MIN_CONFIRMATIONS = process.env.UTXO_MIN_CONFIRMATIONS
   ? parseInt(process.env.UTXO_MIN_CONFIRMATIONS) 
   : 1;
 
+// Retry configuration for API calls
+const MAX_RETRIES = 3;
+const BASE_TIMEOUT = 30000; // Increased to 30 seconds for production
+
 // Database connection
 const DB_PATH = process.env.PAYROLL_DB_PATH || path.join(process.cwd(), 'payroll.db');
 const db = new Database(DB_PATH);
@@ -246,13 +250,18 @@ export async function cleanupExpiredLocks(): Promise<number> {
 
 /**
  * Fetches all UTXOs for a given Bitcoin address from Mempool.space
+ * Includes retry mechanism with exponential backoff for production reliability
+ * 
+ * @param address - Bitcoin address to fetch UTXOs for
+ * @param retryCount - Current retry attempt (used internally for recursion)
+ * @returns Array of UTXOs
  */
-export async function fetchAddressUtxos(address: string): Promise<Utxo[]> {
+export async function fetchAddressUtxos(address: string, retryCount: number = 0): Promise<Utxo[]> {
   try {
-    console.log(`[UTXO Manager] Fetching UTXOs for ${address}...`);
+    console.log(`[UTXO Manager] Fetching UTXOs for ${address} (Attempt ${retryCount + 1})...`);
     
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
-      timeout: 10000 // 10 second timeout
+    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, { 
+      timeout: BASE_TIMEOUT 
     });
     
     if (!response.data || !Array.isArray(response.data)) {
@@ -263,9 +272,20 @@ export async function fetchAddressUtxos(address: string): Promise<Utxo[]> {
     return response.data;
     
   } catch (error: any) {
+    // PROFESSIONAL FIX: Implement exponential backoff for timeouts and server errors [Source 113]
+    const isTimeout = error.code === 'ECONNABORTED';
+    const isServerError = error.response?.status >= 500 && error.response?.status < 600;
+    
+    if ((isTimeout || isServerError) && retryCount < MAX_RETRIES) {
+      const delay = Math.pow(2, retryCount) * 1000;
+      console.warn(`[UTXO Manager] API ${isTimeout ? 'timeout' : 'error'} (${error.response?.status || error.code}). Retrying in ${delay}ms...`);
+      await new Promise(res => setTimeout(res, delay));
+      return fetchAddressUtxos(address, retryCount + 1);
+    }
+    
     if (axios.isAxiosError(error)) {
       if (error.code === 'ECONNABORTED') {
-        throw new UtxoError(`Mempool API timeout`);
+        throw new UtxoError(`Mempool API timeout after ${MAX_RETRIES} retries`);
       }
       if (error.response?.status === 404) {
         throw new UtxoError(`Address ${address} not found or has no transactions`);
@@ -395,7 +415,7 @@ export async function getDynamicFundingUtxo(
   await cleanupExpiredLocks();
   
   try {
-    // Step 1: Fetch all UTXOs for address
+    // Step 1: Fetch all UTXOs for address (with retries)
     const allUtxos = await fetchAddressUtxos(address);
     
     // Step 2: Filter out locked UTXOs and session-excluded UTXOs

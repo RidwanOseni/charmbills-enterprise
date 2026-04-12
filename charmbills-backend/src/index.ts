@@ -3,7 +3,7 @@ import cors from 'cors';
 import { Database } from 'sqlite3';
 import { createPayrollPlan, getPlans, getPlanById } from './api/plans';
 import { mintPayrollToken, batchHireWorkers, getHiringQuote } from './api/payrollhiring';
-import { getWorkers, getDashboardStats, getWorkerMetadata, addWorker } from './api/workers';
+import { getWorkers, getDashboardStats, getWorkerMetadata, addWorker, getWorkerByAddress, updateWorkerTokenUtxo } from './api/workers';
 import { broadcastPackage, checkRpcHealth, getNodeInfo } from './api/broadcast-package';
 import { getPendingApprovals, terminateWorker, approveTermination } from './api/treasury';
 import { 
@@ -79,9 +79,11 @@ app.post('/api/payrollhiring/quote', getHiringQuote);
 // ============================================================
 app.get('/api/workers', getWorkers);
 app.post('/api/workers/add', addWorker);  // ✅ ADDED: Route for adding worker to registry
+app.get('/api/workers/:address', getWorkerByAddress);  // ✅ ADDED: Route for worker lookup with historical tokens
 app.get('/api/dashboard/stats', getDashboardStats);
 app.get('/api/worker-metadata/:address', getWorkerMetadata);
 app.post('/api/workers/terminate', terminateWorker);
+app.post('/api/workers/update-token-utxo', updateWorkerTokenUtxo);
 
 // ============================================================
 // TREASURY ROUTES
@@ -95,6 +97,27 @@ app.post('/api/treasury/approve', approveTermination);
 app.post('/api/broadcast-package', broadcastPackage);
 app.get('/api/broadcast/health', checkRpcHealth);
 app.get('/api/broadcast/node-info', getNodeInfo);
+
+// ============================================================
+// IPFS CID LOOKUP ROUTE
+// ============================================================
+app.get('/api/ipfs/cid/:metadataHash', async (req, res) => {
+  const { metadataHash } = req.params;
+  
+  try {
+    const { getCidByMetadataHash } = await import('./db/schema');
+    const cid = await getCidByMetadataHash(db, metadataHash);
+    
+    if (!cid) {
+      return res.status(404).json({ error: 'CID not found for metadata hash' });
+    }
+    
+    res.json({ cid });
+  } catch (error: any) {
+    console.error('[IPFS CID] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ============================================================
 // FALLBACK ROUTE

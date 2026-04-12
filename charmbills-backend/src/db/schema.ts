@@ -31,6 +31,8 @@ export interface WorkerCache {
   role: string;
   metadataHash: string;
   updatedAt: string;
+  // ADDED: For Payment History Audit Trail [16]
+  historicalTokens: string; // JSON stringified array of spent UTXO IDs
 }
 
 export interface CompanyRecord {
@@ -103,7 +105,7 @@ export async function initDatabase(db: Database): Promise<void> {
         else console.log('[DB INIT] ✅ plans table ready');
       });
 
-      // Create workers table
+      // Create workers table with historicalTokens column for payment history
       db.run(`
         CREATE TABLE IF NOT EXISTS workers (
             walletAddress TEXT,
@@ -118,6 +120,7 @@ export async function initDatabase(db: Database): Promise<void> {
             role TEXT,
             metadataHash TEXT,
             updatedAt TEXT,
+            historicalTokens TEXT DEFAULT '[]',
             PRIMARY KEY (walletAddress, planId)
         )
       `, (err) => {
@@ -473,8 +476,8 @@ export async function saveWorkerRecord(
     db.run(
       `INSERT OR REPLACE INTO workers 
        (walletAddress, name, planId, engagementType, status, lastMintedPeriod, 
-        currentTokenUtxo, expiresAt, salarySats, role, metadataHash, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        currentTokenUtxo, expiresAt, salarySats, role, metadataHash, updatedAt, historicalTokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         worker.walletAddress,
         worker.name || null,
@@ -487,7 +490,8 @@ export async function saveWorkerRecord(
         worker.salarySats,
         worker.role,
         worker.metadataHash,
-        worker.updatedAt
+        worker.updatedAt,
+        worker.historicalTokens || '[]'
       ],
       (err: Error | null) => err ? reject(err) : resolve()
     );
@@ -505,6 +509,22 @@ export async function getWorkersByPlan(
       (err: Error | null, rows: any[]) => {
         if (err) reject(err);
         else resolve(rows || []);
+      }
+    );
+  });
+}
+
+export async function getWorkerByAddress(
+  db: Database,
+  walletAddress: string
+): Promise<WorkerCache | null> {
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT * FROM workers WHERE walletAddress = ? ORDER BY updatedAt DESC LIMIT 1',
+      [walletAddress],
+      (err: Error | null, row: any) => {
+        if (err) reject(err);
+        else resolve(row || null);
       }
     );
   });
@@ -552,6 +572,93 @@ export async function updateWorkerMetadata(
       'UPDATE workers SET metadataHash = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
       [metadataHash, new Date().toISOString(), walletAddress, planId],
       (err: Error | null) => err ? reject(err) : resolve()
+    );
+  });
+}
+
+/**
+ * ADDED: Targeted update for post-mint worker record
+ * This preserves the worker's name and role from the registry
+ * Only updates status, token UTXO, expiry, and last minted period
+ * 
+ * @param db - Database connection
+ * @param walletAddress - Worker's wallet address
+ * @param planId - Plan ID (appId)
+ * @param tokenUtxo - The newly minted token UTXO ID
+ * @param expiresAt - Expiration date of the token
+ * @param lastMintedPeriod - Date string of when the token was minted
+ */
+export async function updateWorkerPostMint(
+  db: Database,
+  walletAddress: string,
+  planId: string,
+  tokenUtxo: string,
+  expiresAt: string,
+  lastMintedPeriod: string
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const query = `
+      UPDATE workers 
+      SET status = 'active', 
+          currentTokenUtxo = ?, 
+          expiresAt = ?, 
+          lastMintedPeriod = ?,
+          updatedAt = ?
+      WHERE walletAddress = ? AND planId = ?
+    `;
+    db.run(query, [
+      tokenUtxo,
+      expiresAt,
+      lastMintedPeriod,
+      new Date().toISOString(),
+      walletAddress,
+      planId
+    ], (err: Error | null) => err ? reject(err) : resolve());
+  });
+}
+
+/**
+ * Add a spent token UTXO to worker's historicalTokens audit trail
+ * Used for Payment History feature
+ */
+export async function addHistoricalToken(
+  db: Database,
+  walletAddress: string,
+  planId: string,
+  spentUtxo: string,
+  timestamp: number
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // First get current historicalTokens
+    db.get(
+      'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
+      [walletAddress, planId],
+      (err: Error | null, row: any) => {
+        if (err) return reject(err);
+        
+        let history: any[] = [];
+        if (row && row.historicalTokens) {
+          try {
+            history = JSON.parse(row.historicalTokens);
+          } catch (e) {
+            history = [];
+          }
+        }
+        
+        // Add new entry
+        history.push({
+          utxoId: spentUtxo,
+          timestamp: timestamp,
+          spentAt: new Date().toISOString()
+        });
+        
+        // Update the record
+        db.run(
+          'UPDATE workers SET historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+          [JSON.stringify(history), new Date().toISOString(), walletAddress, planId],
+          (err: Error | null) => err ? reject(err) : resolve()
+        );
+      }
     );
   });
 }

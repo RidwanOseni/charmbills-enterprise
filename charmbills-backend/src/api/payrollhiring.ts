@@ -67,6 +67,23 @@ async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRec
 }
 
 // --------------------------------------------------------------------------------
+// Helper to get existing worker name
+// --------------------------------------------------------------------------------
+
+async function getExistingWorkerName(walletAddress: string, planId: string): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    db.get(
+      'SELECT name FROM workers WHERE walletAddress = ? AND planId = ?',
+      [walletAddress, planId],
+      (err: Error | null, row: any) => {
+        if (err) reject(err);
+        else resolve(row ? row.name : null);
+      }
+    );
+  });
+}
+
+// --------------------------------------------------------------------------------
 // Validation Functions
 // --------------------------------------------------------------------------------
 
@@ -285,8 +302,15 @@ export async function mintPayrollToken(req: Request, res: Response) {
       const worker = workers[i];
       console.log(`[HIRING API:${requestId}]   Worker ${i + 1}: ${worker.address.substring(0, 16)}... (${worker.role})`);
       
+      // CRITICAL FIX: Get existing worker name to preserve it
+      const existingName = await getExistingWorkerName(worker.address, planMetadata.appId);
+      const workerName = existingName || worker.role;
+      
+      console.log(`[HIRING API:${requestId}]   Worker name: ${workerName} (${existingName ? 'existing' : 'new'})`);
+      
       // Encrypt worker-specific data using wallet entropy (REAL SALARY is used here)
-      const encryptedWorkerData = encryptPayrollData({
+      // CRITICAL FIX: Add await here - encryptPayrollData is async
+      const encryptedWorkerData = await encryptPayrollData({
         walletAddress: worker.address,
         role: worker.role,
         salarySats: worker.salarySats,  // REAL SALARY for IPFS encryption
@@ -299,14 +323,14 @@ export async function mintPayrollToken(req: Request, res: Response) {
       const { metadataHash } = await pinToIPFS(encryptedWorkerData);
       workerMetadataHashes.push(metadataHash);
       
-      // Save to workers table
+      // Save to workers table - preserve name, don't overwrite with role
       await new Promise((resolve, reject) => {
         db.run(
           `INSERT OR REPLACE INTO workers (walletAddress, name, planId, engagementType, status, lastMintedPeriod, currentTokenUtxo, expiresAt, metadataHash, salarySats, role)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             worker.address,
-            worker.role,
+            workerName,                              // Use preserved name, not worker.role
             planMetadata.appId,
             planMetadata.scrollPolicy === 0 ? 0 : 1,
             'active',
@@ -314,7 +338,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
             null,
             new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString(),
             metadataHash,
-            worker.salarySats,  // REAL SALARY stored in DB
+            worker.salarySats,                       // REAL SALARY stored in DB
             worker.role
           ],
           (err: Error | null) => err ? reject(err) : resolve(null)
@@ -476,6 +500,50 @@ export async function mintPayrollToken(req: Request, res: Response) {
     );
     
     console.log(`[HIRING API:${requestId}] ✅ Transactions generated`);
+    
+    // =========================================================================
+    // CRITICAL FIX: Update workers with actual token UTXOs from the transaction
+    // =========================================================================
+    console.log(`[HIRING API:${requestId}] Updating workers with token UTXOs...`);
+    
+    const bitcoin = require('bitcoinjs-lib');
+    
+    // Get the transaction hex from the result
+    const txHex = result.spellTxHex;
+    const tx = bitcoin.Transaction.fromHex(txHex);
+    
+    // Token outputs start at index 0 (each worker gets one output)
+    for (let i = 0; i < workers.length && i < tx.outs.length; i++) {
+        const worker = workers[i];
+        const tokenUtxo = `${tx.getId()}:${i}`;
+        const expiresAt = new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString();
+        const lastMintedPeriod = new Date().toISOString();
+        
+        console.log(`[HIRING API:${requestId}]   Updating worker ${worker.address.substring(0, 16)}... with token UTXO: ${tokenUtxo}`);
+        
+        // Update the worker record with the actual token UTXO
+        await new Promise((resolve, reject) => {
+            db.run(
+                `UPDATE workers 
+                 SET currentTokenUtxo = ?, 
+                     expiresAt = ?, 
+                     lastMintedPeriod = ?,
+                     updatedAt = ?
+                 WHERE walletAddress = ? AND planId = ?`,
+                [
+                    tokenUtxo,
+                    expiresAt,
+                    lastMintedPeriod,
+                    new Date().toISOString(),
+                    worker.address,
+                    planMetadata.appId
+                ],
+                (err: Error | null) => err ? reject(err) : resolve(null)
+            );
+        });
+    }
+    
+    console.log(`[HIRING API:${requestId}] ✅ Updated ${workers.length} workers with token UTXOs`);
     
     // ----------------------------------------------------------------------------
     // Step 15: Return success response
