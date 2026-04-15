@@ -21,7 +21,7 @@
     "@noble/hashes": "^1.8.0",
     "@scure/btc-signer": "^2.0.1",
     "@types/express": "^5.0.6",
-    "axios": "^1.13.2",
+    "axios": "^1.15.0",
     "bitcoinjs-lib": "^7.0.1",
     "cbor": "^10.0.12",
     "cbor-x": "^1.6.4",

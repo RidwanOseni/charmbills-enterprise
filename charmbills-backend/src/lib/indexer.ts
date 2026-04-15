@@ -136,6 +136,12 @@ export class DerivableIndexer {
         if (!hasPayrollNFT) continue;
         
         await this.processPayrollSpell(spell, block.height);
+        
+        // =========================================================================
+        // PRODUCTION RECONCILIATION: Check for spent worker tokens [Source 870]
+        // =========================================================================
+        await this.reconcileSettlements(tx, block.height);
+        
       } catch (error) {
         // Skip non-spell transactions
         continue;
@@ -143,6 +149,9 @@ export class DerivableIndexer {
     }
   }
 
+  // =========================================================================
+  // PRODUCTION FIX: Process payroll spell with awaited decryption [Source 816]
+  // =========================================================================
   private async processPayrollSpell(spell: any, blockHeight: number): Promise<void> {
     console.log(`🔍 Found payroll spell at block ${blockHeight}`);
     
@@ -197,6 +206,15 @@ export class DerivableIndexer {
       new Date().toISOString()
     ]);
     
+    // Create audit log for plan creation
+    await this.createAuditLog(
+      crypto.randomUUID(),
+      'PLAN_CREATED',
+      `Plan NFT created: ${metadata.ticker}`,
+      spell.txid,
+      'pending'
+    );
+    
     // Optionally fetch and decrypt full metadata for HR dashboard
     // This can be done lazily or in background
     this.enrichPlanWithMetadata(spell.appId, metadataHash).catch(console.error);
@@ -230,12 +248,16 @@ export class DerivableIndexer {
         return;
       }
       
-      // Now the types match correctly [3]
-      const decryptedData = decryptPayrollData(encryptedBlob, encryptionKey);
+      // =========================================================================
+      // CRITICAL FIX: Await the decryption to resolve the Promise [Source 816]
+      // This fixes "Property does not exist on type Promise" errors
+      // =========================================================================
+      const decryptedData = await decryptPayrollData(encryptedBlob, encryptionKey);
       
-      // Extract human-readable fields from the decrypted object
+      // Now decryptedData is a Record<string, any>, not a Promise
       const role = decryptedData.role || 'Unknown Role';
       const employeeName = decryptedData.employeeName || 'Unnamed Worker';
+      const employeeWallet = decryptedData.employeeWallet;
       
       console.log(`  Enriched plan ${appId} with role: ${role}`);
       
@@ -252,11 +274,11 @@ export class DerivableIndexer {
       ]);
       
       // If this is a worker token, update worker cache using WorkerCache type
-      if (decryptedData.employeeWallet) {
+      if (employeeWallet) {
         // FIX: Double casting (through unknown) for type safety [2]
         const existingWorker = (await this.db.get(
           'SELECT * FROM workers WHERE walletAddress = ? AND planId = ?',
-          [decryptedData.employeeWallet, appId]
+          [employeeWallet, appId]
         ) as unknown) as WorkerCache | undefined;
         
         // Use the variable to clear the 'never read' warning [2]
@@ -271,7 +293,7 @@ export class DerivableIndexer {
             lastMintedPeriod, currentTokenUtxo, expiresAt
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `, [
-          decryptedData.employeeWallet,
+          employeeWallet,
           employeeName, // Save the name from metadata
           appId,
           decryptedData.engagementType || 0, // Default to full-time
@@ -281,11 +303,97 @@ export class DerivableIndexer {
           decryptedData.expiresAt || null
         ]);
         
-        console.log(`  Updated worker cache for ${decryptedData.employeeWallet.substring(0, 20)}... with name: ${employeeName}`);
+        console.log(`  Updated worker cache for ${employeeWallet.substring(0, 20)}... with name: ${employeeName}`);
       }
       
     } catch (error) {
       console.error(`❌ Decryption failed for plan ${appId}:`, error);
+    }
+  }
+
+  // =========================================================================
+  // PRODUCTION RECONCILIATION: Scans for spent worker tokens 
+  // to move them to 'historicalTokens' and confirm audit logs. [Source 870]
+  // =========================================================================
+  private async reconcileSettlements(tx: any, blockHeight: number): Promise<void> {
+    if (!tx.vin || !Array.isArray(tx.vin)) return;
+    
+    for (const vin of tx.vin) {
+      const spentUtxoId = `${vin.txid}:${vin.vout}`;
+      
+      // Check if this UTXO is a current worker token
+      const worker = (await this.db.get(
+        'SELECT walletAddress, planId FROM workers WHERE currentTokenUtxo = ? AND status = "active"',
+        [spentUtxoId]
+      ) as unknown) as { walletAddress: string; planId: string } | undefined;
+      
+      if (worker) {
+        console.log(`  🔄 Worker token spent: ${spentUtxoId} (worker: ${worker.walletAddress})`);
+        
+        // Move to historical tokens
+        const timestamp = Math.floor(Date.now() / 1000);
+        
+        // Add to historicalTokens array
+        const existingWorker = (await this.db.get(
+          'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
+          [worker.walletAddress, worker.planId]
+        ) as unknown) as { historicalTokens: string } | undefined;
+        
+        let history: any[] = [];
+        if (existingWorker && existingWorker.historicalTokens) {
+          try {
+            history = JSON.parse(existingWorker.historicalTokens);
+          } catch (e) {
+            history = [];
+          }
+        }
+        
+        history.push({
+          utxoId: spentUtxoId,
+          timestamp: timestamp,
+          spentAt: new Date().toISOString(),
+          blockHeight: blockHeight
+        });
+        
+        await this.db.run(
+          'UPDATE workers SET currentTokenUtxo = NULL, historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+          [JSON.stringify(history), new Date().toISOString(), worker.walletAddress, worker.planId]
+        );
+        
+        // Update audit log status to confirmed if this is a Scroll Release
+        const auditLog = (await this.db.get(
+          'SELECT id FROM audit_logs WHERE txid = ? AND type = ?',
+          [tx.txid, 'SCROLL_RELEASE']
+        ) as unknown) as { id: string } | undefined;
+        
+        if (auditLog) {
+          await this.db.run(
+            'UPDATE audit_logs SET status = "confirmed", timestamp = ? WHERE id = ?',
+            [new Date().toISOString(), auditLog.id]
+          );
+          console.log(`  ✅ Audit log confirmed for tx: ${tx.txid}`);
+        }
+      }
+    }
+  }
+
+  // =========================================================================
+  // Helper to create audit log entries
+  // =========================================================================
+  private async createAuditLog(
+    id: string,
+    type: 'PLAN_CREATED' | 'BATCH_MINT' | 'SCROLL_RELEASE' | 'TERMINATION',
+    details: string,
+    txid: string,
+    status: 'pending' | 'confirmed' | 'failed'
+  ): Promise<void> {
+    try {
+      await this.db.run(`
+        INSERT INTO audit_logs (id, type, details, txid, timestamp, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [id, type, details, txid, new Date().toISOString(), status]);
+    } catch (error) {
+      console.error(`Failed to create audit log:`, error);
     }
   }
 

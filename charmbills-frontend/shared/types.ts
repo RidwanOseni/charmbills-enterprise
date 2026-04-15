@@ -231,3 +231,51 @@ export interface EncryptedPayrollResult {
   cid: string;
   metadataHash: string; // 64-char hex
 }
+
+// ============================================================
+// MODIFICATION: Added VaultStats for Treasury Dashboard
+// ============================================================
+
+/**
+ * VaultStats - Treasury statistics for employer dashboard
+ * Shows total locked funds and allocations for employees vs freelancers
+ * 
+ * UPDATED: Added requiredFundingSats for reconciliation [Source 870]
+ * - totalLockedSats: ACTUAL physical BTC in the vault address
+ * - employeeAllocationSats: LIABILITY (sum of active salaries)
+ * - requiredFundingSats: TARGET (allocation + buffer) - Desired State
+ * - freelancerEscrowSats: Sats held in escrow for freelancers
+ * - vaultAddress: Bitcoin address of the treasury vault
+ */
+export interface VaultStats {
+    totalLockedSats: number;           // ACTUAL: Physical BTC in the vault address
+    employeeAllocationSats: number;     // LIABILITY: Sum of active salaries
+    requiredFundingSats: number;        // TARGET: Allocation + Buffer (Desired State)
+    freelancerEscrowSats: number;       // Sats held in escrow for freelancers
+    vaultAddress: string;               // Bitcoin address of the treasury vault
+}
+
+// ============================================================
+// MODIFICATION: Added AuditRecord for Transaction History
+// ============================================================
+
+/**
+ * AuditRecord - On-chain transaction audit trail
+ * Tracks all major operations for compliance and debugging
+ * 
+ * UPDATED: Added 'failed' status for reconciliation state [Source 870]
+ * - id: Unique identifier (UUID)
+ * - type: Type of operation
+ * - details: Human-readable description
+ * - txid: Bitcoin transaction ID
+ * - timestamp: ISO timestamp of the event
+ * - status: 'pending' | 'confirmed' | 'failed' (Reconciliation state)
+ */
+export interface AuditRecord {
+    id: string;                         // Unique identifier (UUID)
+    type: 'PLAN_CREATED' | 'BATCH_MINT' | 'SCROLL_RELEASE' | 'TERMINATION';
+    details: string;                    // Human-readable description
+    txid: string;                       // Bitcoin transaction ID
+    timestamp: string;                  // ISO timestamp of the event
+    status: 'pending' | 'confirmed' | 'failed';    // Reconciliation state
+}

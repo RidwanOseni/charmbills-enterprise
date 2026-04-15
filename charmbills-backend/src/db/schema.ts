@@ -159,6 +159,24 @@ export async function initDatabase(db: Database): Promise<void> {
         else console.log('[DB INIT] ✅ multisig_transactions table ready');
       });
 
+      // ============================================================
+      // MODIFICATION: Create audit_logs table for transaction audit trail
+      // Ensures the system is "Derivable" from the blockchain [Source 77, 662]
+      // ============================================================
+      db.run(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            details TEXT,
+            txid TEXT,
+            timestamp TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+        )
+      `, (err) => {
+        if (err) console.error('[DB INIT] Error creating audit_logs:', err.message);
+        else console.log('[DB INIT] ✅ audit_logs table ready');
+      });
+
       // Create indexes after tables are created
       const indexes = [
         `CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)`,
@@ -171,7 +189,10 @@ export async function initDatabase(db: Database): Promise<void> {
         `CREATE INDEX IF NOT EXISTS idx_locked_utxos_expires ON locked_utxos(expiresAt)`,
         `CREATE INDEX IF NOT EXISTS idx_ipfs_hash ON ipfs_mappings(metadataHash)`,
         `CREATE INDEX IF NOT EXISTS idx_multisig_employer ON multisig_transactions(employerAddress)`,
-        `CREATE INDEX IF NOT EXISTS idx_multisig_status ON multisig_transactions(status)`
+        `CREATE INDEX IF NOT EXISTS idx_multisig_status ON multisig_transactions(status)`,
+        `CREATE INDEX IF NOT EXISTS idx_audit_logs_type ON audit_logs(type)`,
+        `CREATE INDEX IF NOT EXISTS idx_audit_logs_txid ON audit_logs(txid)`,
+        `CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)`
       ];
 
       let indexCount = 0;
@@ -660,6 +681,94 @@ export async function addHistoricalToken(
         );
       }
     );
+  });
+}
+
+// ============================================================
+// AUDIT LOG HELPERS
+// ============================================================
+
+/**
+ * Save an audit log entry for on-chain transaction tracking
+ * Used to maintain a derivable audit trail from the blockchain
+ * 
+ * @param db - Database connection
+ * @param id - Unique identifier (UUID)
+ * @param type - Type of operation (PLAN_CREATED, BATCH_MINT, SCROLL_RELEASE, TERMINATION)
+ * @param details - Human-readable description
+ * @param txid - Bitcoin transaction ID
+ * @param status - Status (pending or confirmed)
+ */
+export async function saveAuditLog(
+  db: Database,
+  id: string,
+  type: string,
+  details: string,
+  txid: string,
+  status: 'pending' | 'confirmed' = 'pending'
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timestamp = new Date().toISOString();
+    db.run(
+      `INSERT INTO audit_logs (id, type, details, txid, timestamp, status)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, type, details, txid, timestamp, status],
+      (err: Error | null) => err ? reject(err) : resolve()
+    );
+  });
+}
+
+/**
+ * Update audit log status when transaction is confirmed
+ * 
+ * @param db - Database connection
+ * @param id - Unique identifier of the audit log entry
+ * @param status - New status (confirmed)
+ */
+export async function updateAuditLogStatus(
+  db: Database,
+  id: string,
+  status: 'confirmed'
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.run(
+      'UPDATE audit_logs SET status = ? WHERE id = ?',
+      [status, id],
+      (err: Error | null) => err ? reject(err) : resolve()
+    );
+  });
+}
+
+/**
+ * Get audit logs for a specific type or time range
+ * 
+ * @param db - Database connection
+ * @param type - Optional filter by operation type
+ * @param limit - Maximum number of records to return
+ * @param offset - Number of records to skip
+ */
+export async function getAuditLogs(
+  db: Database,
+  type?: string,
+  limit: number = 50,
+  offset: number = 0
+): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    let query = 'SELECT * FROM audit_logs';
+    const params: any[] = [];
+    
+    if (type) {
+      query += ' WHERE type = ?';
+      params.push(type);
+    }
+    
+    query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    
+    db.all(query, params, (err: Error | null, rows: any[]) => {
+      if (err) reject(err);
+      else resolve(rows || []);
+    });
   });
 }
 

@@ -5,7 +5,7 @@ import { createPayrollPlan, getPlans, getPlanById } from './api/plans';
 import { mintPayrollToken, batchHireWorkers, getHiringQuote } from './api/payrollhiring';
 import { getWorkers, getDashboardStats, getWorkerMetadata, addWorker, getWorkerByAddress, updateWorkerTokenUtxo } from './api/workers';
 import { broadcastPackage, checkRpcHealth, getNodeInfo } from './api/broadcast-package';
-import { getPendingApprovals, terminateWorker, approveTermination } from './api/treasury';
+import { getPendingApprovals, terminateWorker, approveTermination, getTreasuryStats, getAuditLogs } from './api/treasury';
 import { 
   registerCompany, 
   getCompany, 
@@ -78,8 +78,8 @@ app.post('/api/payrollhiring/quote', getHiringQuote);
 // WORKER ROUTES
 // ============================================================
 app.get('/api/workers', getWorkers);
-app.post('/api/workers/add', addWorker);  // ✅ ADDED: Route for adding worker to registry
-app.get('/api/workers/:address', getWorkerByAddress);  // ✅ ADDED: Route for worker lookup with historical tokens
+app.post('/api/workers/add', addWorker);
+app.get('/api/workers/:address', getWorkerByAddress);
 app.get('/api/dashboard/stats', getDashboardStats);
 app.get('/api/worker-metadata/:address', getWorkerMetadata);
 app.post('/api/workers/terminate', terminateWorker);
@@ -89,6 +89,8 @@ app.post('/api/workers/update-token-utxo', updateWorkerTokenUtxo);
 // TREASURY ROUTES
 // ============================================================
 app.get('/api/treasury/pending', getPendingApprovals);
+app.get('/api/treasury/stats/:employerAddress', getTreasuryStats);
+app.get('/api/treasury/audit', getAuditLogs);
 app.post('/api/treasury/approve', approveTermination);
 
 // ============================================================

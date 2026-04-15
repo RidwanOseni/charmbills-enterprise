@@ -12,6 +12,7 @@ const TESTNET = { bech32: 'tb', pubKeyHash: 0x6f, scriptHash: 0xc4, wif: 0xef };
 interface WalletContextType {
   address: string | null;
   walletConnected: boolean;
+  taprootPublicKey: string | null;
   connectWallet: () => Promise<void>;
   disconnectWallet: () => void;
   signAndBroadcastPackage: (proverResult: ProverResult, dualUtxoContext: any) => Promise<{
@@ -743,6 +744,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         <WalletContext.Provider value={{ 
             address, 
             walletConnected, 
+            taprootPublicKey,
             connectWallet, 
             disconnectWallet, 
             signAndBroadcastPackage 

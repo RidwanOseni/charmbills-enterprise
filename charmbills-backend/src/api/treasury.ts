@@ -6,8 +6,12 @@ import { generateUnsignedTransactions } from '../charms/proverClient';
 import * as crypto from 'crypto';
 import * as constants from '@shared/constants';
 import { SpellRequest } from '@shared/types';
+import * as scrolls from '../bitcoin/scrollsClient';
 
 const db: Database = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
+
+// Mempool API for on-chain queries
+const MEMPOOL_API = "https://mempool.space/testnet4/api";
 
 // --------------------------------------------------------------------------------
 // Database Helper - Company Lookup
@@ -64,6 +68,164 @@ export async function getPendingApprovals(req: Request, res: Response) {
     } catch (error: any) {
         console.error('[TERMINATION API] Unexpected error:', error);
         res.status(500).json({ error: error.message });
+    }
+}
+
+/**
+ * GET /api/treasury/audit
+ * Retrieves the historical record of treasury actions for the Audit Trail.
+ * Ensures the system is "Derivable" from the database state. [Source 850]
+ */
+export async function getAuditLogs(req: Request, res: Response) {
+    try {
+        db.all(
+            'SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 50', 
+            [], 
+            (err: Error | null, rows: any[]) => {
+                if (err) {
+                    console.error('[TREASURY API] Failed to fetch audit logs:', err);
+                    return res.status(500).json({ error: 'Failed to fetch audit logs' });
+                }
+                // Return rows, ensuring they match the AuditRecord interface
+                res.json(rows || []);
+            }
+        );
+    } catch (error: any) {
+        console.error('[TREASURY API] Unexpected error in getAuditLogs:', error);
+        res.status(500).json({ error: error.message });
+    }
+}
+
+/**
+ * GET /api/treasury/stats/:employerAddress
+ * Aggregates vault liquidity and allocations for the treasury dashboard
+ * Uses Deterministic Nonce Model for isolated vaults per employer [Source 628, 734]
+ * 
+ * - totalLockedSats: ACTUAL physical BTC in the employer's isolated vault (queried from mempool)
+ * - employeeAllocationSats: LIABILITY (sum of active salaries)
+ * - requiredFundingSats: TARGET (allocation + buffer) - Desired State
+ * - freelancerEscrowSats: Sats held in escrow for freelancers
+ * - vaultAddress: Isolated Bitcoin vault address for this employer
+ * 
+ * MODIFIED: Now uses centralized scrollsClient for vault address derivation [Source 629]
+ */
+export async function getTreasuryStats(req: Request, res: Response) {
+    const { employerAddress } = req.params;
+    
+    if (!employerAddress) {
+        return res.status(400).json({ error: 'employerAddress parameter is required' });
+    }
+    
+    console.log(`[TREASURY API] 📊 Fetching treasury stats for: ${employerAddress.substring(0, 20)}...`);
+    
+    try {
+        // =========================================================================
+        // STEP 1: Get the department's appId to use as a nonce source [Source 724]
+        // The appId is unique per department, derived from the anchor UTXO
+        // =========================================================================
+        const plan = await new Promise<any>((resolve, reject) => {
+            db.get(
+                'SELECT appId FROM plans WHERE employerAddress = ? LIMIT 1',
+                [employerAddress],
+                (err: Error | null, row: any) => {
+                    if (err) reject(err);
+                    else resolve(row);
+                }
+            );
+        });
+        
+        if (!plan || !plan.appId) {
+            console.warn(`[TREASURY API] No plan found for employer: ${employerAddress}`);
+            // Return default stats with zero balances
+            return res.json({
+                totalLockedSats: 0,
+                employeeAllocationSats: 0,
+                requiredFundingSats: 0,
+                freelancerEscrowSats: 0,
+                vaultAddress: null,
+                message: 'No active plan found for this employer'
+            });
+        }
+        
+        // =========================================================================
+        // STEP 2: Use centralized scrollsClient to get the isolated vault address [Source 629]
+        // This keeps business logic clean and delegates Scroll interaction to the client
+        // =========================================================================
+        const vaultAddress = await scrolls.getVaultAddress(plan.appId);
+        console.log(`[TREASURY API] Isolated vault address: ${vaultAddress}`);
+        
+        // =========================================================================
+        // STEP 3: Query Mempool for the REAL balance of THIS isolated vault [Source 812]
+        // This will show 0 until the employer actually sends funds to their vault
+        // =========================================================================
+        let actualLockedSats = 0;
+        try {
+            const utxoRes = await axios.get(`${MEMPOOL_API}/address/${vaultAddress}/utxo`, {
+                timeout: 10000
+            });
+            const utxos = utxoRes.data;
+            actualLockedSats = utxos.reduce((sum: number, u: any) => sum + u.value, 0);
+            console.log(`[TREASURY API] Actual vault balance: ${actualLockedSats} sats (${actualLockedSats / 1e8} BTC)`);
+        } catch (mempoolError: any) {
+            console.error(`[TREASURY API] ⚠️ Failed to fetch vault balance from mempool:`, mempoolError.message);
+            actualLockedSats = 0;
+        }
+        
+        // =========================================================================
+        // STEP 4: Calculate Liabilities (Source of Truth from DB) [Source 870]
+        // Fetch all active workers for this employer's plan
+        // =========================================================================
+        const workers = await new Promise<any[]>((resolve, reject) => {
+            db.all(
+                `SELECT w.salarySats, w.currentTokenUtxo, w.status 
+                 FROM workers w
+                 JOIN plans p ON w.planId = p.appId 
+                 WHERE w.status = 'active' AND p.employerAddress = ?`,
+                [employerAddress],
+                (err: Error | null, rows: any[]) => {
+                    if (err) reject(err);
+                    else resolve(rows || []);
+                }
+            );
+        });
+        
+        console.log(`[TREASURY API] Found ${workers.length} active workers`);
+        
+        // Calculate total employee allocation (sum of all active worker salaries) - LIABILITY
+        const employeeAllocationSats = workers.reduce((sum, w) => sum + (w.salarySats || 0), 0);
+        
+        // For demo, freelancer escrow is 0 (can be extended later)
+        const freelancerEscrowSats = 0;
+        
+        // Buffer for transaction fees and operational costs (5% buffer)
+        const bufferSats = Math.floor(employeeAllocationSats * 0.05);
+        
+        // =========================================================================
+        // SEPARATE "TARGET" FROM "ACTUAL" [Source 76, 77]
+        // requiredFundingSats: TARGET (Desired State) = allocation + buffer
+        // totalLockedSats: ACTUAL (Physical BTC in the employer's isolated vault)
+        // =========================================================================
+        const requiredFundingSats = employeeAllocationSats + bufferSats + freelancerEscrowSats;
+        
+        console.log(`[TREASURY API] ✅ Stats calculated:`, {
+            totalLockedSats: actualLockedSats,
+            employeeAllocationSats: employeeAllocationSats,
+            requiredFundingSats: requiredFundingSats,
+            freelancerEscrowSats: freelancerEscrowSats,
+            vaultAddress: vaultAddress
+        });
+        
+        res.json({
+            totalLockedSats: actualLockedSats,        // ACTUAL: Real on-chain data from isolated vault
+            employeeAllocationSats: employeeAllocationSats,    // LIABILITY: Sum of active salaries
+            requiredFundingSats: requiredFundingSats,          // TARGET: Allocation + Buffer (Desired State)
+            freelancerEscrowSats: freelancerEscrowSats,        // Sats held in escrow for freelancers
+            vaultAddress: vaultAddress                         // Isolated Bitcoin vault address for this employer
+        });
+        
+    } catch (error: any) {
+        console.error('[TREASURY API] ❌ Failed to fetch treasury stats:', error);
+        res.status(500).json({ error: `Failed to fetch treasury stats: ${error.message}` });
     }
 }
 
@@ -263,32 +425,52 @@ export async function terminateWorker(req: Request, res: Response) {
  * Allows board members to sign pending multisig transactions with RBAC verification
  * and PSBT state persistence until threshold is met, then broadcasts to network.
  * 
- * Body: { multisigId: string, signerKey: string, signedCommitHex: string, signedSpellHex: string }
+ * MODIFIED: Added Board Override simulation with proper RBAC verification [Source 870]
+ * 
+ * Body: { multisigId: string, signerAddress: string, signedCommitHex?: string, signedSpellHex?: string }
  */
 export async function approveTermination(req: Request, res: Response) {
-    const { multisigId, signerKey, signedCommitHex, signedSpellHex } = req.body;
+    const { multisigId, signerAddress, signedCommitHex, signedSpellHex } = req.body;
 
-    if (!multisigId || !signerKey || !signedCommitHex || !signedSpellHex) {
-        return res.status(400).json({ error: 'multisigId, signerKey, and signed hexes are required' });
+    if (!multisigId || !signerAddress) {
+        return res.status(400).json({ error: 'multisigId and signerAddress are required' });
     }
 
     try {
-        // PRODUCTION FIX: Reliable RBAC using the direct worker_address column
-        const authData: any = await new Promise((resolve, reject) => {
+        // =========================================================================
+        // BOARD OVERRIDE SIMULATION: Verify signer is in the Board Registry [Source 870]
+        // =========================================================================
+        console.log(`[TERMINATION API] 🔐 Verifying board signer: ${signerAddress.substring(0, 20)}...`);
+        
+        // Get the plan's multiSigSigners for this transaction
+        const planData: any = await new Promise((resolve, reject) => {
             db.get(
-                `SELECT p.multiSigSigners FROM multisig_transactions mt
-                 JOIN workers w ON mt.worker_address = w.walletAddress
-                 JOIN plans p ON w.planId = p.appId
+                `SELECT p.multiSigSigners 
+                 FROM plans p 
+                 JOIN workers w ON w.planId = p.appId 
+                 JOIN multisig_transactions mt ON mt.worker_address = w.walletAddress 
                  WHERE mt.id = ?`,
                 [multisigId],
                 (err: Error | null, row: any) => err ? reject(err) : resolve(row)
             );
         });
 
-        const authorizedKeys = JSON.parse(authData?.multiSigSigners || '[]');
-        if (!authorizedKeys.includes(signerKey)) {
-            return res.status(403).json({ error: 'Unauthorized signer: Key not found in Plan NFT authority' });
+        if (!planData) {
+            return res.status(404).json({ error: 'Plan not found for this transaction' });
         }
+
+        const authorizedSigners = JSON.parse(planData.multiSigSigners || '[]');
+        
+        // Check if signer is in the board registry
+        if (!authorizedSigners.includes(signerAddress)) {
+            console.error(`[TERMINATION API] ❌ Unauthorized signer: ${signerAddress.substring(0, 20)}...`);
+            return res.status(403).json({ 
+                error: "Unauthorized: Wallet not in Board Registry",
+                authorizedSigners: authorizedSigners.map((s: string) => s.substring(0, 20) + '...')
+            });
+        }
+        
+        console.log(`[TERMINATION API] ✅ Signer authorized`);
 
         // Get current transaction
         const tx: any = await new Promise((resolve, reject) => {
@@ -309,13 +491,24 @@ export async function approveTermination(req: Request, res: Response) {
 
         // Parse current signers and add new one if not already present
         const currentSigners = JSON.parse(tx.signers_json || '[]');
-        if (!currentSigners.includes(signerKey)) {
-            currentSigners.push(signerKey);
+        if (!currentSigners.includes(signerAddress)) {
+            currentSigners.push(signerAddress);
         }
 
         // Check if we've reached threshold (3-of-5)
-        const threshold = tx.threshold;
+        const threshold = tx.threshold || 3;
         const canBroadcast = currentSigners.length >= threshold;
+
+        // Update the signed hexes if provided
+        let updatedCommitHex = tx.commitTxHex;
+        let updatedSpellHex = tx.spellTxHex;
+        
+        if (signedCommitHex) {
+            updatedCommitHex = signedCommitHex;
+        }
+        if (signedSpellHex) {
+            updatedSpellHex = signedSpellHex;
+        }
 
         // Save the updated hexes to the DB with state persistence [1, 2]
         await new Promise((resolve, reject) => {
@@ -326,8 +519,8 @@ export async function approveTermination(req: Request, res: Response) {
                  WHERE id = ?`,
                 [
                     JSON.stringify(currentSigners), 
-                    signedCommitHex, 
-                    signedSpellHex, 
+                    updatedCommitHex, 
+                    updatedSpellHex, 
                     canBroadcast ? 'ready' : 'pending', 
                     multisigId
                 ],
@@ -343,7 +536,7 @@ export async function approveTermination(req: Request, res: Response) {
                 jsonrpc: "1.0",
                 id: `charmbills-multisig-broadcast-${Date.now()}`,
                 method: "submitpackage",
-                params: [[signedCommitHex, signedSpellHex]]
+                params: [[updatedCommitHex, updatedSpellHex]]
             };
 
             const rpcUser = process.env.RPC_USER;
@@ -357,7 +550,8 @@ export async function approveTermination(req: Request, res: Response) {
 
             const rpcRes = await axios.post(`http://${rpcHost}:${rpcPort}`, rpcRequest, {
                 auth: { username: rpcUser, password: rpcPassword },
-                headers: { 'Content-Type': 'application/json' }
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 30000
             });
 
             if (rpcRes.data.error) {
@@ -377,6 +571,8 @@ export async function approveTermination(req: Request, res: Response) {
             }
         }
 
+        console.log(`[TERMINATION API] ✅ Approval recorded. Total signers: ${currentSigners.length}/${threshold}`);
+        
         res.json({ 
             success: true, 
             canBroadcast, 
