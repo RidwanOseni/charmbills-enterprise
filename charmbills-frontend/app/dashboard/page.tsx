@@ -822,7 +822,7 @@ export default function EmployerDashboard() {
                     <SelectItem value="weekly">Weekly</SelectItem>
                     <SelectItem value="biweekly">Bi-weekly (Standard)</SelectItem>
                     <SelectItem value="monthly">Monthly</SelectItem>
-                    <SelectItem value="demo">Investor Demo (1 Minute)</SelectItem>
+                    <SelectItem value="demo">Investor Demo (8 Minute)</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground mt-1">Sets the on-chain pay period for all workers in this department.</p>

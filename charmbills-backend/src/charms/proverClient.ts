@@ -528,6 +528,8 @@ export async function generateUnsignedTransactions(
         console.log(`[PAYROLL PROVER] Added token app_private_inputs for mint-token`);
     }
 
+    console.log('[PAYROLL PROVER] prev_txs format:', JSON.stringify(requestBody.prev_txs).substring(0, 200));
+
     const jsonString = JSON.stringify(requestBody);
     console.log('[PAYROLL PROVER] ACTUAL JSON being sent (first 1200 chars):', jsonString.substring(0, 1200));
     console.log('[PAYROLL PROVER] ACTUAL JSON at column 1130-1150:', jsonString.substring(1130, 1150));

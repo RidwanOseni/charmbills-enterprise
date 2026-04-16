@@ -1,7 +1,5 @@
 import axios from 'axios';
 import * as constants from '@shared/constants';
-import { Database } from 'sqlite3';
-import * as path from 'path';
 
 // --------------------------------------------------------------------------------
 // Configuration
@@ -22,10 +20,6 @@ const MIN_CONFIRMATIONS = process.env.UTXO_MIN_CONFIRMATIONS
 // Retry configuration for API calls
 const MAX_RETRIES = 3;
 const BASE_TIMEOUT = 30000; // Increased to 30 seconds for production
-
-// Database connection
-const DB_PATH = process.env.PAYROLL_DB_PATH || path.join(process.cwd(), 'payroll.db');
-const db = new Database(DB_PATH);
 
 // --------------------------------------------------------------------------------
 // Types
@@ -76,137 +70,113 @@ class UtxoError extends Error {
  * Locks a UTXO to prevent double-spending across multiple transactions
  * Lock expires after 30 minutes by default
  * 
+ * @param db - Database connection (Turso client)
  * @param utxoId - UTXO ID in format "txid:vout"
  * @param employerAddress - Employer who is locking this UTXO
  * @param ttlMinutes - Time to live in minutes (default: 30)
  */
 export async function lockUtxo(
+  db: any,
   utxoId: string, 
   employerAddress: string,
   ttlMinutes: number = 30
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const now = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + ttlMinutes * 60000).toISOString();
-    
-    db.run(
-      `INSERT INTO locked_utxos (utxoId, employerAddress, lockedAt, expiresAt) 
-       VALUES (?, ?, ?, ?)`,
-      [utxoId, employerAddress, now, expiresAt],
-      (err: Error | null) => {
-        if (err) {
-          // SQLITE_CONSTRAINT means UTXO already locked
-          if (err.message.includes('UNIQUE constraint failed')) {
-            reject(new UtxoError(`UTXO ${utxoId} is already locked`));
-          } else {
-            reject(err);
-          }
-        } else {
-          console.log(`[UTXO Manager] 🔒 Locked UTXO: ${utxoId} for employer ${employerAddress.substring(0, 16)}... expires at ${expiresAt}`);
-          resolve();
-        }
-      }
-    );
-  });
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + ttlMinutes * 60000).toISOString();
+  
+  try {
+    await db.execute({
+      sql: `INSERT INTO locked_utxos (utxoId, employerAddress, lockedAt, expiresAt) 
+            VALUES (?, ?, ?, ?)`,
+      args: [utxoId, employerAddress, now, expiresAt]
+    });
+    console.log(`[UTXO Manager] 🔒 Locked UTXO: ${utxoId} for employer ${employerAddress.substring(0, 16)}... expires at ${expiresAt}`);
+  } catch (err: any) {
+    // SQLITE_CONSTRAINT means UTXO already locked
+    if (err.message && err.message.includes('UNIQUE constraint failed')) {
+      throw new UtxoError(`UTXO ${utxoId} is already locked`);
+    }
+    throw err;
+  }
 }
 
 /**
  * Unlocks a UTXO (call after transaction is broadcast or on failure)
  * 
+ * @param db - Database connection (Turso client)
  * @param utxoId - UTXO ID to unlock
  */
-export async function unlockUtxo(utxoId: string): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'DELETE FROM locked_utxos WHERE utxoId = ?',
-      [utxoId],
-      function(err: Error | null) {
-        if (err) {
-          reject(err);
-        } else {
-          if (this.changes > 0) {
-            console.log(`[UTXO Manager] 🔓 Unlocked UTXO: ${utxoId}`);
-          }
-          resolve(this.changes > 0);
-        }
-      }
-    );
+export async function unlockUtxo(db: any, utxoId: string): Promise<boolean> {
+  const result = await db.execute({
+    sql: 'DELETE FROM locked_utxos WHERE utxoId = ?',
+    args: [utxoId]
   });
+  
+  const changes = result.rowsAffected || 0;
+  if (changes > 0) {
+    console.log(`[UTXO Manager] 🔓 Unlocked UTXO: ${utxoId}`);
+  }
+  return changes > 0;
 }
 
 /**
  * Checks if a UTXO is currently locked
  * 
+ * @param db - Database connection (Turso client)
  * @param utxoId - UTXO ID to check
  */
-export async function isUtxoLocked(utxoId: string): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT utxoId FROM locked_utxos WHERE utxoId = ? AND expiresAt > ?',
-      [utxoId, new Date().toISOString()],
-      (err: Error | null, row: any) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(!!row);
-        }
-      }
-    );
+export async function isUtxoLocked(db: any, utxoId: string): Promise<boolean> {
+  const result = await db.execute({
+    sql: 'SELECT utxoId FROM locked_utxos WHERE utxoId = ? AND expiresAt > ?',
+    args: [utxoId, new Date().toISOString()]
   });
+  
+  return result.rows && result.rows.length > 0;
 }
 
 /**
  * Gets all currently locked UTXOs (not expired)
+ * 
+ * @param db - Database connection (Turso client)
  */
-export async function getLockedUtxos(): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    db.all(
-      'SELECT utxoId FROM locked_utxos WHERE expiresAt > ?',
-      [new Date().toISOString()],
-      (err: Error | null, rows: any[]) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rows.map(r => r.utxoId));
-        }
-      }
-    );
+export async function getLockedUtxos(db: any): Promise<string[]> {
+  const result = await db.execute({
+    sql: 'SELECT utxoId FROM locked_utxos WHERE expiresAt > ?',
+    args: [new Date().toISOString()]
   });
+  
+  return result.rows ? result.rows.map((r: any) => r.utxoId) : [];
 }
 
 /**
  * Gets locked UTXOs for a specific employer
  * 
+ * @param db - Database connection (Turso client)
  * @param employerAddress - Employer address to filter by
  */
-export async function getLockedUtxosForEmployer(employerAddress: string): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    db.all(
-      'SELECT utxoId FROM locked_utxos WHERE employerAddress = ? AND expiresAt > ?',
-      [employerAddress, new Date().toISOString()],
-      (err: Error | null, rows: any[]) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rows.map(r => r.utxoId));
-        }
-      }
-    );
+export async function getLockedUtxosForEmployer(db: any, employerAddress: string): Promise<string[]> {
+  const result = await db.execute({
+    sql: 'SELECT utxoId FROM locked_utxos WHERE employerAddress = ? AND expiresAt > ?',
+    args: [employerAddress, new Date().toISOString()]
   });
+  
+  return result.rows ? result.rows.map((r: any) => r.utxoId) : [];
 }
 
 /**
  * Filters UTXOs by removing locked ones
  * 
+ * @param db - Database connection (Turso client)
  * @param utxos - Array of UTXOs to filter
  * @param excludeIds - Additional UTXO IDs to exclude (for session-level exclusion)
  */
 export async function filterEligibleUtxos(
+  db: any,
   utxos: Utxo[], 
   excludeIds: string[] = []
 ): Promise<Utxo[]> {
   // Get all locked UTXOs from database
-  const lockedIds = await getLockedUtxos();
+  const lockedIds = await getLockedUtxos(db);
   
   // Combine locked IDs with session-level exclusion list
   const allExcluded = [...new Set([...lockedIds, ...excludeIds])];
@@ -224,24 +194,20 @@ export async function filterEligibleUtxos(
 
 /**
  * Cleans up expired locks (should be called periodically or on startup)
+ * 
+ * @param db - Database connection (Turso client)
  */
-export async function cleanupExpiredLocks(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'DELETE FROM locked_utxos WHERE expiresAt <= ?',
-      [new Date().toISOString()],
-      function(err: Error | null) {
-        if (err) {
-          reject(err);
-        } else {
-          if (this.changes > 0) {
-            console.log(`[UTXO Manager] 🧹 Cleaned up ${this.changes} expired UTXO locks`);
-          }
-          resolve(this.changes);
-        }
-      }
-    );
+export async function cleanupExpiredLocks(db: any): Promise<number> {
+  const result = await db.execute({
+    sql: 'DELETE FROM locked_utxos WHERE expiresAt <= ?',
+    args: [new Date().toISOString()]
   });
+  
+  const changes = result.rowsAffected || 0;
+  if (changes > 0) {
+    console.log(`[UTXO Manager] 🧹 Cleaned up ${changes} expired UTXO locks`);
+  }
+  return changes;
 }
 
 // --------------------------------------------------------------------------------
@@ -391,6 +357,7 @@ export async function selectOptimalUtxo(
  * Main function: Dynamically selects the smallest UTXO that covers the required amount
  * Uses database-backed locking to prevent double-spending
  * 
+ * @param db - Database connection (Turso client)
  * @param address - Treasury address to check
  * @param minAmount - Minimum satoshis needed (e.g., 50000 for fees + outputs)
  * @param employerAddress - Employer address for lock ownership (required)
@@ -398,6 +365,7 @@ export async function selectOptimalUtxo(
  * @returns FundingUtxo object with ID, value, and raw hex
  */
 export async function getDynamicFundingUtxo(
+  db: any,
   address: string, 
   minAmount: number,
   employerAddress: string,
@@ -412,14 +380,14 @@ export async function getDynamicFundingUtxo(
   console.log(`[UTXO Manager:${requestId}] Session excludes: ${sessionExcludeIds.length} UTXO(s)`);
   
   // Clean up expired locks on each request
-  await cleanupExpiredLocks();
+  await cleanupExpiredLocks(db);
   
   try {
     // Step 1: Fetch all UTXOs for address (with retries)
     const allUtxos = await fetchAddressUtxos(address);
     
     // Step 2: Filter out locked UTXOs and session-excluded UTXOs
-    const eligibleUtxos = await filterEligibleUtxos(allUtxos, sessionExcludeIds);
+    const eligibleUtxos = await filterEligibleUtxos(db, allUtxos, sessionExcludeIds);
     
     console.log(`[UTXO Manager:${requestId}] Eligible after filtering: ${eligibleUtxos.length} / ${allUtxos.length}`);
     
@@ -428,7 +396,7 @@ export async function getDynamicFundingUtxo(
     
     // Step 4: Lock the selected UTXO in database
     const utxoId = `${selected.txid}:${selected.vout}`;
-    await lockUtxo(utxoId, employerAddress);
+    await lockUtxo(db, utxoId, employerAddress);
     
     // Step 5: Fetch raw transaction hex
     const hex = await fetchTransactionHex(selected.txid);
@@ -476,9 +444,3 @@ export function estimateRequiredSats(
   // Total + buffer
   return outputsCost + estimatedFee + extraBuffer;
 }
-
-// --------------------------------------------------------------------------------
-// Export database for external cleanup if needed
-// --------------------------------------------------------------------------------
-
-export { db };

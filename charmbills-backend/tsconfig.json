@@ -18,5 +18,5 @@
     "resolveJsonModule": true
   },
   "include": ["src/**/*", "../shared"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": ["src/runMintFlow.ts", "src/**/*.test.ts", "node_modules", "dist"]
 }

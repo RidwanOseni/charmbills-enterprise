@@ -1,5 +1,4 @@
 import { Request, Response } from 'express';
-import { Database } from 'sqlite3';
 import axios from 'axios';
 import { fetchTransactionHex } from '../lib/utxo-manager';
 import { generateUnsignedTransactions } from '../charms/proverClient';
@@ -8,13 +7,11 @@ import * as constants from '@shared/constants';
 import { SpellRequest } from '@shared/types';
 import * as scrolls from '../bitcoin/scrollsClient';
 
-const db: Database = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
-
 // Mempool API for on-chain queries
 const MEMPOOL_API = "https://mempool.space/testnet4/api";
 
 // --------------------------------------------------------------------------------
-// Database Helper - Company Lookup
+// Database Helper - Company Lookup (Turso version)
 // --------------------------------------------------------------------------------
 
 interface CompanyRecord {
@@ -26,19 +23,14 @@ interface CompanyRecord {
 }
 
 /**
- * Get company configuration by employer address
+ * Get company configuration by employer address (Turso version)
  */
-async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRecord | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
-      [employerAddress],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+async function getCompanyByEmployer(db: any, employerAddress: string): Promise<CompanyRecord | null> {
+  const result = await db.execute({
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+    args: [employerAddress]
   });
+  return result.rows[0] || null;
 }
 
 /**
@@ -46,28 +38,26 @@ async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRec
  * Fetches all pending multisig actions requiring board approval [2]
  */
 export async function getPendingApprovals(req: Request, res: Response) {
+    const db = req.app.locals.db;
+    
     try {
-        db.all(
-            'SELECT * FROM multisig_transactions WHERE status = "pending" OR status = "ready" ORDER BY createdAt DESC', 
-            [], 
-            (err: Error | null, rows: any[]) => {
-                if (err) {
-                    console.error('[TERMINATION API] Failed to fetch pending approvals:', err);
-                    return res.status(500).json({ error: 'Failed to fetch pending approvals' });
-                }
-                
-                // Parse signers_json back to array for frontend
-                const parsedRows = rows.map(row => ({
-                    ...row,
-                    signers: row.signers_json ? JSON.parse(row.signers_json) : []
-                }));
-                
-                res.json(parsedRows);
-            }
-        );
+        const result = await db.execute({
+            sql: 'SELECT * FROM multisig_transactions WHERE status IN (?, ?) ORDER BY createdAt DESC',
+            args: ['pending', 'ready']
+        });
+        
+        const rows = result.rows || [];
+        
+        // Parse signers_json back to array for frontend
+        const parsedRows = rows.map((row: any) => ({
+            ...row,
+            signers: row.signers_json ? JSON.parse(row.signers_json) : []
+        }));
+        
+        res.json(parsedRows);
     } catch (error: any) {
-        console.error('[TERMINATION API] Unexpected error:', error);
-        res.status(500).json({ error: error.message });
+        console.error('[TERMINATION API] Failed to fetch pending approvals:', error);
+        res.status(500).json({ error: 'Failed to fetch pending approvals' });
     }
 }
 
@@ -77,22 +67,19 @@ export async function getPendingApprovals(req: Request, res: Response) {
  * Ensures the system is "Derivable" from the database state. [Source 850]
  */
 export async function getAuditLogs(req: Request, res: Response) {
+    const db = req.app.locals.db;
+    
     try {
-        db.all(
-            'SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 50', 
-            [], 
-            (err: Error | null, rows: any[]) => {
-                if (err) {
-                    console.error('[TREASURY API] Failed to fetch audit logs:', err);
-                    return res.status(500).json({ error: 'Failed to fetch audit logs' });
-                }
-                // Return rows, ensuring they match the AuditRecord interface
-                res.json(rows || []);
-            }
-        );
+        const result = await db.execute({
+            sql: 'SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 50',
+            args: []
+        });
+        
+        const rows = result.rows || [];
+        res.json(rows);
     } catch (error: any) {
-        console.error('[TREASURY API] Unexpected error in getAuditLogs:', error);
-        res.status(500).json({ error: error.message });
+        console.error('[TREASURY API] Failed to fetch audit logs:', error);
+        res.status(500).json({ error: 'Failed to fetch audit logs' });
     }
 }
 
@@ -110,6 +97,7 @@ export async function getAuditLogs(req: Request, res: Response) {
  * MODIFIED: Now uses centralized scrollsClient for vault address derivation [Source 629]
  */
 export async function getTreasuryStats(req: Request, res: Response) {
+    const db = req.app.locals.db;
     const { employerAddress } = req.params;
     
     if (!employerAddress) {
@@ -123,16 +111,12 @@ export async function getTreasuryStats(req: Request, res: Response) {
         // STEP 1: Get the department's appId to use as a nonce source [Source 724]
         // The appId is unique per department, derived from the anchor UTXO
         // =========================================================================
-        const plan = await new Promise<any>((resolve, reject) => {
-            db.get(
-                'SELECT appId FROM plans WHERE employerAddress = ? LIMIT 1',
-                [employerAddress],
-                (err: Error | null, row: any) => {
-                    if (err) reject(err);
-                    else resolve(row);
-                }
-            );
+        const planResult = await db.execute({
+            sql: 'SELECT appId FROM plans WHERE employerAddress = ? LIMIT 1',
+            args: [employerAddress]
         });
+        
+        const plan = planResult.rows[0];
         
         if (!plan || !plan.appId) {
             console.warn(`[TREASURY API] No plan found for employer: ${employerAddress}`);
@@ -175,24 +159,20 @@ export async function getTreasuryStats(req: Request, res: Response) {
         // STEP 4: Calculate Liabilities (Source of Truth from DB) [Source 870]
         // Fetch all active workers for this employer's plan
         // =========================================================================
-        const workers = await new Promise<any[]>((resolve, reject) => {
-            db.all(
-                `SELECT w.salarySats, w.currentTokenUtxo, w.status 
-                 FROM workers w
-                 JOIN plans p ON w.planId = p.appId 
-                 WHERE w.status = 'active' AND p.employerAddress = ?`,
-                [employerAddress],
-                (err: Error | null, rows: any[]) => {
-                    if (err) reject(err);
-                    else resolve(rows || []);
-                }
-            );
+        const workersResult = await db.execute({
+            sql: `SELECT w.salarySats, w.currentTokenUtxo, w.status 
+                  FROM workers w
+                  JOIN plans p ON w.planId = p.appId 
+                  WHERE w.status = 'active' AND p.employerAddress = ?`,
+            args: [employerAddress]
         });
+        
+        const workers = workersResult.rows || [];
         
         console.log(`[TREASURY API] Found ${workers.length} active workers`);
         
         // Calculate total employee allocation (sum of all active worker salaries) - LIABILITY
-        const employeeAllocationSats = workers.reduce((sum, w) => sum + (w.salarySats || 0), 0);
+        const employeeAllocationSats = workers.reduce((sum: number, w: any) => sum + (w.salarySats || 0), 0);
         
         // For demo, freelancer escrow is 0 (can be extended later)
         const freelancerEscrowSats = 0;
@@ -244,6 +224,7 @@ export async function getTreasuryStats(req: Request, res: Response) {
  * }
  */
 export async function terminateWorker(req: Request, res: Response) {
+    const db = req.app.locals.db;
     const { 
         walletAddress, 
         employerAddress, 
@@ -280,7 +261,7 @@ export async function terminateWorker(req: Request, res: Response) {
         // ----------------------------------------------------------------------------
         console.log(`[TERMINATION API] 🔍 Looking up company for employer: ${employerAddress.substring(0, 20)}...`);
         
-        const company = await getCompanyByEmployer(employerAddress);
+        const company = await getCompanyByEmployer(db, employerAddress);
         
         if (!company || !company.treasuryHexDest) {
             console.error(`[TERMINATION API] ❌ Company not found for employer: ${employerAddress}`);
@@ -296,36 +277,28 @@ export async function terminateWorker(req: Request, res: Response) {
         });
         
         // Begin transaction for atomicity
-        await new Promise((resolve, reject) => {
-            db.run('BEGIN TRANSACTION', (err: Error | null) => err ? reject(err) : resolve(null));
-        });
+        await db.execute({ sql: 'BEGIN TRANSACTION', args: [] });
 
         // Step 2: Off-chain: Update status in WorkerCache to prevent future funding [4]
-        await new Promise((resolve, reject) => {
-            db.run(
-                'UPDATE workers SET status = "terminated" WHERE walletAddress = ?', 
-                [walletAddress], 
-                function(this: any, err: Error | null) {
-                    if (err) return reject(err);
-                    if (this.changes === 0) {
-                        reject(new Error(`Worker with address ${walletAddress} not found`));
-                    }
-                    resolve(null);
-                }
-            );
+        const updateResult = await db.execute({
+            sql: 'UPDATE workers SET status = "terminated" WHERE walletAddress = ?',
+            args: [walletAddress]
         });
+        
+        if (updateResult.rowsAffected === 0) {
+            throw new Error(`Worker with address ${walletAddress} not found`);
+        }
 
         // Step 3: Get vault details - specifically target the unspent token currently held by the worker [17]
-        const vaultDetails: any = await new Promise((resolve, reject) => {
-            db.get(
-                `SELECT p.appId, w.currentTokenUtxo, p.multiSigSigners, p.ticker
-                 FROM workers w
-                 JOIN plans p ON w.planId = p.appId
-                 WHERE w.walletAddress = ? AND w.status = 'active'`,
-                [walletAddress],
-                (err: Error | null, row: any) => err ? reject(err) : resolve(row)
-            );
+        const vaultResult = await db.execute({
+            sql: `SELECT p.appId, w.currentTokenUtxo, p.multiSigSigners, p.ticker
+                  FROM workers w
+                  JOIN plans p ON w.planId = p.appId
+                  WHERE w.walletAddress = ? AND w.status = 'active'`,
+            args: [walletAddress]
         });
+        
+        const vaultDetails = vaultResult.rows[0];
 
         if (!vaultDetails || !vaultDetails.currentTokenUtxo) {
             throw new Error('No active payroll vault found for this worker');
@@ -367,28 +340,23 @@ export async function terminateWorker(req: Request, res: Response) {
             ? `Emergency Freeze: Worker ${walletAddress} - ${reason}`
             : `Emergency Freeze: Worker ${walletAddress}`;
 
-        await new Promise((resolve, reject) => {
-            db.run(
-                `INSERT INTO multisig_transactions 
-                (id, type, category, description, worker_address, employerAddress, commitTxHex, spellTxHex, threshold, signers_json, createdAt, status) 
-                VALUES (?, 'vault-freeze', 'corporate', ?, ?, ?, ?, ?, 3, '[]', ?, 'pending')`,
-                [
-                    multisigId,
-                    description,
-                    walletAddress,              // worker_address column
-                    employerAddress,            // employerAddress column
-                    freezeSpell.commitTxHex,
-                    freezeSpell.spellTxHex,
-                    new Date().toISOString()
-                ],
-                (err: Error | null) => err ? reject(err) : resolve(null)
-            );
+        await db.execute({
+            sql: `INSERT INTO multisig_transactions 
+                  (id, type, category, description, worker_address, employerAddress, commitTxHex, spellTxHex, threshold, signers_json, createdAt, status) 
+                  VALUES (?, 'vault-freeze', 'corporate', ?, ?, ?, ?, ?, 3, '[]', ?, 'pending')`,
+            args: [
+                multisigId,
+                description,
+                walletAddress,
+                employerAddress,
+                freezeSpell.commitTxHex,
+                freezeSpell.spellTxHex,
+                new Date().toISOString()
+            ]
         });
 
         // Commit transaction
-        await new Promise((resolve, reject) => {
-            db.run('COMMIT', (err: Error | null) => err ? reject(err) : resolve(null));
-        });
+        await db.execute({ sql: 'COMMIT', args: [] });
 
         console.log(`[TERMINATION API] ✅ Worker ${walletAddress} terminated. Board approval ID: ${multisigId}`);
 
@@ -405,9 +373,7 @@ export async function terminateWorker(req: Request, res: Response) {
 
     } catch (error: any) {
         // Rollback on error
-        await new Promise((resolve) => {
-            db.run('ROLLBACK', () => resolve(null));
-        });
+        await db.execute({ sql: 'ROLLBACK', args: [] }).catch(() => {});
 
         console.error('[TERMINATION API] ❌ Termination failed:', error);
         
@@ -430,6 +396,7 @@ export async function terminateWorker(req: Request, res: Response) {
  * Body: { multisigId: string, signerAddress: string, signedCommitHex?: string, signedSpellHex?: string }
  */
 export async function approveTermination(req: Request, res: Response) {
+    const db = req.app.locals.db;
     const { multisigId, signerAddress, signedCommitHex, signedSpellHex } = req.body;
 
     if (!multisigId || !signerAddress) {
@@ -443,17 +410,16 @@ export async function approveTermination(req: Request, res: Response) {
         console.log(`[TERMINATION API] 🔐 Verifying board signer: ${signerAddress.substring(0, 20)}...`);
         
         // Get the plan's multiSigSigners for this transaction
-        const planData: any = await new Promise((resolve, reject) => {
-            db.get(
-                `SELECT p.multiSigSigners 
-                 FROM plans p 
-                 JOIN workers w ON w.planId = p.appId 
-                 JOIN multisig_transactions mt ON mt.worker_address = w.walletAddress 
-                 WHERE mt.id = ?`,
-                [multisigId],
-                (err: Error | null, row: any) => err ? reject(err) : resolve(row)
-            );
+        const planResult = await db.execute({
+            sql: `SELECT p.multiSigSigners 
+                  FROM plans p 
+                  JOIN workers w ON w.planId = p.appId 
+                  JOIN multisig_transactions mt ON mt.worker_address = w.walletAddress 
+                  WHERE mt.id = ?`,
+            args: [multisigId]
         });
+        
+        const planData = planResult.rows[0];
 
         if (!planData) {
             return res.status(404).json({ error: 'Plan not found for this transaction' });
@@ -473,13 +439,12 @@ export async function approveTermination(req: Request, res: Response) {
         console.log(`[TERMINATION API] ✅ Signer authorized`);
 
         // Get current transaction
-        const tx: any = await new Promise((resolve, reject) => {
-            db.get(
-                'SELECT * FROM multisig_transactions WHERE id = ?',
-                [multisigId],
-                (err: Error | null, row: any) => err ? reject(err) : resolve(row)
-            );
+        const txResult = await db.execute({
+            sql: 'SELECT * FROM multisig_transactions WHERE id = ?',
+            args: [multisigId]
         });
+        
+        const tx = txResult.rows[0];
 
         if (!tx) {
             return res.status(404).json({ error: 'Multisig transaction not found' });
@@ -511,21 +476,18 @@ export async function approveTermination(req: Request, res: Response) {
         }
 
         // Save the updated hexes to the DB with state persistence [1, 2]
-        await new Promise((resolve, reject) => {
-            db.run(
-                `UPDATE multisig_transactions 
-                 SET signers_json = ?, commitTxHex = ?, spellTxHex = ?, 
-                     status = ? 
-                 WHERE id = ?`,
-                [
-                    JSON.stringify(currentSigners), 
-                    updatedCommitHex, 
-                    updatedSpellHex, 
-                    canBroadcast ? 'ready' : 'pending', 
-                    multisigId
-                ],
-                (err: Error | null) => err ? reject(err) : resolve(null)
-            );
+        await db.execute({
+            sql: `UPDATE multisig_transactions 
+                  SET signers_json = ?, commitTxHex = ?, spellTxHex = ?, 
+                      status = ? 
+                  WHERE id = ?`,
+            args: [
+                JSON.stringify(currentSigners), 
+                updatedCommitHex, 
+                updatedSpellHex, 
+                canBroadcast ? 'ready' : 'pending', 
+                multisigId
+            ]
         });
 
         // Trigger on-chain broadcast if threshold met [3-5]
@@ -559,12 +521,9 @@ export async function approveTermination(req: Request, res: Response) {
             }
 
             if (rpcRes.data.result) {
-                await new Promise((resolve, reject) => {
-                    db.run(
-                        'UPDATE multisig_transactions SET status = "broadcasted" WHERE id = ?', 
-                        [multisigId],
-                        (err: Error | null) => err ? reject(err) : resolve(null)
-                    );
+                await db.execute({
+                    sql: 'UPDATE multisig_transactions SET status = "broadcasted" WHERE id = ?',
+                    args: [multisigId]
                 });
                 
                 console.log(`[TERMINATION API] ✅ Successfully broadcasted ${multisigId}`);

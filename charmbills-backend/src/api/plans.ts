@@ -1,5 +1,4 @@
 import { Request, Response } from 'express';
-import { Database } from 'sqlite3';
 import { generateUnsignedTransactions } from '../charms/proverClient'; 
 import { encryptPayrollData } from '@shared/encryption';
 import { pinToIPFS } from '../lib/ipfs-pinner';
@@ -7,8 +6,7 @@ import { SpellRequest, ProverResult } from '@shared/types';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
-
-const db = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
+import { syncIndexer } from '../lib/indexer';
 
 // --------------------------------------------------------------------------------
 // Types
@@ -181,23 +179,18 @@ function validatePayrollPlanRequest(body: any): asserts body is CreatePayrollPla
 }
 
 // --------------------------------------------------------------------------------
-// Database Helper Functions
+// Database Helper Functions (with db parameter)
 // --------------------------------------------------------------------------------
 
 /**
  * Look up company by employer address
  */
-async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRecord | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
-      [employerAddress],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+async function getCompanyByEmployer(db: any, employerAddress: string): Promise<CompanyRecord | null> {
+  const result = await db.execute({
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+    args: [employerAddress]
   });
+  return result.rows[0] || null;
 }
 
 /**
@@ -205,6 +198,7 @@ async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRec
  * Now includes remaining field (department budget)
  */
 async function savePlanRecord(
+  db: any,
   appId: string,
   planUtxo: string,
   anchorUtxo: string,
@@ -215,26 +209,24 @@ async function savePlanRecord(
   metadataHash: string,
   scrollPolicy: number
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `INSERT INTO plans (appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt, updatedAt) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        appId, 
-        planUtxo, 
-        anchorUtxo,
-        constants.PAYROLL_NFT_TICKER, 
-        employerAddress,
-        department, 
-        payPeriodSeconds, 
-        remaining,
-        metadataHash, 
-        scrollPolicy, 
-        new Date().toISOString(),
-        new Date().toISOString()
-      ],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  const now = new Date().toISOString();
+  await db.execute({
+    sql: `INSERT INTO plans (appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt, updatedAt) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      appId, 
+      planUtxo, 
+      anchorUtxo,
+      constants.PAYROLL_NFT_TICKER, 
+      employerAddress,
+      department, 
+      payPeriodSeconds, 
+      remaining,
+      metadataHash, 
+      scrollPolicy, 
+      now,
+      now
+    ]
   });
 }
 
@@ -293,6 +285,7 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
  */
 export async function createPayrollPlan(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
+  const db = req.app.locals.db;
   
   console.log(`\n[PLANS API:${requestId}] ===== START createPayrollPlan =====`);
   
@@ -372,7 +365,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔍 Looking up company for employer: ${employerAddress.substring(0, 20)}...`);
     
-    const company = await getCompanyByEmployer(employerAddress);
+    const company = await getCompanyByEmployer(db, employerAddress);
     
     if (!company) {
       console.error(`[PLANS API:${requestId}] ❌ Company not found for employer: ${employerAddress}`);
@@ -400,7 +393,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     
     // No environment key - using encryptionEntropy from wallet signature
     // NOTE: No salary or role in department-level metadata
-    const encryptedBlob = encryptPayrollData({
+    const encryptedBlob = await encryptPayrollData({
       department,
       remaining,           // Include budget in encrypted metadata
       created: new Date().toISOString(),
@@ -425,12 +418,9 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     // Step 6: Persist CID mapping for indexer lookup [7]
     // ----------------------------------------------------------------------------
-    await new Promise((resolve, reject) => {
-      db.run(
-        'INSERT OR IGNORE INTO ipfs_mappings (metadataHash, cid, createdAt) VALUES (?, ?, ?)',
-        [metadataHash, cid, new Date().toISOString()],
-        (err: Error | null) => err ? reject(err) : resolve(null)
-      );
+    await db.execute({
+      sql: 'INSERT OR IGNORE INTO ipfs_mappings (metadataHash, cid, createdAt) VALUES (?, ?, ?)',
+      args: [metadataHash, cid, new Date().toISOString()]
     });
     
     console.log(`[PLANS API:${requestId}] ✅ CID Mapping saved: ${metadataHash.substring(0, 16)}... -> ${cid}`);
@@ -502,6 +492,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
     console.log(`[PLANS API:${requestId}] 💾 Saving plan record...`);
     
     await savePlanRecord(
+      db,
       appId,
       planUtxo,
       anchorUtxo,
@@ -575,48 +566,49 @@ export async function createPayrollPlan(req: Request, res: Response) {
  * Endpoint: GET /api/plans
  */
 export async function getPlans(req: Request, res: Response) {
+  const db = req.app.locals.db;
+  
   try {
+    // Trigger lazy indexer sync to update blockchain state before returning data
+    await syncIndexer(db, 50);
+    
     const { department, employerAddress, limit = '50', offset = '0' } = req.query;
     
-    let query = 'SELECT appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE 1=1';
-    const params: any[] = [];
+    let sql = 'SELECT appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE 1=1';
+    const args: any[] = [];
     
     if (department) {
-      query += ' AND department = ?';
-      params.push(department);
+      sql += ' AND department = ?';
+      args.push(department);
     }
     
     if (employerAddress) {
-      query += ' AND employerAddress = ?';
-      params.push(employerAddress);
+      sql += ' AND employerAddress = ?';
+      args.push(employerAddress);
     }
     
-    query += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit as string), parseInt(offset as string));
+    sql += ' ORDER BY createdAt DESC LIMIT ? OFFSET ?';
+    args.push(parseInt(limit as string), parseInt(offset as string));
     
-    db.all(query, params, (err: Error | null, rows: any[]) => {
-      if (err) {
-        console.error('[PLANS API] Error fetching plans:', err);
-        return res.status(500).json({ error: err.message });
-      }
-      
-      // Return full data including anchorUtxo (required for mint-token witness)
-      const rowsWithAnchor = rows.map(row => ({
-        appId: row.appId,
-        nftUtxoId: row.nftUtxoId,
-        anchorUtxo: row.anchorUtxo,
-        ticker: row.ticker,
-        employerAddress: row.employerAddress,
-        department: row.department,
-        payPeriodSeconds: row.payPeriodSeconds,
-        remaining: row.remaining,
-        metadataHash: row.metadataHash,
-        scrollPolicy: row.scrollPolicy,
-        createdAt: row.createdAt
-      }));
-      
-      res.json(rowsWithAnchor);
-    });
+    const result = await db.execute({ sql, args });
+    const rows = result.rows || [];
+    
+    // Return full data including anchorUtxo (required for mint-token witness)
+    const rowsWithAnchor = rows.map((row: any) => ({
+      appId: row.appId,
+      nftUtxoId: row.nftUtxoId,
+      anchorUtxo: row.anchorUtxo,
+      ticker: row.ticker,
+      employerAddress: row.employerAddress,
+      department: row.department,
+      payPeriodSeconds: row.payPeriodSeconds,
+      remaining: row.remaining,
+      metadataHash: row.metadataHash,
+      scrollPolicy: row.scrollPolicy,
+      createdAt: row.createdAt
+    }));
+    
+    res.json(rowsWithAnchor);
   } catch (error: any) {
     console.error('[PLANS API] Error in getPlans:', error);
     res.status(500).json({ error: error.message });
@@ -632,44 +624,45 @@ export async function getPlans(req: Request, res: Response) {
  * Endpoint: GET /api/plans/:appId
  */
 export async function getPlanById(req: Request, res: Response) {
+  const db = req.app.locals.db;
+  
   try {
+    // Trigger lazy indexer sync to update blockchain state before returning data
+    await syncIndexer(db, 50);
+    
     const { appId } = req.params;
     
     if (!appId) {
       return res.status(400).json({ error: 'appId is required' });
     }
     
-    db.get(
-      'SELECT appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE appId = ?',
-      [appId],
-      (err: Error | null, row: any) => {
-        if (err) {
-          console.error('[PLANS API] Error fetching plan:', err);
-          return res.status(500).json({ error: err.message });
-        }
-        
-        if (!row) {
-          return res.status(404).json({ error: 'Plan not found' });
-        }
-        
-        // Return full data including anchorUtxo (required for mint-token witness)
-        const rowWithAnchor = {
-          appId: row.appId,
-          nftUtxoId: row.nftUtxoId,
-          anchorUtxo: row.anchorUtxo,
-          ticker: row.ticker,
-          employerAddress: row.employerAddress,
-          department: row.department,
-          payPeriodSeconds: row.payPeriodSeconds,
-          remaining: row.remaining,
-          metadataHash: row.metadataHash,
-          scrollPolicy: row.scrollPolicy,
-          createdAt: row.createdAt
-        };
-        
-        res.json(rowWithAnchor);
-      }
-    );
+    const result = await db.execute({
+      sql: 'SELECT appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt FROM plans WHERE appId = ?',
+      args: [appId]
+    });
+    
+    const row = result.rows[0];
+    
+    if (!row) {
+      return res.status(404).json({ error: 'Plan not found' });
+    }
+    
+    // Return full data including anchorUtxo (required for mint-token witness)
+    const rowWithAnchor = {
+      appId: row.appId,
+      nftUtxoId: row.nftUtxoId,
+      anchorUtxo: row.anchorUtxo,
+      ticker: row.ticker,
+      employerAddress: row.employerAddress,
+      department: row.department,
+      payPeriodSeconds: row.payPeriodSeconds,
+      remaining: row.remaining,
+      metadataHash: row.metadataHash,
+      scrollPolicy: row.scrollPolicy,
+      createdAt: row.createdAt
+    };
+    
+    res.json(rowWithAnchor);
   } catch (error: any) {
     console.error('[PLANS API] Error in getPlanById:', error);
     res.status(500).json({ error: error.message });

@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import { Database } from 'sqlite3';
 import { createPayrollPlan, getPlans, getPlanById } from './api/plans';
 import { mintPayrollToken, batchHireWorkers, getHiringQuote } from './api/payrollhiring';
 import { getWorkers, getDashboardStats, getWorkerMetadata, addWorker, getWorkerByAddress, updateWorkerTokenUtxo } from './api/workers';
@@ -14,13 +13,15 @@ import {
   updateTreasuryHex 
 } from './api/companies';
 import { initDatabase } from './db/schema';
+import { turso } from './db/client';
 
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-// Database connection
-const dbPath = process.env.PAYROLL_DB_PATH || './payroll.db';
-const db = new Database(dbPath);
+// ============================================================
+// Database connection - Using Turso instead of local SQLite
+// ============================================================
+const db = turso;
 
 // ============================================================
 // MIDDLEWARE
@@ -159,30 +160,19 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
  */
 async function startServer() {
   try {
-    console.log('🔧 Initializing database at:', dbPath);
-    
-    // Ensure database directory exists
-    const fs = require('fs');
-    const path = require('path');
-    const dir = path.dirname(dbPath);
-    if (dir !== '.' && !fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-      console.log('📁 Created database directory:', dir);
-    }
+    console.log('🔧 Initializing database connection with Turso...');
     
     // Initialize tables
     await initDatabase(db);
     console.log('✅ Database tables created/verified');
     
-    // Verify companies table exists
-    const tableCheck = await new Promise((resolve, reject) => {
-      db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='companies'", (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-      });
+    // Verify companies table exists using Turso syntax
+    const tableCheck = await db.execute({
+      sql: "SELECT name FROM sqlite_master WHERE type='table' AND name='companies'",
+      args: []
     });
     
-    if (!tableCheck) {
+    if (!tableCheck.rows || tableCheck.rows.length === 0) {
       throw new Error('companies table not found after initialization');
     }
     console.log('✅ Verified companies table exists');
@@ -196,7 +186,7 @@ async function startServer() {
 ║   Version: 1.0.0                                          ║
 ║   Port: ${PORT}                                              ║
 ║   Environment: ${process.env.NODE_ENV || 'development'}                         ║
-║   Database: ${dbPath}                                      ║
+║   Database: Turso (Cloud SQLite)                          ║
 ║                                                           ║
 ║   Ready to serve:                                         ║
 ║   • Companies: /api/companies/*                           ║
@@ -224,21 +214,15 @@ async function startServer() {
   }
 }
 
-// Graceful shutdown
+// Graceful shutdown - Turso doesn't need db.close(), but keep for compatibility
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, closing server...');
-  db.close(() => {
-    console.log('Database connection closed.');
-    process.exit(0);
-  });
+  process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('SIGINT received, closing server...');
-  db.close(() => {
-    console.log('Database connection closed.');
-    process.exit(0);
-  });
+  process.exit(0);
 });
 
 // Start the server

@@ -11,8 +11,8 @@ import {
   INDEXER_BATCH_SIZE,
   INDEXER_SCAN_INTERVAL_MS
 } from '@shared/constants';
-import { Database } from 'sqlite3';
 import * as dotenv from 'dotenv';
+import * as crypto from 'crypto';
 
 // Load environment variables
 dotenv.config();
@@ -27,13 +27,13 @@ export interface IndexerConfig {
 }
 
 export class DerivableIndexer {
-  private db: Database;
+  private db: any;  // Changed from Database to any for Turso compatibility
   private config: IndexerConfig;
   private currentBlock: number;
   private rpcUrl: string;
   private rpcAuth: string;
 
-  constructor(db: Database, config: IndexerConfig = {}) {
+  constructor(db: any, config: IndexerConfig = {}) {
     this.db = db;
     
     // Load RPC credentials from environment
@@ -58,11 +58,80 @@ export class DerivableIndexer {
       ...config
     };
     
-    this.currentBlock = config.startBlock || 0;
+    // Prioritize: config > env > default
+    this.currentBlock = config.startBlock || 
+                        Number(process.env.INDEXER_START_BLOCK) || 
+                        129000;
     
     console.log(`🔧 Indexer initialized with RPC URL: ${this.rpcUrl}`);
+    console.log(`🔧 Starting from block: ${this.currentBlock}`);
   }
 
+  // =========================================================================
+  // Helper to convert Turso result to row object
+  // =========================================================================
+  private async dbGet(sql: string, args: any[] = []): Promise<any> {
+    try {
+      const result = await this.db.execute({ sql, args });
+      return result.rows[0] || null;
+    } catch (error) {
+      console.error('Database error in dbGet:', error);
+      return null;
+    }
+  }
+
+  private async dbRun(sql: string, args: any[] = []): Promise<any> {
+    try {
+      const result = await this.db.execute({ sql, args });
+      return result;
+    } catch (error) {
+      console.error('Database error in dbRun:', error);
+      throw error;
+    }
+  }
+
+  // =========================================================================
+  // PUBLIC METHODS FOR LAZY INDEXER PATTERN
+  // =========================================================================
+
+  /**
+   * Get the latest block height from Bitcoin node
+   * Made public for Lazy Indexer pattern
+   */
+  public async getLatestBlockHeight(): Promise<number> {
+    return this.rpcCall('getblockcount', []);
+  }
+
+  /**
+   * Index a range of blocks
+   * Made public for Lazy Indexer pattern
+   * Preserves all existing audit log and reconciliation logic
+   */
+  public async indexBlocks(fromBlock: number, toBlock: number): Promise<void> {
+    console.log(`📦 Indexing blocks ${fromBlock} to ${toBlock}`);
+    
+    for (let blockHeight = fromBlock; blockHeight <= toBlock; blockHeight += this.config.batchSize!) {
+      const endBlock = Math.min(blockHeight + this.config.batchSize! - 1, toBlock);
+      
+      try {
+        // Get block hashes for range
+        const blockHashes = await this.getBlockHashes(blockHeight, endBlock);
+        
+        for (const blockHash of blockHashes) {
+          await this.indexBlock(blockHash);
+        }
+        
+        console.log(`✅ Indexed blocks ${blockHeight}-${endBlock}`);
+      } catch (error) {
+        console.error(`❌ Failed to index blocks ${blockHeight}-${endBlock}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Start continuous indexing (for persistent server environments)
+   * This method runs an infinite loop - DO NOT use on Vercel
+   */
   async start(): Promise<void> {
     console.log(`🔄 Indexer starting from block ${this.currentBlock}`);
     
@@ -85,25 +154,21 @@ export class DerivableIndexer {
     }
   }
 
-  private async indexBlocks(fromBlock: number, toBlock: number): Promise<void> {
-    console.log(`📦 Indexing blocks ${fromBlock} to ${toBlock}`);
-    
-    for (let blockHeight = fromBlock; blockHeight <= toBlock; blockHeight += this.config.batchSize!) {
-      const endBlock = Math.min(blockHeight + this.config.batchSize! - 1, toBlock);
-      
-      try {
-        // Get block hashes for range
-        const blockHashes = await this.getBlockHashes(blockHeight, endBlock);
-        
-        for (const blockHash of blockHashes) {
-          await this.indexBlock(blockHash);
-        }
-        
-        console.log(`✅ Indexed blocks ${blockHeight}-${endBlock}`);
-      } catch (error) {
-        console.error(`❌ Failed to index blocks ${blockHeight}-${endBlock}:`, error);
-      }
+  // =========================================================================
+  // PRIVATE METHODS
+  // =========================================================================
+
+  private async getBlockHashes(from: number, to: number): Promise<string[]> {
+    const hashes = [];
+    for (let i = from; i <= to; i++) {
+      const hash = await this.rpcCall('getblockhash', [i]);
+      hashes.push(hash);
     }
+    return hashes;
+  }
+
+  private async getBlock(blockHash: string): Promise<any> {
+    return this.rpcCall('getblock', [blockHash, 2]); // Verbosity 2 for full tx details
   }
 
   private async indexBlock(blockHash: string): Promise<void> {
@@ -122,7 +187,6 @@ export class DerivableIndexer {
     for (const tx of block.tx) {
       try {
         // Extract spell using WASM module
-        // Note: extractAndVerifySpell expects hex transaction
         const txHex = tx.hex || tx;
         const spell = extractAndVerifySpell(txHex, false);
         
@@ -139,6 +203,7 @@ export class DerivableIndexer {
         
         // =========================================================================
         // PRODUCTION RECONCILIATION: Check for spent worker tokens [Source 870]
+        // This preserves your audit log functionality for non-ZKproof transactions
         // =========================================================================
         await this.reconcileSettlements(tx, block.height);
         
@@ -176,18 +241,16 @@ export class DerivableIndexer {
     console.log(`  ✅ Found Plan NFT: appId=${spell.appId}, utxo=${nftOutput.utxoId}`);
     console.log(`     compensation=${metadata.compensationSats} sats, period=${metadata.payPeriodSeconds}s`);
     
-    // FIX: Double casting (through unknown) for type safety [1]
-    const existingPlan = (await this.db.get(
-      'SELECT * FROM plans WHERE appId = ?', 
-      [spell.appId]
-    ) as unknown) as PlanCache | undefined;
+    // Get existing plan using Turso
+    const existingPlanResult = await this.dbGet('SELECT * FROM plans WHERE appId = ?', [spell.appId]);
+    const existingPlan = existingPlanResult as PlanCache | undefined;
     
     if (existingPlan) {
       console.log(` ✅ Found existing plan: ${existingPlan.appId} (last indexed at block ${existingPlan.lastIndexedBlock})`);
     }
     
     // Store in cache immediately (minimal data)
-    await this.db.run(`
+    await this.dbRun(`
       INSERT OR REPLACE INTO plans (
         appId, nftUtxoId, ticker, compensationSats, 
         payPeriodSeconds, metadataHash, scrollPolicy,
@@ -262,7 +325,7 @@ export class DerivableIndexer {
       console.log(`  Enriched plan ${appId} with role: ${role}`);
       
       // Update plan with human-readable fields
-      await this.db.run(`
+      await this.dbRun(`
         UPDATE plans 
         SET role = ?, 
             updatedAt = ?
@@ -275,19 +338,20 @@ export class DerivableIndexer {
       
       // If this is a worker token, update worker cache using WorkerCache type
       if (employeeWallet) {
-        // FIX: Double casting (through unknown) for type safety [2]
-        const existingWorker = (await this.db.get(
+        // Get existing worker using Turso
+        const existingWorkerResult = await this.dbGet(
           'SELECT * FROM workers WHERE walletAddress = ? AND planId = ?',
           [employeeWallet, appId]
-        ) as unknown) as WorkerCache | undefined;
+        );
+        const existingWorker = existingWorkerResult as WorkerCache | undefined;
         
-        // Use the variable to clear the 'never read' warning [2]
+        // Use the variable to clear the 'never read' warning
         if (existingWorker) {
           console.log(` 👤 Worker already exists in cache: ${existingWorker.walletAddress}`);
         }
         
         // Insert worker with name from decrypted data
-        await this.db.run(`
+        await this.dbRun(`
           INSERT OR REPLACE INTO workers (
             walletAddress, name, planId, engagementType, status,
             lastMintedPeriod, currentTokenUtxo, expiresAt
@@ -314,6 +378,7 @@ export class DerivableIndexer {
   // =========================================================================
   // PRODUCTION RECONCILIATION: Scans for spent worker tokens 
   // to move them to 'historicalTokens' and confirm audit logs. [Source 870]
+  // This function preserves your existing audit log functionality
   // =========================================================================
   private async reconcileSettlements(tx: any, blockHeight: number): Promise<void> {
     if (!tx.vin || !Array.isArray(tx.vin)) return;
@@ -321,11 +386,12 @@ export class DerivableIndexer {
     for (const vin of tx.vin) {
       const spentUtxoId = `${vin.txid}:${vin.vout}`;
       
-      // Check if this UTXO is a current worker token
-      const worker = (await this.db.get(
+      // Check if this UTXO is a current worker token using Turso
+      const workerResult = await this.dbGet(
         'SELECT walletAddress, planId FROM workers WHERE currentTokenUtxo = ? AND status = "active"',
         [spentUtxoId]
-      ) as unknown) as { walletAddress: string; planId: string } | undefined;
+      );
+      const worker = workerResult as { walletAddress: string; planId: string } | undefined;
       
       if (worker) {
         console.log(`  🔄 Worker token spent: ${spentUtxoId} (worker: ${worker.walletAddress})`);
@@ -333,11 +399,13 @@ export class DerivableIndexer {
         // Move to historical tokens
         const timestamp = Math.floor(Date.now() / 1000);
         
-        // Add to historicalTokens array
-        const existingWorker = (await this.db.get(
+        // Add to historicalTokens array using the existing helper
+        // This preserves your audit trail
+        const existingWorkerResult = await this.dbGet(
           'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
           [worker.walletAddress, worker.planId]
-        ) as unknown) as { historicalTokens: string } | undefined;
+        );
+        const existingWorker = existingWorkerResult as { historicalTokens: string } | undefined;
         
         let history: any[] = [];
         if (existingWorker && existingWorker.historicalTokens) {
@@ -355,23 +423,34 @@ export class DerivableIndexer {
           blockHeight: blockHeight
         });
         
-        await this.db.run(
+        await this.dbRun(
           'UPDATE workers SET currentTokenUtxo = NULL, historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
           [JSON.stringify(history), new Date().toISOString(), worker.walletAddress, worker.planId]
         );
         
         // Update audit log status to confirmed if this is a Scroll Release
-        const auditLog = (await this.db.get(
+        const auditLogResult = await this.dbGet(
           'SELECT id FROM audit_logs WHERE txid = ? AND type = ?',
           [tx.txid, 'SCROLL_RELEASE']
-        ) as unknown) as { id: string } | undefined;
+        );
+        const auditLog = auditLogResult as { id: string } | undefined;
         
         if (auditLog) {
-          await this.db.run(
+          await this.dbRun(
             'UPDATE audit_logs SET status = "confirmed", timestamp = ? WHERE id = ?',
             [new Date().toISOString(), auditLog.id]
           );
           console.log(`  ✅ Audit log confirmed for tx: ${tx.txid}`);
+        } else {
+          // Create audit log for this Scroll release if it doesn't exist
+          await this.createAuditLog(
+            crypto.randomUUID(),
+            'SCROLL_RELEASE',
+            `Salary payment released for worker ${worker.walletAddress.substring(0, 16)}...`,
+            tx.txid,
+            'confirmed'
+          );
+          console.log(`  ✅ Created audit log for Scroll release: ${tx.txid}`);
         }
       }
     }
@@ -382,13 +461,13 @@ export class DerivableIndexer {
   // =========================================================================
   private async createAuditLog(
     id: string,
-    type: 'PLAN_CREATED' | 'BATCH_MINT' | 'SCROLL_RELEASE' | 'TERMINATION',
+    type: 'PLAN_CREATED' | 'BATCH_MINT' | 'SCROLL_RELEASE' | 'TERMINATION' | 'TREASURY_FUNDING',
     details: string,
     txid: string,
     status: 'pending' | 'confirmed' | 'failed'
   ): Promise<void> {
     try {
-      await this.db.run(`
+      await this.dbRun(`
         INSERT INTO audit_logs (id, type, details, txid, timestamp, status)
         VALUES (?, ?, ?, ?, ?, ?)
       `, [id, type, details, txid, new Date().toISOString(), status]);
@@ -398,23 +477,6 @@ export class DerivableIndexer {
   }
 
   // RPC helpers
-  private async getLatestBlockHeight(): Promise<number> {
-    return this.rpcCall('getblockcount', []);
-  }
-
-  private async getBlockHashes(from: number, to: number): Promise<string[]> {
-    const hashes = [];
-    for (let i = from; i <= to; i++) {
-      const hash = await this.rpcCall('getblockhash', [i]);
-      hashes.push(hash);
-    }
-    return hashes;
-  }
-
-  private async getBlock(blockHash: string): Promise<any> {
-    return this.rpcCall('getblock', [blockHash, 2]); // Verbosity 2 for full tx details
-  }
-
   private async rpcCall(method: string, params: any[]): Promise<any> {
     try {
       const response = await axios.post(
@@ -450,12 +512,12 @@ export class DerivableIndexer {
   private async findCIDByHash(metadataHash: string): Promise<string | null> {
     // This requires a mapping table that stores CID -> metadataHash when pinning
     try {
-      const result = (await this.db.get(
+      const result = await this.dbGet(
         'SELECT cid FROM ipfs_mappings WHERE metadataHash = ?',
         [metadataHash]
-      ) as unknown) as { cid: string } | undefined;
-
-      return result?.cid || null;
+      );
+      const row = result as { cid: string } | undefined;
+      return row?.cid || null;
     } catch (error) {
       console.error(`Failed to find CID for hash ${metadataHash}:`, error);
       return null;
@@ -463,13 +525,69 @@ export class DerivableIndexer {
   }
 }
 
-// Factory function
-export function createIndexer(db: Database, config?: IndexerConfig): DerivableIndexer {
+// =========================================================================
+// LAZY INDEXER PATTERN FOR SERVERLESS (Vercel) DEPLOYMENT
+// This function can be called from API routes to sync recent blocks
+// Preserves all existing audit log and reconciliation logic
+// =========================================================================
+
+/**
+ * Lazy Indexer - Triggers a partial blockchain sync from the last processed block
+ * Designed for serverless environments (Vercel) where long-running processes are not allowed
+ * Call this function at the beginning of your API routes (plans, workers, treasury)
+ * 
+ * @param db - Database connection (Turso client)
+ * @param maxBlocksToScan - Maximum number of blocks to scan per API call (default 50)
+ */
+export async function syncIndexer(db: any, maxBlocksToScan: number = 50): Promise<void> {
+  console.log('[LAZY INDEXER] Starting partial sync...');
+  
+  const indexer = new DerivableIndexer(db);
+  
+  try {
+    // Get latest block from Bitcoin node
+    const latestBlock = await indexer.getLatestBlockHeight();
+    console.log(`[LAZY INDEXER] Latest block: ${latestBlock}`);
+    
+    // Get last processed block from database using Turso
+    let startBlock = 129000; // Default fallback
+    try {
+      const result = await db.execute({
+        sql: 'SELECT MAX(lastIndexedBlock) as block FROM plans',
+        args: []
+      });
+      const row = result.rows[0];
+      startBlock = row?.block || Number(process.env.INDEXER_START_BLOCK) || 129000;
+    } catch (err) {
+      console.error('[LAZY INDEXER] Failed to get last processed block:', err);
+    }
+    console.log(`[LAZY INDEXER] Last processed block: ${startBlock}`);
+    
+    // Only scan new blocks, limited by maxBlocksToScan
+    if (latestBlock > startBlock) {
+      const blocksToScan = Math.min(latestBlock - startBlock, maxBlocksToScan);
+      const endBlock = startBlock + blocksToScan;
+      
+      console.log(`[LAZY INDEXER] Syncing blocks ${startBlock + 1} to ${endBlock} (${blocksToScan} blocks)`);
+      
+      await indexer.indexBlocks(startBlock + 1, endBlock);
+      
+      console.log(`[LAZY INDEXER] Sync complete. Processed up to block ${endBlock}`);
+    } else {
+      console.log(`[LAZY INDEXER] No new blocks to sync`);
+    }
+  } catch (error) {
+    console.error('[LAZY INDEXER] Sync failed:', error);
+  }
+}
+
+// Factory function for persistent environments
+export function createIndexer(db: any, config?: IndexerConfig): DerivableIndexer {
   return new DerivableIndexer(db, config);
 }
 
-// Standalone function to start indexer
-export async function startIndexer(db: Database, startBlock?: number): Promise<DerivableIndexer> {
+// Standalone function to start indexer (for persistent server environments)
+export async function startIndexer(db: any, startBlock?: number): Promise<DerivableIndexer> {
   const indexer = createIndexer(db, { startBlock });
   
   // Handle graceful shutdown

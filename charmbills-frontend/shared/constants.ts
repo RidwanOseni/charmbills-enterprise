@@ -22,7 +22,7 @@ export const SECONDS_PER_BIWEEK = 1209600;      // 2 weeks
 export const SECONDS_PER_MONTH = 2592000;        // 30 days
 
 // Demo Mode Constants (for investor presentation)
-export const DEMO_SECONDS_PER_PERIOD = 60;       // 1 minute = 1 pay period for demo
+export const DEMO_SECONDS_PER_PERIOD = 480;       // 1 minute = 1 pay period for demo
 
 // Multi-signature Defaults
 export const DEFAULT_MULTISIG_THRESHOLD = 2;     // 2-of-3 default
@@ -43,5 +43,5 @@ export const DEFAULT_RPC_PASSWORD = ""; // Set via env
 export const INDEXER_BATCH_SIZE = 10;
 export const INDEXER_SCAN_INTERVAL_MS = 30000;
 
-export const DEFAULT_RPC_PORT = 18332; 
+export const DEFAULT_RPC_PORT = 48332; 
 export const DEFAULT_RPC_HOST = "localhost";

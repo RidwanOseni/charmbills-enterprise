@@ -1,8 +1,18 @@
 import { Request, Response } from 'express';
 import axios from 'axios';
-const db = new (require('sqlite3').Database)('./payroll.db');
+import { syncIndexer } from '../lib/indexer';
+import { turso } from '../db/client';
 
 const MEMPOOL_API = "https://mempool.space/testnet4/api";
+
+// Helper to convert Turso result row to object with correct types
+function rowToObject(row: Record<string, any>): any {
+    const obj: any = {};
+    for (const [key, value] of Object.entries(row)) {
+        obj[key] = value;
+    }
+    return obj;
+}
 
 /**
  * GET /api/workers
@@ -10,6 +20,13 @@ const MEMPOOL_API = "https://mempool.space/testnet4/api";
  * Includes name field from IPFS enrichment and department ticker from plans table
  */
 export async function getWorkers(req: Request, res: Response) {
+    try {
+        await syncIndexer(turso, 20);
+        console.log('[WORKERS API] Lazy sync completed for getWorkers');
+    } catch (syncError) {
+        console.error('[WORKERS API] Lazy sync failed (non-critical):', syncError);
+    }
+    
     const query = `
         SELECT 
             w.walletAddress, 
@@ -24,13 +41,14 @@ export async function getWorkers(req: Request, res: Response) {
         LEFT JOIN plans p ON w.planId = p.appId
     `;
 
-    db.all(query, [], (err: Error | null, rows: any[]) => {
-        if (err) {
-            console.error('[WORKERS API] Database error:', err);
-            return res.status(500).json({ error: err.message });
-        }
+    try {
+        const result = await turso.execute({ sql: query, args: [] });
+        const rows = result.rows.map(row => rowToObject(row));
         res.json(rows);
-    });
+    } catch (err: any) {
+        console.error('[WORKERS API] Database error:', err);
+        res.status(500).json({ error: err.message });
+    }
 }
 
 /**
@@ -58,33 +76,32 @@ export async function addWorker(req: Request, res: Response) {
     const workerSalary = salarySats || 1000; // Minimal sats per period
     
     // FIX: Use planId (not department/departmentId) to match schema.ts
-    db.run(
-        `INSERT INTO workers (name, walletAddress, planId, role, engagementType, status, salarySats, updatedAt) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-            name, 
-            walletAddress, 
-            planId, 
-            workerRole, 
-            workerEngagementType, 
-            workerStatus, 
-            workerSalary,
-            new Date().toISOString()
-        ],
-        function(this: any, err: Error | null) {
-            if (err) {
-                console.error('[WORKERS API] Database error:', err);
-                return res.status(500).json({ error: err.message });
-            }
-            
-            console.log(`[WORKERS API] ✅ Worker added successfully with ID: ${this.lastID}`);
-            res.status(201).json({ 
-                success: true, 
-                id: this.lastID,
-                message: 'Worker added to registry successfully'
-            });
-        }
-    );
+    try {
+        const result = await turso.execute({
+            sql: `INSERT INTO workers (name, walletAddress, planId, role, engagementType, status, salarySats, updatedAt) 
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            args: [
+                name, 
+                walletAddress, 
+                planId, 
+                workerRole, 
+                workerEngagementType, 
+                workerStatus, 
+                workerSalary,
+                new Date().toISOString()
+            ]
+        });
+        
+        console.log(`[WORKERS API] ✅ Worker added successfully with ID: ${result.lastInsertRowid}`);
+        res.status(201).json({ 
+            success: true, 
+            id: result.lastInsertRowid,
+            message: 'Worker added to registry successfully'
+        });
+    } catch (err: any) {
+        console.error('[WORKERS API] Database error:', err);
+        res.status(500).json({ error: err.message });
+    }
 }
 
 /**
@@ -92,16 +109,20 @@ export async function addWorker(req: Request, res: Response) {
  * Calculates "Next Payroll Run" based on the earliest expiration in the cache [3]
  */
 export async function getDashboardStats(req: Request, res: Response) {
-    db.get('SELECT MIN(lastMintedPeriod) as nextRun FROM workers WHERE status = "active"', [], (err: Error | null, row: any) => {
-        if (err) {
-            console.error('[DASHBOARD API] Database error:', err);
-            return res.status(500).json({ error: err.message });
-        }
+    try {
+        const result = await turso.execute({
+            sql: 'SELECT MIN(lastMintedPeriod) as nextRun FROM workers WHERE status = ?',
+            args: ['active']
+        });
+        const row = result.rows[0];
         // Returns null for "Waiting for first hire" state
         res.json({
             nextRun: row?.nextRun || null
         });
-    });
+    } catch (err: any) {
+        console.error('[DASHBOARD API] Database error:', err);
+        res.status(500).json({ error: err.message });
+    }
 }
 
 /**
@@ -121,16 +142,19 @@ export async function getWorkerMetadata(req: Request, res: Response) {
         WHERE w.walletAddress = ?
     `;
 
-    db.get(query, [address], (err: Error | null, row: any) => {
-        if (err) {
-            console.error('[WORKERS API] Database error:', err);
-            return res.status(500).json({ error: err.message });
-        }
+    try {
+        const result = await turso.execute({ sql: query, args: [address] });
+        const row = result.rows[0];
+        
         if (!row) {
             return res.status(404).json({ error: "Worker record not found" });
         }
-        res.json(row);
-    });
+        
+        res.json(rowToObject(row));
+    } catch (err: any) {
+        console.error('[WORKERS API] Database error:', err);
+        res.status(500).json({ error: err.message });
+    }
 }
 
 /**
@@ -157,6 +181,14 @@ export async function getWorkerByAddress(req: Request, res: Response) {
 
     if (!address) {
         return res.status(400).json({ error: 'Address parameter is required' });
+    }
+
+    try {
+        await syncIndexer(turso, 20);  // Scan up to 20 recent blocks
+        console.log('[WORKERS API] Lazy sync completed for getWorkerByAddress');
+    } catch (syncError) {
+        console.error('[WORKERS API] Lazy sync failed (non-critical):', syncError);
+        // Continue even if sync fails - don't block the response
     }
 
     const query = `
@@ -188,42 +220,40 @@ export async function getWorkerByAddress(req: Request, res: Response) {
         LIMIT 1
     `;
 
-    db.get(query, [address], async (err: Error | null, row: any) => {
-        if (err) {
-            console.error('[WORKERS API] Database error in getWorkerByAddress:', err.message);
-            return res.status(500).json({ 
-                error: "Internal database error", 
-                details: err.message 
-            });
-        }
-
+    try {
+        const result = await turso.execute({ sql: query, args: [address] });
+        let row = result.rows[0];
+        
         if (!row) {
             console.warn(`[WORKERS API] Worker lookup failed for address: ${address}`);
             return res.status(404).json({ error: "Worker record not found in registry" });
         }
-
+        
+        // Convert row to object
+        let workerRecord = rowToObject(row);
+        
         // If ticker is null, the worker exists but the Plan NFT hasn't been minted yet
-        if (!row.ticker) {
+        if (!workerRecord.ticker) {
             console.log(`[WORKERS API] Worker found, but Departmental Plan is not yet on-chain.`);
         }
         
         // Ensure historicalTokens is always a valid JSON array
-        if (!row.historicalTokens) {
-            row.historicalTokens = "[]";
-        } else if (typeof row.historicalTokens === 'string') {
+        if (!workerRecord.historicalTokens) {
+            workerRecord.historicalTokens = [];
+        } else if (typeof workerRecord.historicalTokens === 'string') {
             try {
-                row.historicalTokens = JSON.parse(row.historicalTokens);
+                workerRecord.historicalTokens = JSON.parse(workerRecord.historicalTokens);
             } catch (e) {
                 console.error('[WORKERS API] Failed to parse historicalTokens:', e);
-                row.historicalTokens = [];
+                workerRecord.historicalTokens = [];
             }
         }
         
         // Fetch the Plan NFT hex for WASM verification context
         let planNftHex = null;
-        if (row.planNftId) {
+        if (workerRecord.planNftId) {
             try {
-                const [txid] = row.planNftId.split(':');
+                const [txid] = workerRecord.planNftId.split(':');
                 console.log(`[WORKERS API] Fetching hex for Plan NFT txid: ${txid}`);
                 const hexResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/hex`, { responseType: 'text' });
                 planNftHex = hexResponse.data;
@@ -238,13 +268,19 @@ export async function getWorkerByAddress(req: Request, res: Response) {
         
         // Add planNftHex to the response
         const responseRow = {
-            ...row,
+            ...workerRecord,
             planNftHex
         };
         
         console.log(`[WORKERS API] Returning response with planNftHex: ${!!planNftHex}`);
         res.json(responseRow);
-    });
+    } catch (err: any) {
+        console.error('[WORKERS API] Database error in getWorkerByAddress:', err.message);
+        res.status(500).json({ 
+            error: "Internal database error", 
+            details: err.message 
+        });
+    }
 }
 
 /**
@@ -265,20 +301,20 @@ export async function updateWorkerTokenUtxo(req: Request, res: Response) {
     
     console.log(`[WORKERS API] Updating worker ${walletAddress} token UTXO to: ${tokenUtxo}`);
     
-    db.run(
-        `UPDATE workers 
-         SET currentTokenUtxo = ?, 
-             lastMintedPeriod = ?,
-             updatedAt = ?
-         WHERE walletAddress = ? AND planId = ?`,
-        [tokenUtxo, lastMintedPeriod, new Date().toISOString(), walletAddress, planId],
-        function(err: Error | null) {
-            if (err) {
-                console.error('[WORKERS API] Failed to update token UTXO:', err);
-                return res.status(500).json({ error: err.message });
-            }
-            console.log(`[WORKERS API] ✅ Updated worker ${walletAddress} with token UTXO: ${tokenUtxo}`);
-            res.json({ success: true, tokenUtxo });
-        }
-    );
+    try {
+        await turso.execute({
+            sql: `UPDATE workers 
+                  SET currentTokenUtxo = ?, 
+                      lastMintedPeriod = ?,
+                      updatedAt = ?
+                  WHERE walletAddress = ? AND planId = ?`,
+            args: [tokenUtxo, lastMintedPeriod, new Date().toISOString(), walletAddress, planId]
+        });
+        
+        console.log(`[WORKERS API] ✅ Updated worker ${walletAddress} with token UTXO: ${tokenUtxo}`);
+        res.json({ success: true, tokenUtxo });
+    } catch (err: any) {
+        console.error('[WORKERS API] Failed to update token UTXO:', err);
+        res.status(500).json({ error: err.message });
+    }
 }

@@ -1,6 +1,5 @@
 // charmbills-backend/src/db/schema.ts
 import { EngagementType, ScrollPolicyType } from '@shared/types';
-import { Database } from 'sqlite3';
 
 export interface PlanCache {
   appId: string;
@@ -50,164 +49,113 @@ export interface LockedUtxo {
   expiresAt: string;
 }
 
-// Database setup
-export async function initDatabase(db: Database): Promise<void> {
+// Database setup for Turso
+export async function initDatabase(db: any): Promise<void> {
   console.log('[DB INIT] Creating database tables...');
   
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      // Create companies table
-      db.run(`
-        CREATE TABLE IF NOT EXISTS companies (
-            employerAddress TEXT PRIMARY KEY,
-            treasuryAddress TEXT NOT NULL,
-            treasuryHexDest TEXT NOT NULL,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating companies:', err.message);
-        else console.log('[DB INIT] ✅ companies table ready');
-      });
-
-      // Create locked_utxos table
-      db.run(`
-        CREATE TABLE IF NOT EXISTS locked_utxos (
-            utxoId TEXT PRIMARY KEY,
-            employerAddress TEXT NOT NULL,
-            lockedAt TEXT NOT NULL,
-            expiresAt TEXT NOT NULL
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating locked_utxos:', err.message);
-        else console.log('[DB INIT] ✅ locked_utxos table ready');
-      });
-
-      // Create plans table
-      db.run(`
-        CREATE TABLE IF NOT EXISTS plans (
-            appId TEXT PRIMARY KEY,
-            nftUtxoId TEXT UNIQUE NOT NULL,
-            anchorUtxo TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            employerAddress TEXT NOT NULL,
-            department TEXT,
-            payPeriodSeconds INTEGER NOT NULL,
-            metadataHash TEXT NOT NULL,
-            scrollPolicy INTEGER NOT NULL,
-            remaining INTEGER NOT NULL DEFAULT 100,
-            lastIndexedBlock INTEGER DEFAULT 0,
-            createdAt TEXT NOT NULL,
-            updatedAt TEXT NOT NULL
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating plans:', err.message);
-        else console.log('[DB INIT] ✅ plans table ready');
-      });
-
-      // Create workers table with historicalTokens column for payment history
-      db.run(`
-        CREATE TABLE IF NOT EXISTS workers (
-            walletAddress TEXT,
-            name TEXT,
-            planId TEXT,
-            engagementType INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            lastMintedPeriod TEXT,
-            currentTokenUtxo TEXT,
-            expiresAt TEXT,
-            salarySats INTEGER,
-            role TEXT,
-            metadataHash TEXT,
-            updatedAt TEXT,
-            historicalTokens TEXT DEFAULT '[]',
-            PRIMARY KEY (walletAddress, planId)
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating workers:', err.message);
-        else console.log('[DB INIT] ✅ workers table ready');
-      });
-
-      // Create ipfs_mappings table
-      db.run(`
-        CREATE TABLE IF NOT EXISTS ipfs_mappings (
-            metadataHash TEXT PRIMARY KEY,
-            cid TEXT NOT NULL,
-            createdAt TEXT NOT NULL
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating ipfs_mappings:', err.message);
-        else console.log('[DB INIT] ✅ ipfs_mappings table ready');
-      });
-
-      // Create multisig_transactions table
-      db.run(`
-        CREATE TABLE IF NOT EXISTS multisig_transactions (
-            id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            employerAddress TEXT NOT NULL,
-            worker_address TEXT,
-            commitTxHex TEXT NOT NULL,
-            spellTxHex TEXT NOT NULL,
-            threshold INTEGER NOT NULL,
-            signers_json TEXT DEFAULT '[]',
-            status TEXT DEFAULT 'pending',
-            createdAt TEXT NOT NULL
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating multisig_transactions:', err.message);
-        else console.log('[DB INIT] ✅ multisig_transactions table ready');
-      });
-
-      // ============================================================
-      // MODIFICATION: Create audit_logs table for transaction audit trail
-      // Ensures the system is "Derivable" from the blockchain [Source 77, 662]
-      // ============================================================
-      db.run(`
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            details TEXT,
-            txid TEXT,
-            timestamp TEXT NOT NULL,
-            status TEXT DEFAULT 'pending'
-        )
-      `, (err) => {
-        if (err) console.error('[DB INIT] Error creating audit_logs:', err.message);
-        else console.log('[DB INIT] ✅ audit_logs table ready');
-      });
-
-      // Create indexes after tables are created
-      const indexes = [
-        `CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)`,
-        `CREATE INDEX IF NOT EXISTS idx_workers_plan ON workers(planId)`,
-        `CREATE INDEX IF NOT EXISTS idx_plans_ticker ON plans(ticker)`,
-        `CREATE INDEX IF NOT EXISTS idx_plans_employer ON plans(employerAddress)`,
-        `CREATE INDEX IF NOT EXISTS idx_plans_nftUtxo ON plans(nftUtxoId)`,
-        `CREATE INDEX IF NOT EXISTS idx_plans_remaining ON plans(remaining)`,
-        `CREATE INDEX IF NOT EXISTS idx_locked_utxos_employer ON locked_utxos(employerAddress)`,
-        `CREATE INDEX IF NOT EXISTS idx_locked_utxos_expires ON locked_utxos(expiresAt)`,
-        `CREATE INDEX IF NOT EXISTS idx_ipfs_hash ON ipfs_mappings(metadataHash)`,
-        `CREATE INDEX IF NOT EXISTS idx_multisig_employer ON multisig_transactions(employerAddress)`,
-        `CREATE INDEX IF NOT EXISTS idx_multisig_status ON multisig_transactions(status)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_logs_type ON audit_logs(type)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_logs_txid ON audit_logs(txid)`,
-        `CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)`
-      ];
-
-      let indexCount = 0;
-      indexes.forEach((idxQuery) => {
-        db.run(idxQuery, (err) => {
-          if (err) console.error(`[DB INIT] Error creating index: ${err.message}`);
-          indexCount++;
-          if (indexCount === indexes.length) {
-            console.log('[DB INIT] Database initialization complete');
-            resolve();
-          }
-        });
-      });
-    });
-  });
+  const queries = [
+    `CREATE TABLE IF NOT EXISTS companies (
+        employerAddress TEXT PRIMARY KEY,
+        treasuryAddress TEXT NOT NULL,
+        treasuryHexDest TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT
+    )`,
+    
+    `CREATE TABLE IF NOT EXISTS locked_utxos (
+        utxoId TEXT PRIMARY KEY,
+        employerAddress TEXT NOT NULL,
+        lockedAt TEXT NOT NULL,
+        expiresAt TEXT NOT NULL
+    )`,
+    
+    `CREATE TABLE IF NOT EXISTS plans (
+        appId TEXT PRIMARY KEY,
+        nftUtxoId TEXT UNIQUE NOT NULL,
+        anchorUtxo TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        employerAddress TEXT NOT NULL,
+        department TEXT,
+        payPeriodSeconds INTEGER NOT NULL,
+        metadataHash TEXT NOT NULL,
+        scrollPolicy INTEGER NOT NULL,
+        remaining INTEGER NOT NULL DEFAULT 100,
+        lastIndexedBlock INTEGER DEFAULT 0,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+    )`,
+    
+    `CREATE TABLE IF NOT EXISTS workers (
+        walletAddress TEXT,
+        name TEXT,
+        planId TEXT,
+        engagementType INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        lastMintedPeriod TEXT,
+        currentTokenUtxo TEXT,
+        expiresAt TEXT,
+        salarySats INTEGER,
+        role TEXT,
+        metadataHash TEXT,
+        updatedAt TEXT,
+        historicalTokens TEXT DEFAULT '[]',
+        PRIMARY KEY (walletAddress, planId)
+    )`,
+    
+    `CREATE TABLE IF NOT EXISTS ipfs_mappings (
+        metadataHash TEXT PRIMARY KEY,
+        cid TEXT NOT NULL,
+        createdAt TEXT NOT NULL
+    )`,
+    
+    `CREATE TABLE IF NOT EXISTS multisig_transactions (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        employerAddress TEXT NOT NULL,
+        worker_address TEXT,
+        commitTxHex TEXT NOT NULL,
+        spellTxHex TEXT NOT NULL,
+        threshold INTEGER NOT NULL,
+        signers_json TEXT DEFAULT '[]',
+        status TEXT DEFAULT 'pending',
+        createdAt TEXT NOT NULL
+    )`,
+    
+    `CREATE TABLE IF NOT EXISTS audit_logs (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        details TEXT,
+        txid TEXT,
+        timestamp TEXT NOT NULL,
+        status TEXT DEFAULT 'pending'
+    )`,
+    
+    // Indexes
+    `CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_workers_plan ON workers(planId)`,
+    `CREATE INDEX IF NOT EXISTS idx_plans_ticker ON plans(ticker)`,
+    `CREATE INDEX IF NOT EXISTS idx_plans_employer ON plans(employerAddress)`,
+    `CREATE INDEX IF NOT EXISTS idx_plans_nftUtxo ON plans(nftUtxoId)`,
+    `CREATE INDEX IF NOT EXISTS idx_plans_remaining ON plans(remaining)`,
+    `CREATE INDEX IF NOT EXISTS idx_locked_utxos_employer ON locked_utxos(employerAddress)`,
+    `CREATE INDEX IF NOT EXISTS idx_locked_utxos_expires ON locked_utxos(expiresAt)`,
+    `CREATE INDEX IF NOT EXISTS idx_ipfs_hash ON ipfs_mappings(metadataHash)`,
+    `CREATE INDEX IF NOT EXISTS idx_multisig_employer ON multisig_transactions(employerAddress)`,
+    `CREATE INDEX IF NOT EXISTS idx_multisig_status ON multisig_transactions(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_type ON audit_logs(type)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_txid ON audit_logs(txid)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)`
+  ];
+  
+  for (const query of queries) {
+    try {
+      await db.execute(query);
+    } catch (err: any) {
+      console.error(`[DB INIT] Error: ${err.message}`);
+    }
+  }
+  
+  console.log('[DB INIT] Database initialization complete');
 }
 
 // ============================================================
@@ -215,65 +163,49 @@ export async function initDatabase(db: Database): Promise<void> {
 // ============================================================
 
 export async function saveCompanyConfig(
-  db: Database,
+  db: any,
   employerAddress: string,
   treasuryAddress: string,
   treasuryHexDest: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const now = new Date().toISOString();
-    db.run(
-      `INSERT OR REPLACE INTO companies (employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?)`,
-      [employerAddress, treasuryAddress, treasuryHexDest, now, now],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  const now = new Date().toISOString();
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO companies (employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?)`,
+    args: [employerAddress, treasuryAddress, treasuryHexDest, now, now]
   });
 }
 
 export async function getCompanyConfig(
-  db: Database,
+  db: any,
   employerAddress: string
 ): Promise<CompanyRecord | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
-      [employerAddress],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+    args: [employerAddress]
   });
+  return result.rows[0] || null;
 }
 
 export async function listCompanies(
-  db: Database,
+  db: any,
   limit: number = 50,
   offset: number = 0
 ): Promise<CompanyRecord[]> {
-  return new Promise((resolve, reject) => {
-    db.all(
-      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
-      [limit, offset],
-      (err: Error | null, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
+    args: [limit, offset]
   });
+  return result.rows || [];
 }
 
 export async function deleteCompany(
-  db: Database,
+  db: any,
   employerAddress: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'DELETE FROM companies WHERE employerAddress = ?',
-      [employerAddress],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'DELETE FROM companies WHERE employerAddress = ?',
+    args: [employerAddress]
   });
 }
 
@@ -282,95 +214,70 @@ export async function deleteCompany(
 // ============================================================
 
 export async function lockUtxo(
-  db: Database,
+  db: any,
   utxoId: string,
   employerAddress: string,
   ttlSeconds: number = 3600
 ): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    const now = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
-    
-    db.run(
-      `INSERT INTO locked_utxos (utxoId, employerAddress, lockedAt, expiresAt)
-       VALUES (?, ?, ?, ?)`,
-      [utxoId, employerAddress, now, expiresAt],
-      (err: Error | null) => {
-        if (err) {
-          if (err.message.includes('UNIQUE constraint failed')) {
-            resolve(false);
-          } else {
-            reject(err);
-          }
-        } else {
-          resolve(true);
-        }
-      }
-    );
-  });
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  
+  try {
+    await db.execute({
+      sql: `INSERT INTO locked_utxos (utxoId, employerAddress, lockedAt, expiresAt)
+            VALUES (?, ?, ?, ?)`,
+      args: [utxoId, employerAddress, now, expiresAt]
+    });
+    return true;
+  } catch (err: any) {
+    if (err.message.includes('UNIQUE constraint failed')) {
+      return false;
+    }
+    throw err;
+  }
 }
 
 export async function unlockUtxo(
-  db: Database,
+  db: any,
   utxoId: string
 ): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'DELETE FROM locked_utxos WHERE utxoId = ?',
-      [utxoId],
-      function(err: Error | null) {
-        if (err) reject(err);
-        else resolve(this.changes > 0);
-      }
-    );
+  const result = await db.execute({
+    sql: 'DELETE FROM locked_utxos WHERE utxoId = ?',
+    args: [utxoId]
   });
+  return (result.rowsAffected || 0) > 0;
 }
 
 export async function isUtxoLocked(
-  db: Database,
+  db: any,
   utxoId: string
 ): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT utxoId FROM locked_utxos WHERE utxoId = ? AND expiresAt > ?',
-      [utxoId, new Date().toISOString()],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(!!row);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT utxoId FROM locked_utxos WHERE utxoId = ? AND expiresAt > ?',
+    args: [utxoId, new Date().toISOString()]
   });
+  return (result.rows?.length || 0) > 0;
 }
 
 export async function cleanupExpiredLocks(
-  db: Database
+  db: any
 ): Promise<number> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'DELETE FROM locked_utxos WHERE expiresAt <= ?',
-      [new Date().toISOString()],
-      function(err: Error | null) {
-        if (err) reject(err);
-        else resolve(this.changes);
-      }
-    );
+  const result = await db.execute({
+    sql: 'DELETE FROM locked_utxos WHERE expiresAt <= ?',
+    args: [new Date().toISOString()]
   });
+  return result.rowsAffected || 0;
 }
 
 export async function getLockedUtxosForEmployer(
-  db: Database,
+  db: any,
   employerAddress: string
 ): Promise<LockedUtxo[]> {
-  return new Promise((resolve, reject) => {
-    db.all(
-      'SELECT utxoId, employerAddress, lockedAt, expiresAt FROM locked_utxos WHERE employerAddress = ? AND expiresAt > ?',
-      [employerAddress, new Date().toISOString()],
-      (err: Error | null, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT utxoId, employerAddress, lockedAt, expiresAt FROM locked_utxos WHERE employerAddress = ? AND expiresAt > ?',
+    args: [employerAddress, new Date().toISOString()]
   });
+  return result.rows || [];
 }
 
 // ============================================================
@@ -378,110 +285,86 @@ export async function getLockedUtxosForEmployer(
 // ============================================================
 
 export async function savePlanRecord(
-  db: Database,
+  db: any,
   plan: PlanCache
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `INSERT OR REPLACE INTO plans 
-       (appId, nftUtxoId, ticker, employerAddress, department, 
-        payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
-        lastIndexedBlock, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        plan.appId,
-        plan.nftUtxoId,
-        plan.ticker,
-        plan.employerAddress,
-        plan.department || null,
-        plan.payPeriodSeconds,
-        plan.metadataHash,
-        plan.scrollPolicy,
-        plan.remaining,
-        plan.lastIndexedBlock || 0,
-        plan.createdAt,
-        plan.updatedAt
-      ],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO plans 
+          (appId, nftUtxoId, ticker, employerAddress, department, 
+           payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
+           lastIndexedBlock, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      plan.appId,
+      plan.nftUtxoId,
+      plan.ticker,
+      plan.employerAddress,
+      plan.department || null,
+      plan.payPeriodSeconds,
+      plan.metadataHash,
+      plan.scrollPolicy,
+      plan.remaining,
+      plan.lastIndexedBlock || 0,
+      plan.createdAt,
+      plan.updatedAt
+    ]
   });
 }
 
 export async function getPlanByAppId(
-  db: Database,
+  db: any,
   appId: string
 ): Promise<PlanCache | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT * FROM plans WHERE appId = ?',
-      [appId],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT * FROM plans WHERE appId = ?',
+    args: [appId]
   });
+  return result.rows[0] || null;
 }
 
 export async function getPlanByNftUtxo(
-  db: Database,
+  db: any,
   nftUtxoId: string
 ): Promise<PlanCache | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT * FROM plans WHERE nftUtxoId = ?',
-      [nftUtxoId],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT * FROM plans WHERE nftUtxoId = ?',
+    args: [nftUtxoId]
   });
+  return result.rows[0] || null;
 }
 
 export async function getPlansByEmployer(
-  db: Database,
+  db: any,
   employerAddress: string,
   limit: number = 50,
   offset: number = 0
 ): Promise<PlanCache[]> {
-  return new Promise((resolve, reject) => {
-    db.all(
-      'SELECT * FROM plans WHERE employerAddress = ? ORDER BY createdAt DESC LIMIT ? OFFSET ?',
-      [employerAddress, limit, offset],
-      (err: Error | null, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT * FROM plans WHERE employerAddress = ? ORDER BY createdAt DESC LIMIT ? OFFSET ?',
+    args: [employerAddress, limit, offset]
   });
+  return result.rows || [];
 }
 
 export async function updatePlanRemaining(
-  db: Database,
+  db: any,
   appId: string,
   newRemaining: number
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'UPDATE plans SET remaining = ?, updatedAt = ? WHERE appId = ?',
-      [newRemaining, new Date().toISOString(), appId],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'UPDATE plans SET remaining = ?, updatedAt = ? WHERE appId = ?',
+    args: [newRemaining, new Date().toISOString(), appId]
   });
 }
 
 export async function updatePlanLastIndexedBlock(
-  db: Database,
+  db: any,
   appId: string,
   blockNumber: number
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'UPDATE plans SET lastIndexedBlock = ?, updatedAt = ? WHERE appId = ?',
-      [blockNumber, new Date().toISOString(), appId],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'UPDATE plans SET lastIndexedBlock = ?, updatedAt = ? WHERE appId = ?',
+    args: [blockNumber, new Date().toISOString(), appId]
   });
 }
 
@@ -490,110 +373,88 @@ export async function updatePlanLastIndexedBlock(
 // ============================================================
 
 export async function saveWorkerRecord(
-  db: Database,
+  db: any,
   worker: WorkerCache
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `INSERT OR REPLACE INTO workers 
-       (walletAddress, name, planId, engagementType, status, lastMintedPeriod, 
-        currentTokenUtxo, expiresAt, salarySats, role, metadataHash, updatedAt, historicalTokens)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        worker.walletAddress,
-        worker.name || null,
-        worker.planId,
-        worker.engagementType,
-        worker.status,
-        worker.lastMintedPeriod,
-        worker.currentTokenUtxo || null,
-        worker.expiresAt || null,
-        worker.salarySats,
-        worker.role,
-        worker.metadataHash,
-        worker.updatedAt,
-        worker.historicalTokens || '[]'
-      ],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO workers 
+          (walletAddress, name, planId, engagementType, status, lastMintedPeriod, 
+           currentTokenUtxo, expiresAt, salarySats, role, metadataHash, updatedAt, historicalTokens)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      worker.walletAddress,
+      worker.name || null,
+      worker.planId,
+      worker.engagementType,
+      worker.status,
+      worker.lastMintedPeriod,
+      worker.currentTokenUtxo || null,
+      worker.expiresAt || null,
+      worker.salarySats,
+      worker.role,
+      worker.metadataHash,
+      worker.updatedAt,
+      worker.historicalTokens || '[]'
+    ]
   });
 }
 
 export async function getWorkersByPlan(
-  db: Database,
+  db: any,
   planId: string
 ): Promise<WorkerCache[]> {
-  return new Promise((resolve, reject) => {
-    db.all(
-      'SELECT * FROM workers WHERE planId = ? ORDER BY status DESC, name ASC',
-      [planId],
-      (err: Error | null, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT * FROM workers WHERE planId = ? ORDER BY status DESC, name ASC',
+    args: [planId]
   });
+  return result.rows || [];
 }
 
 export async function getWorkerByAddress(
-  db: Database,
+  db: any,
   walletAddress: string
 ): Promise<WorkerCache | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT * FROM workers WHERE walletAddress = ? ORDER BY updatedAt DESC LIMIT 1',
-      [walletAddress],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT * FROM workers WHERE walletAddress = ? ORDER BY updatedAt DESC LIMIT 1',
+    args: [walletAddress]
   });
+  return result.rows[0] || null;
 }
 
 export async function updateWorkerStatus(
-  db: Database,
+  db: any,
   walletAddress: string,
   planId: string,
   status: 'active' | 'terminated' | 'pending'
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'UPDATE workers SET status = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
-      [status, new Date().toISOString(), walletAddress, planId],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'UPDATE workers SET status = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+    args: [status, new Date().toISOString(), walletAddress, planId]
   });
 }
 
 export async function updateWorkerToken(
-  db: Database,
+  db: any,
   walletAddress: string,
   planId: string,
   tokenUtxo: string,
   expiresAt: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'UPDATE workers SET currentTokenUtxo = ?, expiresAt = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
-      [tokenUtxo, expiresAt, new Date().toISOString(), walletAddress, planId],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'UPDATE workers SET currentTokenUtxo = ?, expiresAt = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+    args: [tokenUtxo, expiresAt, new Date().toISOString(), walletAddress, planId]
   });
 }
 
 export async function updateWorkerMetadata(
-  db: Database,
+  db: any,
   walletAddress: string,
   planId: string,
   metadataHash: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'UPDATE workers SET metadataHash = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
-      [metadataHash, new Date().toISOString(), walletAddress, planId],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'UPDATE workers SET metadataHash = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+    args: [metadataHash, new Date().toISOString(), walletAddress, planId]
   });
 }
 
@@ -601,40 +462,31 @@ export async function updateWorkerMetadata(
  * ADDED: Targeted update for post-mint worker record
  * This preserves the worker's name and role from the registry
  * Only updates status, token UTXO, expiry, and last minted period
- * 
- * @param db - Database connection
- * @param walletAddress - Worker's wallet address
- * @param planId - Plan ID (appId)
- * @param tokenUtxo - The newly minted token UTXO ID
- * @param expiresAt - Expiration date of the token
- * @param lastMintedPeriod - Date string of when the token was minted
  */
 export async function updateWorkerPostMint(
-  db: Database,
+  db: any,
   walletAddress: string,
   planId: string,
   tokenUtxo: string,
   expiresAt: string,
   lastMintedPeriod: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const query = `
-      UPDATE workers 
-      SET status = 'active', 
-          currentTokenUtxo = ?, 
-          expiresAt = ?, 
-          lastMintedPeriod = ?,
-          updatedAt = ?
-      WHERE walletAddress = ? AND planId = ?
-    `;
-    db.run(query, [
+  await db.execute({
+    sql: `UPDATE workers 
+          SET status = 'active', 
+              currentTokenUtxo = ?, 
+              expiresAt = ?, 
+              lastMintedPeriod = ?,
+              updatedAt = ?
+          WHERE walletAddress = ? AND planId = ?`,
+    args: [
       tokenUtxo,
       expiresAt,
       lastMintedPeriod,
       new Date().toISOString(),
       walletAddress,
       planId
-    ], (err: Error | null) => err ? reject(err) : resolve());
+    ]
   });
 }
 
@@ -643,44 +495,39 @@ export async function updateWorkerPostMint(
  * Used for Payment History feature
  */
 export async function addHistoricalToken(
-  db: Database,
+  db: any,
   walletAddress: string,
   planId: string,
   spentUtxo: string,
   timestamp: number
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // First get current historicalTokens
-    db.get(
-      'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
-      [walletAddress, planId],
-      (err: Error | null, row: any) => {
-        if (err) return reject(err);
-        
-        let history: any[] = [];
-        if (row && row.historicalTokens) {
-          try {
-            history = JSON.parse(row.historicalTokens);
-          } catch (e) {
-            history = [];
-          }
-        }
-        
-        // Add new entry
-        history.push({
-          utxoId: spentUtxo,
-          timestamp: timestamp,
-          spentAt: new Date().toISOString()
-        });
-        
-        // Update the record
-        db.run(
-          'UPDATE workers SET historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
-          [JSON.stringify(history), new Date().toISOString(), walletAddress, planId],
-          (err: Error | null) => err ? reject(err) : resolve()
-        );
-      }
-    );
+  // First get current historicalTokens
+  const result = await db.execute({
+    sql: 'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
+    args: [walletAddress, planId]
+  });
+  
+  let history: any[] = [];
+  const row = result.rows[0];
+  if (row && row.historicalTokens) {
+    try {
+      history = JSON.parse(row.historicalTokens);
+    } catch (e) {
+      history = [];
+    }
+  }
+  
+  // Add new entry
+  history.push({
+    utxoId: spentUtxo,
+    timestamp: timestamp,
+    spentAt: new Date().toISOString()
+  });
+  
+  // Update the record
+  await db.execute({
+    sql: 'UPDATE workers SET historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+    args: [JSON.stringify(history), new Date().toISOString(), walletAddress, planId]
   });
 }
 
@@ -691,85 +538,59 @@ export async function addHistoricalToken(
 /**
  * Save an audit log entry for on-chain transaction tracking
  * Used to maintain a derivable audit trail from the blockchain
- * 
- * @param db - Database connection
- * @param id - Unique identifier (UUID)
- * @param type - Type of operation (PLAN_CREATED, BATCH_MINT, SCROLL_RELEASE, TERMINATION)
- * @param details - Human-readable description
- * @param txid - Bitcoin transaction ID
- * @param status - Status (pending or confirmed)
  */
 export async function saveAuditLog(
-  db: Database,
+  db: any,
   id: string,
   type: string,
   details: string,
   txid: string,
   status: 'pending' | 'confirmed' = 'pending'
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timestamp = new Date().toISOString();
-    db.run(
-      `INSERT INTO audit_logs (id, type, details, txid, timestamp, status)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [id, type, details, txid, timestamp, status],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  const timestamp = new Date().toISOString();
+  await db.execute({
+    sql: `INSERT INTO audit_logs (id, type, details, txid, timestamp, status)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+    args: [id, type, details, txid, timestamp, status]
   });
 }
 
 /**
  * Update audit log status when transaction is confirmed
- * 
- * @param db - Database connection
- * @param id - Unique identifier of the audit log entry
- * @param status - New status (confirmed)
  */
 export async function updateAuditLogStatus(
-  db: Database,
+  db: any,
   id: string,
   status: 'confirmed'
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'UPDATE audit_logs SET status = ? WHERE id = ?',
-      [status, id],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'UPDATE audit_logs SET status = ? WHERE id = ?',
+    args: [status, id]
   });
 }
 
 /**
  * Get audit logs for a specific type or time range
- * 
- * @param db - Database connection
- * @param type - Optional filter by operation type
- * @param limit - Maximum number of records to return
- * @param offset - Number of records to skip
  */
 export async function getAuditLogs(
-  db: Database,
+  db: any,
   type?: string,
   limit: number = 50,
   offset: number = 0
 ): Promise<any[]> {
-  return new Promise((resolve, reject) => {
-    let query = 'SELECT * FROM audit_logs';
-    const params: any[] = [];
-    
-    if (type) {
-      query += ' WHERE type = ?';
-      params.push(type);
-    }
-    
-    query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
-    
-    db.all(query, params, (err: Error | null, rows: any[]) => {
-      if (err) reject(err);
-      else resolve(rows || []);
-    });
-  });
+  let sql = 'SELECT * FROM audit_logs';
+  const args: any[] = [];
+  
+  if (type) {
+    sql += ' WHERE type = ?';
+    args.push(type);
+  }
+  
+  sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
+  args.push(limit, offset);
+  
+  const result = await db.execute({ sql, args });
+  return result.rows || [];
 }
 
 // ============================================================
@@ -777,31 +598,24 @@ export async function getAuditLogs(
 // ============================================================
 
 export async function saveIpfsMapping(
-  db: Database,
+  db: any,
   metadataHash: string,
   cid: string
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    db.run(
-      'INSERT OR IGNORE INTO ipfs_mappings (metadataHash, cid, createdAt) VALUES (?, ?, ?)',
-      [metadataHash, cid, new Date().toISOString()],
-      (err: Error | null) => err ? reject(err) : resolve()
-    );
+  await db.execute({
+    sql: 'INSERT OR IGNORE INTO ipfs_mappings (metadataHash, cid, createdAt) VALUES (?, ?, ?)',
+    args: [metadataHash, cid, new Date().toISOString()]
   });
 }
 
 export async function getCidByMetadataHash(
-  db: Database,
+  db: any,
   metadataHash: string
 ): Promise<string | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT cid FROM ipfs_mappings WHERE metadataHash = ?',
-      [metadataHash],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row?.cid || null);
-      }
-    );
+  const result = await db.execute({
+    sql: 'SELECT cid FROM ipfs_mappings WHERE metadataHash = ?',
+    args: [metadataHash]
   });
+  const row = result.rows[0];
+  return row?.cid || null;
 }

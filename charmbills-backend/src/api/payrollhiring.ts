@@ -7,9 +7,6 @@ import { encryptPayrollData } from '@shared/encryption';
 import { pinToIPFS } from '../lib/ipfs-pinner';
 import * as constants from '@shared/constants';
 import * as crypto from 'crypto';
-import { Database } from 'sqlite3';
-
-const db = new (require('sqlite3').Database)(process.env.PAYROLL_DB_PATH || './payroll.db');
 
 // --------------------------------------------------------------------------------
 // Types
@@ -50,36 +47,93 @@ interface CompanyRecord {
 }
 
 // --------------------------------------------------------------------------------
-// Database Helper
+// Database Helper - Uses db from req.app.locals
 // --------------------------------------------------------------------------------
 
-async function getCompanyByEmployer(employerAddress: string): Promise<CompanyRecord | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
-      [employerAddress],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row || null);
-      }
-    );
+async function getCompanyByEmployer(db: any, employerAddress: string): Promise<CompanyRecord | null> {
+  const result = await db.execute({
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+    args: [employerAddress]
   });
+  return result.rows[0] || null;
 }
 
 // --------------------------------------------------------------------------------
 // Helper to get existing worker name
 // --------------------------------------------------------------------------------
 
-async function getExistingWorkerName(walletAddress: string, planId: string): Promise<string | null> {
-  return new Promise((resolve, reject) => {
-    db.get(
-      'SELECT name FROM workers WHERE walletAddress = ? AND planId = ?',
-      [walletAddress, planId],
-      (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row ? row.name : null);
-      }
-    );
+async function getExistingWorkerName(db: any, walletAddress: string, planId: string): Promise<string | null> {
+  const result = await db.execute({
+    sql: 'SELECT name FROM workers WHERE walletAddress = ? AND planId = ?',
+    args: [walletAddress, planId]
+  });
+  return result.rows[0] ? result.rows[0].name : null;
+}
+
+// --------------------------------------------------------------------------------
+// Helper to save or update worker
+// --------------------------------------------------------------------------------
+
+async function saveWorkerRecord(
+  db: any,
+  walletAddress: string,
+  workerName: string,
+  planId: string,
+  engagementType: number,
+  status: string,
+  lastMintedPeriod: string,
+  currentTokenUtxo: string | null,
+  expiresAt: string,
+  metadataHash: string,
+  salarySats: number,
+  role: string
+): Promise<void> {
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO workers (walletAddress, name, planId, engagementType, status, lastMintedPeriod, currentTokenUtxo, expiresAt, metadataHash, salarySats, role)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      walletAddress,
+      workerName,
+      planId,
+      engagementType,
+      status,
+      lastMintedPeriod,
+      currentTokenUtxo,
+      expiresAt,
+      metadataHash,
+      salarySats,
+      role
+    ]
+  });
+}
+
+// --------------------------------------------------------------------------------
+// Helper to update worker after mint (token UTXO)
+// --------------------------------------------------------------------------------
+
+async function updateWorkerPostMint(
+  db: any,
+  walletAddress: string,
+  planId: string,
+  tokenUtxo: string,
+  expiresAt: string,
+  lastMintedPeriod: string
+): Promise<void> {
+  await db.execute({
+    sql: `UPDATE workers 
+          SET currentTokenUtxo = ?, 
+              expiresAt = ?, 
+              lastMintedPeriod = ?,
+              updatedAt = ?
+          WHERE walletAddress = ? AND planId = ?`,
+    args: [
+      tokenUtxo,
+      expiresAt,
+      lastMintedPeriod,
+      new Date().toISOString(),
+      walletAddress,
+      planId
+    ]
   });
 }
 
@@ -199,6 +253,9 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
 export async function mintPayrollToken(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
   
+  // Get database from app locals
+  const db = req.app.locals.db;
+  
   console.log(`\n[HIRING API:${requestId}] ===== START mintPayrollToken =====`);
   
   try {
@@ -260,7 +317,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] 🔍 Looking up company for employer: ${employerAddress.substring(0, 20)}...`);
     
-    const company = await getCompanyByEmployer(employerAddress);
+    const company = await getCompanyByEmployer(db, employerAddress);
     
     if (!company) {
       console.error(`[HIRING API:${requestId}] ❌ Company not found for employer: ${employerAddress}`);
@@ -303,13 +360,12 @@ export async function mintPayrollToken(req: Request, res: Response) {
       console.log(`[HIRING API:${requestId}]   Worker ${i + 1}: ${worker.address.substring(0, 16)}... (${worker.role})`);
       
       // CRITICAL FIX: Get existing worker name to preserve it
-      const existingName = await getExistingWorkerName(worker.address, planMetadata.appId);
+      const existingName = await getExistingWorkerName(db, worker.address, planMetadata.appId);
       const workerName = existingName || worker.role;
       
       console.log(`[HIRING API:${requestId}]   Worker name: ${workerName} (${existingName ? 'existing' : 'new'})`);
       
       // Encrypt worker-specific data using wallet entropy (REAL SALARY is used here)
-      // CRITICAL FIX: Add await here - encryptPayrollData is async
       const encryptedWorkerData = await encryptPayrollData({
         walletAddress: worker.address,
         role: worker.role,
@@ -324,26 +380,20 @@ export async function mintPayrollToken(req: Request, res: Response) {
       workerMetadataHashes.push(metadataHash);
       
       // Save to workers table - preserve name, don't overwrite with role
-      await new Promise((resolve, reject) => {
-        db.run(
-          `INSERT OR REPLACE INTO workers (walletAddress, name, planId, engagementType, status, lastMintedPeriod, currentTokenUtxo, expiresAt, metadataHash, salarySats, role)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            worker.address,
-            workerName,                              // Use preserved name, not worker.role
-            planMetadata.appId,
-            planMetadata.scrollPolicy === 0 ? 0 : 1,
-            'active',
-            new Date().toISOString(),
-            null,
-            new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString(),
-            metadataHash,
-            worker.salarySats,                       // REAL SALARY stored in DB
-            worker.role
-          ],
-          (err: Error | null) => err ? reject(err) : resolve(null)
-        );
-      });
+      await saveWorkerRecord(
+        db,
+        worker.address,
+        workerName,
+        planMetadata.appId,
+        planMetadata.scrollPolicy === 0 ? 0 : 1,
+        'active',
+        new Date().toISOString(),
+        null,
+        new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString(),
+        metadataHash,
+        worker.salarySats,
+        worker.role
+      );
     }
     
     console.log(`[HIRING API:${requestId}] ✅ Worker data encrypted and pinned to IPFS`);
@@ -388,6 +438,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`[HIRING API:${requestId}] Selecting funding UTXO...`);
     
     const funding = await getDynamicFundingUtxo(
+      db,
       treasuryAddress, 
       requiredSats,
       employerAddress
@@ -522,25 +573,14 @@ export async function mintPayrollToken(req: Request, res: Response) {
         console.log(`[HIRING API:${requestId}]   Updating worker ${worker.address.substring(0, 16)}... with token UTXO: ${tokenUtxo}`);
         
         // Update the worker record with the actual token UTXO
-        await new Promise((resolve, reject) => {
-            db.run(
-                `UPDATE workers 
-                 SET currentTokenUtxo = ?, 
-                     expiresAt = ?, 
-                     lastMintedPeriod = ?,
-                     updatedAt = ?
-                 WHERE walletAddress = ? AND planId = ?`,
-                [
-                    tokenUtxo,
-                    expiresAt,
-                    lastMintedPeriod,
-                    new Date().toISOString(),
-                    worker.address,
-                    planMetadata.appId
-                ],
-                (err: Error | null) => err ? reject(err) : resolve(null)
-            );
-        });
+        await updateWorkerPostMint(
+          db,
+          worker.address,
+          planMetadata.appId,
+          tokenUtxo,
+          expiresAt,
+          lastMintedPeriod
+        );
     }
     
     console.log(`[HIRING API:${requestId}] ✅ Updated ${workers.length} workers with token UTXOs`);
@@ -604,6 +644,9 @@ export async function mintPayrollToken(req: Request, res: Response) {
 
 export async function batchHireWorkers(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
+  
+  // Get database from app locals
+  const db = req.app.locals.db;
   
   console.log(`\n[HIRING API:${requestId}] ===== START batchHireWorkers =====`);
   
