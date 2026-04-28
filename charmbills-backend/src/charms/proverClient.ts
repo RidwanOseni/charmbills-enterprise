@@ -204,7 +204,16 @@ export async function generateUnsignedTransactions(
     if (!PROVER_URL) throw new Error('PROVER_API_URL not configured');
     if (!request.fundingUtxo || !request.fundingUtxoValue) throw new Error('Funding UTXO required');
     if (!request.changeAddress) throw new Error('Change address required');
-    if (prevTxHexes.length !== 2) throw new Error(`v0.12 requires exactly 2 prev_txs, got ${prevTxHexes.length}`);
+    
+    // =========================================================================
+    // STEP 1 FIX: Remove hardcoded 2-input requirement for Plan NFT minting
+    // v14 Consolidated Model allows 1 input when anchorUtxo === fundingUtxo
+    // =========================================================================
+    if (prevTxHexes.length === 0) {
+        throw new Error('[PAYROLL PROVER] Context failure: prevTxHexes cannot be empty');
+    }
+    
+    console.log(`[PAYROLL PROVER] Processing ${prevTxHexes.length} inputs for transaction...`);
     
     if (!treasuryHexDest) {
         throw new Error('treasuryHexDest is required for NFT minting');
@@ -268,11 +277,39 @@ export async function generateUnsignedTransactions(
         // =========================================================================
         // MANDATORY VERSION OVERRIDE
         // This resolves the "spell.version == CURRENT_VERSION" error in prove-log.txt
-        // The local v12 prover requires version 12, but the bridge returns version 11
+        // The local v14 prover requires version 14, but the bridge returns version 11
         // =========================================================================
-        console.log('[PAYROLL PROVER] Overriding spell.version from', spellObj.version, 'to 12');
-        spellObj.version = 12;
+        console.log('[PAYROLL PROVER] Overriding spell.version from', spellObj.version, 'to 14');
+        spellObj.version = 14;
         console.log('[PAYROLL PROVER] spell.version is now', spellObj.version);
+        
+        // =========================================================================
+        // COLLAPSED MODEL DEDUPLICATION
+        // When anchorUtxo === fundingUtxo (single consolidated UTXO), we need to reduce
+        // the spell to have exactly 1 input and 1 prev_txs for the Prover API
+        // =========================================================================
+        console.log(`[PAYROLL PROVER] Checking for Collapsed Model deduplication...`);
+        console.log(`[PAYROLL PROVER]   request.anchorUtxo: ${request.anchorUtxo}`);
+        console.log(`[PAYROLL PROVER]   request.fundingUtxo: ${request.fundingUtxo}`);
+        console.log(`[PAYROLL PROVER]   Are they equal? ${request.anchorUtxo === request.fundingUtxo}`);
+        console.log(`[PAYROLL PROVER]   spellObj.tx.ins length: ${spellObj.tx?.ins?.length || 0}`);
+        
+        if (request.anchorUtxo === request.fundingUtxo && spellObj.tx.ins && spellObj.tx.ins.length > 1) {
+            console.log('[PAYROLL PROVER] 🚀 COLLAPSED MODEL: Reducing tx.ins to single unique input');
+            
+            // 1. Reduce the inputs in the spell to just the authority input (first one)
+            const originalInsLength = spellObj.tx.ins.length;
+            spellObj.tx.ins = [spellObj.tx.ins[0]];
+            console.log(`[PAYROLL PROVER]   Reduced tx.ins from ${originalInsLength} to ${spellObj.tx.ins.length}`);
+            
+            // 2. Reduce the provided parent transaction hexes to just one
+            // This ensures the Prover API sees a perfectly matching 1-input structure
+            const originalPrevTxLength = prevTxHexes.length;
+            prevTxHexes = [prevTxHexes[0]];
+            console.log(`[PAYROLL PROVER]   Reduced prevTxHexes from ${originalPrevTxLength} to ${prevTxHexes.length}`);
+        } else {
+            console.log('[PAYROLL PROVER]   No collapsed model deduplication needed');
+        }
         
         // =========================================================================
         // BRANCH LOGIC: mint-nft vs mint-token
@@ -313,12 +350,27 @@ export async function generateUnsignedTransactions(
                 console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.outs.length} tx.outs entries to Maps`);
             }
             
-            // Patch Inputs: Bridge returns "txid:vout" strings - convert to 36-byte Uint8Array
+            // =========================================================================
+            // STEP 2 FIX: Dynamic tx.ins patching based on actual prevTxHexes length
+            // This allows 1-input transactions for Consolidated Model
+            // =========================================================================
             console.log('[PAYROLL PROVER] Patching tx.ins from UTXO strings to 36-byte Uint8Array...');
             if (spellObj.tx && Array.isArray(spellObj.tx.ins)) {
-                spellObj.tx.ins = spellObj.tx.ins.map((utxoId: string) => {
+                // Ensure we have matching parent hexes for each input
+                if (spellObj.tx.ins.length !== prevTxHexes.length) {
+                    console.warn(`[PAYROLL PROVER] WARNING: tx.ins length (${spellObj.tx.ins.length}) != prevTxHexes length (${prevTxHexes.length})`);
+                    console.warn(`[PAYROLL PROVER] This may cause verification issues. Truncating to match.`);
+                }
+                
+                spellObj.tx.ins = spellObj.tx.ins.map((utxoId: string, index: number) => {
+                    // Ensure we have a parent hex for this input
+                    const currentHex = prevTxHexes[index];
+                    if (!currentHex) {
+                        throw new Error(`[PAYROLL PROVER] Missing parent hex for input at index ${index}`);
+                    }
+                    
                     const result = new Uint8Array(utxoTo36Bytes(utxoId));
-                    console.log(`[PAYROLL PROVER] DEBUG - Converted UTXO: ${utxoId} -> ${result.length} bytes`);
+                    console.log(`[PAYROLL PROVER] DEBUG - Converted UTXO ${index}: ${utxoId} -> ${result.length} bytes`);
                     return result;
                 });
                 console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.ins.length} tx.ins entries`);
@@ -548,6 +600,15 @@ export async function generateUnsignedTransactions(
     
     const requestBodySize = JSON.stringify(requestBody).length;
     console.log(`[PAYROLL PROVER] Request body JSON size: ${requestBodySize} bytes`);
+
+    // =========================================================================
+    // CAPTURE PAYLOAD FOR CHARMS TEAM DEBUGGING
+    // =========================================================================
+    const fs = require('fs');
+    const payloadPath = '/tmp/prover-payload-batch.json';
+    fs.writeFileSync(payloadPath, JSON.stringify(requestBody, null, 2));
+    console.log(`[PAYROLL PROVER] ✅ Saved batch payload to ${payloadPath}`);
+    console.log(`[PAYROLL PROVER] Payload size: ${JSON.stringify(requestBody).length} bytes`);
 
     // ----------------------------------------------------------------------------
     // Step 9: Send to Prover API with retries

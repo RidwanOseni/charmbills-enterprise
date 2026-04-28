@@ -30,6 +30,9 @@ export const WalletContext = createContext<WalletContextType | undefined>(undefi
  * FIX: Polymorphic Signing based on Actual Script Length [3, 4, 9]
  * - Input 0 (Anchor): Always Taproot (34-byte script) - includes tapInternalKey
  * - Input 1 (Fee): Uses fundingScript from dualUtxoContext (actual on-chain script)
+ * FIX: Input 1 now properly uses context.fee.value (>=15000 sats) and extracts script from parent transaction hex
+ * FIX: Removed context.isSingle wrapper - if decoded transaction has 2 inputs, we add both unconditionally
+ * FIX: Added total sats validation to prevent "insufficient fuel" errors
  */
 function buildTaprootPsbt(
     rawHex: string, 
@@ -55,11 +58,12 @@ function buildTaprootPsbt(
         lockTime: decoded.lockTime     // ✅ Correct approach - passed to constructor
     });
 
+    console.log('[buildTaprootPsbt] ========== PSBT CONSTRUCTION START ==========');
     console.log('[buildTaprootPsbt] Decoded transaction:', {
         inputs: decoded.inputs.length,
         outputs: decoded.outputs.length,
         witnesses: decoded.witnesses?.length || 0,
-        isSingle: context.isSingle,
+        isSingle: context?.isSingle,
         version: 2,
         lockTime: decoded.lockTime
     });
@@ -73,122 +77,137 @@ function buildTaprootPsbt(
     // Map outputs
     decoded.outputs.forEach(out => psbt.addOutput({ amount: out.amount, script: out.script }));
 
-    // Map inputs
+    // =========================================================================
+    // PROFESSIONAL AUDIT: Track total input and output sats to validate fuel
+    // =========================================================================
+    let totalInputSats = BigInt(0);
+    let totalOutputSats = BigInt(0);
+    
+    // Calculate total outputs first
+    decoded.outputs.forEach(out => {
+        totalOutputSats += out.amount;
+    });
+    console.log(`[PSBT AUDIT] Total Output Sats: ${totalOutputSats.toString()}`);
+
+    // =========================================================================
+    // CRITICAL FIX: Map inputs with explicit values for Plan NFT and Treasury UTXO
+    // Input 0: The Plan NFT (Authority) - always 1000 sats
+    // Input 1: The Treasury UTXO (Gas/Fees) - uses context.fee.value (>=15000 sats)
+    // =========================================================================
     decoded.inputs.forEach((input, i) => {
+        console.log(`[PSBT AUDIT] Processing Input ${i}...`);
+        
         if (i === 0) {
             // =========================================================================
-            // Input 0 is the Anchor UTXO: Always Taproot (34-byte script)
-            // Must use the Anchor's extracted script (targetScript)
+            // INPUT 0: The Plan NFT (Authority UTXO) - 1,000 sats
             // =========================================================================
-            console.log('[buildTaprootPsbt] Adding Input 0 (Anchor):', {
+            console.log('[PSBT AUDIT] Adding Input 0 (Authority):', {
                 txid: targetTxid,
                 vout: targetVout,
                 value: targetValue,
-                scriptType: 'targetScript (from anchor tx)',
                 scriptLength: targetScript.length
             });
+            totalInputSats += BigInt(targetValue);
             psbt.addInput({
                 txid: targetTxid,
                 index: targetVout,
                 witnessUtxo: {
                     amount: BigInt(targetValue),
-                    script: targetScript  // ✅ Use targetScript for Anchor input
+                    script: targetScript
                 },
-                tapInternalKey: payment.tapInternalKey, // ✅ Correct for 34-byte Taproot script
+                tapInternalKey: payment.tapInternalKey,
                 sequence: input.sequence
             });
+            console.log(`[PSBT AUDIT] Input 0 Added: ${targetValue} sats`);
+            
         } else if (i === 1) {
-            if (context.isSingle) {
-                // =========================================================================
-                // v0.12 MODE: Input 1 is the Fee UTXO
-                // CRITICAL FIX: Use the fundingScript from dualUtxoContext (actual on-chain script)
-                // This script comes from the frontend via the backend's fundingScript field
-                // =========================================================================
-                if (!context.fee) {
-                    throw new Error('Missing fee UTXO context for PSBT input 1 in v0.12 mode');
-                }
-                const [feeTxid, feeVoutStr] = context.fee.utxoId.split(':');
-                const vout = parseInt(feeVoutStr);
-                
-                // =========================================================================
-                // CRITICAL: Use context.fee.script (actual on-chain script from fundingScript)
-                // This is the authentic script that protects the UTXO on the blockchain
-                // Fallback to payment.script only if context.fee.script is not provided
-                // =========================================================================
-                let feeScript: Uint8Array;
-                if (context.fee.script) {
-                    // Use the actual script from the backend (passed via fundingScript)
-                    feeScript = typeof context.fee.script === 'string' 
-                        ? hexToBytes(context.fee.script) 
-                        : context.fee.script;
-                    console.log('[buildTaprootPsbt] v0.12: Using fundingScript from context (actual on-chain script)');
-                } else {
-                    // Fallback: decode from fee hex (legacy, should not happen after fix)
-                    console.warn('[buildTaprootPsbt] v0.12: No fundingScript in context - falling back to decoding from hex');
-                    const feeTx = btc.RawTx.decode(hexToBytes(context.fee.hex));
-                    feeScript = feeTx.outputs[vout].script;
-                }
-                
-                const isInput1Taproot = feeScript.length === 34;
-                
-                console.log('[buildTaprootPsbt] v0.12: Adding Input 1 (Fee UTXO):', {
-                    txid: feeTxid,
-                    vout: vout,
-                    value: context.fee.value,
-                    scriptLength: feeScript.length,
-                    isTaproot: isInput1Taproot,
-                    willUseTapInternalKey: isInput1Taproot,
-                    scriptSource: context.fee.script ? 'fundingScript (from backend)' : 'decoded from hex'
+            // =========================================================================
+            // INPUT 1: The Treasury UTXO (Gas Sponsor) - ≥15,000 sats
+            // PROFESSIONAL FIX: REMOVED 'if (context.isSingle)' wrapper
+            // If the prover gave us 2 inputs, we MUST provide 2 inputs regardless of flags
+            // =========================================================================
+            console.log('[PSBT AUDIT] Processing Input 1 (Treasury Fuel)...');
+            
+            if (!context || !context.fee) {
+                console.error('[PSBT AUDIT] FATAL: Input 1 found in template but NO fee context provided!', {
+                    contextExists: !!context,
+                    feeExists: !!context?.fee
                 });
-                
-                // =========================================================================
-                // CRITICAL FIX: Polymorphic signing based on actual script length
-                // Only add tapInternalKey if it's actually a Taproot UTXO (34-byte script)
-                // For non-Taproot UTXOs, this must be omitted to get an ECDSA signature
-                // =========================================================================
-                const inputConfig: any = {
-                    txid: feeTxid,
-                    index: vout,
-                    witnessUtxo: {
-                        amount: BigInt(context.fee.value),
-                        script: feeScript  // ✅ Use the authentic script from context
-                    },
-                    sequence: input.sequence
-                };
-                
-                // Only add tapInternalKey for Taproot UTXOs (34-byte scripts)
-                if (isInput1Taproot) {
-                    inputConfig.tapInternalKey = payment.tapInternalKey;
-                    console.log('[buildTaprootPsbt] Input 1: Taproot detected - adding tapInternalKey');
-                } else {
-                    console.log('[buildTaprootPsbt] Input 1: Non-Taproot detected - NO tapInternalKey (ECDSA signature)');
-                }
-                
-                psbt.addInput(inputConfig);
-            } else {
-                // v11 MODE: Input 1 spends the finalized Commit TX (no tapInternalKey needed)
-                if (!context.commit) {
-                    throw new Error('Missing commit UTXO context for PSBT input 1 in v11 mode');
-                }
-                console.log('[buildTaprootPsbt] v11: Adding Input 1 (Commit Output):', {
-                    txid: context.commit.txid,
-                    vout: context.commit.vout,
-                    value: context.commit.value
-                });
-                
-                psbt.addInput({
-                    txid: context.commit.txid,
-                    index: context.commit.vout,
-                    witnessUtxo: {
-                        amount: BigInt(context.commit.value),
-                        script: context.commit.script
-                    },
-                    // NO tapInternalKey for v11 mode - this input is pre-signed by ZK-prover
-                    sequence: input.sequence
-                });
+                throw new Error('Fatal: Treasury "fuel" missing for input 1. Cannot build PSBT.');
             }
+            
+            console.log('[PSBT AUDIT] Context fee details:', {
+                utxoId: context.fee.utxoId,
+                value: context.fee.value,
+                hasHex: !!context.fee.hex,
+                hasScript: !!context.fee.script,
+                scriptLength: context.fee.script?.length
+            });
+            
+            // CORRECT EXTRACTION: Split into string components
+            const utxoParts = context.fee.utxoId.split(':');
+            const feeTxid = utxoParts[0];           // String: The Transaction ID
+            const feeVout = parseInt(utxoParts[1]);   // Number: The Output Index
+            
+            console.log(`[PSBT AUDIT] Parsed fee UTXO: txid=${feeTxid}, vout=${feeVout}`);
+            
+            // CORRECT SCRIPT DECODING: Extracting the actual locking script
+            let actualScriptPubKey: Uint8Array;
+            
+            if (context.fee.script && context.fee.script.length === 34) {
+                // Use the script if already provided and correct length
+                actualScriptPubKey = typeof context.fee.script === 'string' 
+                    ? hexToBytes(context.fee.script) 
+                    : context.fee.script;
+                console.log(`[PSBT AUDIT] Using fee script from context, length: ${actualScriptPubKey.length}`);
+            } else if (context.fee.hex) {
+                // CRITICAL: Decode the parent transaction and extract the script from the specific output
+                console.log('[PSBT AUDIT] Decoding fee parent transaction to extract scriptPubKey...');
+                const parentTx = btc.RawTx.decode(hexToBytes(context.fee.hex));
+                actualScriptPubKey = parentTx.outputs[feeVout].script;
+                console.log(`[PSBT AUDIT] Extracted script from parent tx output ${feeVout}, length: ${actualScriptPubKey.length}`);
+                console.log(`[PSBT AUDIT] Script preview: ${bytesToHex(actualScriptPubKey).substring(0, 50)}...`);
+            } else {
+                console.error('[PSBT AUDIT] Missing both script and hex for Treasury UTXO');
+                throw new Error('Missing both script and hex for Treasury UTXO');
+            }
+            
+            const isTaproot = actualScriptPubKey.length === 34;
+            
+            console.log(`[PSBT AUDIT] Adding Input 1 (Treasury Fuel):`, {
+                txid: feeTxid,
+                vout: feeVout,
+                value: context.fee.value,
+                scriptLength: actualScriptPubKey.length,
+                isTaproot: isTaproot
+            });
+            
+            totalInputSats += BigInt(context.fee.value);
+            
+            const inputConfig: any = {
+                txid: feeTxid,
+                index: feeVout,
+                witnessUtxo: {
+                    amount: BigInt(context.fee.value),
+                    script: actualScriptPubKey
+                },
+                sequence: input.sequence
+            };
+            
+            // Only add tapInternalKey for Taproot UTXOs (34-byte scripts)
+            if (isTaproot) {
+                inputConfig.tapInternalKey = payment.tapInternalKey;
+                console.log('[PSBT AUDIT] Input 1 is Taproot - adding tapInternalKey');
+            } else {
+                console.log('[PSBT AUDIT] Input 1 is non-Taproot - NO tapInternalKey');
+            }
+            
+            psbt.addInput(inputConfig);
+            console.log(`[PSBT AUDIT] Input 1 Added: ${context.fee.value} sats`);
+            
         } else {
-            console.warn('[buildTaprootPsbt] Unexpected input index:', i);
+            console.warn('[PSBT AUDIT] Unexpected input index:', i);
+            totalInputSats += BigInt(1000);
             psbt.addInput({
                 txid: bytesToHex(input.txid),
                 index: input.index,
@@ -202,6 +221,26 @@ function buildTaprootPsbt(
         }
     });
 
+    // =========================================================================
+    // PROFESSIONAL AUDIT: Final math check before returning
+    // This prevents the "Outputs spends more than inputs amount" error
+    // =========================================================================
+    console.log(`[PSBT AUDIT] ========== FINAL MATH CHECK ==========`);
+    console.log(`[PSBT AUDIT] Total Input Sats: ${totalInputSats.toString()}`);
+    console.log(`[PSBT AUDIT] Total Output Sats: ${totalOutputSats.toString()}`);
+    console.log(`[PSBT AUDIT] Input - Output: ${(totalInputSats - totalOutputSats).toString()} sats`);
+    
+    if (totalInputSats < totalOutputSats) {
+        const deficit = totalOutputSats - totalInputSats;
+        console.error(`[PSBT AUDIT] ❌ INSUFFICIENT FUEL: Inputs(${totalInputSats}) vs Outputs(${totalOutputSats})`);
+        console.error(`[PSBT AUDIT] Deficit: ${deficit} sats`);
+        throw new Error(`Insufficient Fuel: ${totalInputSats} sats in vs ${totalOutputSats} sats out (deficit: ${deficit} sats)`);
+    }
+    
+    console.log(`[PSBT AUDIT] ✅ Fuel check passed: ${totalInputSats} sats in >= ${totalOutputSats} sats out`);
+    console.log('[PSBT AUDIT] PSBT built successfully, total inputs:', psbt.inputsLength);
+    console.log('[buildTaprootPsbt] ========== PSBT CONSTRUCTION END ==========');
+    
     return bytesToHex(psbt.toPSBT());
 }
 
@@ -225,11 +264,11 @@ function buildCommitPsbt(rawHex: string, anchorUtxo: any, feeUtxo: any, pubKeyHe
     });
 
     console.log('[buildCommitPsbt] Building commit PSBT');
-    console.log('[buildCommitPsbt] Anchor UTXO:', {
+    console.log('[buildCommitPsbt] Anchor UTXO (Plan NFT):', {
         utxoId: anchorUtxo.utxoId,
         value: anchorUtxo.value
     });
-    console.log('[buildCommitPsbt] Fee UTXO:', {
+    console.log('[buildCommitPsbt] Fee UTXO (Treasury):', {
         utxoId: feeUtxo.utxoId,
         value: feeUtxo.value
     });
@@ -246,7 +285,7 @@ function buildCommitPsbt(rawHex: string, anchorUtxo: any, feeUtxo: any, pubKeyHe
     const [feeTxid, feeVoutStr] = feeUtxo.utxoId.split(':');
     const feeVout = parseInt(feeVoutStr);
     
-    console.log('[buildCommitPsbt] Adding anchor UTXO as input 0:', { txid: anchorTxid, vout: anchorVout, value: anchorUtxo.value });
+    console.log('[buildCommitPsbt] Adding anchor UTXO as input 0 (Plan NFT):', { txid: anchorTxid, vout: anchorVout, value: anchorUtxo.value });
     psbt.addInput({
         txid: anchorTxid,
         index: anchorVout,
@@ -258,7 +297,7 @@ function buildCommitPsbt(rawHex: string, anchorUtxo: any, feeUtxo: any, pubKeyHe
         sequence: 0xffffffff
     });
     
-    console.log('[buildCommitPsbt] Adding fee UTXO as input 1:', { txid: feeTxid, vout: feeVout, value: feeUtxo.value });
+    console.log('[buildCommitPsbt] Adding fee UTXO as input 1 (Treasury):', { txid: feeTxid, vout: feeVout, value: feeUtxo.value });
     psbt.addInput({
         txid: feeTxid,
         index: feeVout,
@@ -383,11 +422,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 isSingle: proverResult.isSingle
             });
 
-            console.log('[WalletContext] Fee UTXO details:', {
-                utxoId: dualUtxoContext.fee.utxoId,
-                value: dualUtxoContext.fee.value,
-                scriptHex: dualUtxoContext.fee.script,
-                scriptLength: dualUtxoContext.fee.script?.length
+            console.log('[WalletContext] Fee UTXO (Treasury) details:', {
+                utxoId: dualUtxoContext.fee?.utxoId,
+                value: dualUtxoContext.fee?.value,
+                scriptHex: dualUtxoContext.fee?.script,
+                scriptLength: dualUtxoContext.fee?.script?.length
             });
 
             if (!dualUtxoContext.fee || !dualUtxoContext.anchor) {
@@ -453,27 +492,35 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 // Do NOT re-decode the fee transaction - use the script provided by the backend
                 // =========================================================================
                 let actualFeeScript: Uint8Array;
-                if (dualUtxoContext.fee.script) {
+                if (dualUtxoContext.fee.script && dualUtxoContext.fee.script.length === 34) {
                     actualFeeScript = typeof dualUtxoContext.fee.script === 'string' 
                         ? hexToBytes(dualUtxoContext.fee.script) 
                         : dualUtxoContext.fee.script;
                     console.log('[WalletContext] Using fee script from context (fundingScript)');
                 } else {
-                    // Fallback: decode from hex (should not happen after fix)
-                    console.warn('[WalletContext] No fee script in context - falling back to decoding from hex');
+                    // Fallback: decode from hex to extract scriptPubKey
+                    console.warn('[WalletContext] No fee script in context - extracting from hex');
                     const feeTx = btc.RawTx.decode(hexToBytes(dualUtxoContext.fee.hex));
                     const [feeTxid, feeVoutStr] = dualUtxoContext.fee.utxoId.split(':');
                     const feeVout = parseInt(feeVoutStr);
                     actualFeeScript = feeTx.outputs[feeVout].script;
+                    console.log(`[WalletContext] Extracted fee script from hex, length: ${actualFeeScript.length}`);
                 }
                 
                 // Add the fee script to context for buildTaprootPsbt
                 dualUtxoContext.fee.script = actualFeeScript;
                 
+                // =========================================================================
+                // CRITICAL: Combine dualUtxoContext with isSingle flag from proverResult
+                // The buildTaprootPsbt function now ignores isSingle and always adds Input 1
+                // =========================================================================
                 const singleTxContext = {
                     ...dualUtxoContext,
-                    isSingle: true
+                    isSingle: proverResult.isSingle
                 };
+                
+                console.log('[WalletContext] singleTxContext.isSingle:', singleTxContext.isSingle);
+                console.log('[WalletContext] singleTxContext.fee exists:', !!singleTxContext.fee);
                 
                 const combinedPsbt = buildTaprootPsbt(
                     spellRaw,
@@ -492,13 +539,13 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 // 3. DO NOT manually re-attach witnesses - proof is in OP_RETURN output
                 // 4. DO NOT updateInput(1, ...) - this would wipe the Fee signature!
                 // =========================================================================
-                console.log('[WalletContext] Requesting signature for both inputs (Anchor + Fee)');
+                console.log('[WalletContext] Requesting signature for both inputs (Plan NFT + Treasury UTXO)');
+                console.log('[WalletContext] Combined PSBT length:', combinedPsbt.length);
                 
                 const signedRes = await (window as any).LeatherProvider.request("signPsbt", {
                     hex: combinedPsbt,
                     network: "testnet",
                     broadcast: false
-                    // No signAtIndex: wallet signs all inputs owned by the wallet
                 });
                 
                 console.log('✅ Spell PSBT signed by wallet for all inputs');
@@ -532,9 +579,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 let txidStrings: string[] = [];
                 try {
                     console.log('📤 Broadcasting single transaction...');
-                    // Use port 3002 to match backend server
                     const broadcastResponse = await axios.post('http://localhost:3002/api/broadcast-package', {
-                        transactions: [finalizedHex]  // Correctly send as a single-item array
+                        transactions: [finalizedHex]
                     });
                     
                     const data = broadcastResponse.data.txids;
@@ -564,9 +610,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             // ============================================================
             
             console.log('🔐 Signing Commit Transaction...');
-            console.log('Anchor UTXO value:', dualUtxoContext.anchor.value, 'sats');
+            console.log('Anchor UTXO (Plan NFT) value:', dualUtxoContext.anchor.value, 'sats');
             console.log('Anchor UTXO ID:', dualUtxoContext.anchor.utxoId);
-            console.log('Fee UTXO value:', dualUtxoContext.fee.value, 'sats');
+            console.log('Fee UTXO (Treasury) value:', dualUtxoContext.fee.value, 'sats');
             console.log('Fee UTXO ID:', dualUtxoContext.fee.utxoId);
             
             const commitPsbt = buildCommitPsbt(commitRaw, dualUtxoContext.anchor, dualUtxoContext.fee, taprootPublicKey);
@@ -609,7 +655,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             console.log('[WalletContext] Commit output added to context');
 
             console.log('🔐 Signing Spell Transaction...');
-            console.log('Anchor UTXO value:', dualUtxoContext.anchor.value, 'sats');
+            console.log('Anchor UTXO (Plan NFT) value:', dualUtxoContext.anchor.value, 'sats');
             console.log('Anchor UTXO ID:', dualUtxoContext.anchor.utxoId);
             console.log('Commit output value:', dualUtxoContext.commit.value, 'sats');
             console.log('Commit output TXID:', dualUtxoContext.commit.txid);
@@ -639,16 +685,13 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             
             console.log('[WalletContext] Spell PSBT built, length:', spellPsbt.length);
             
-            // Request signature for ALL inputs
             const spellRes = await (window as any).LeatherProvider.request("signPsbt", {
                 hex: spellPsbt,
                 network: "testnet",
                 broadcast: false
-                // No signAtIndex: wallet signs all inputs owned by the wallet
             });
             console.log('[WalletContext] Spell signed, response received');
 
-            // For dual-transaction mode, we still need to stitch the proof
             console.log('[WalletContext] Dual-transaction mode: Stitching proof from original spell...');
             
             const spellTx = btc.Transaction.fromPSBT(
@@ -657,12 +700,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
             );
             const originalSpellTx = btc.RawTx.decode(hexToBytes(spellRaw));
             
-            // Look for the proof witness in the original spell
-            // The proof is typically in the first witness (index 0)
             if (originalSpellTx.witnesses && originalSpellTx.witnesses.length > 0) {
                 const proofWitness = originalSpellTx.witnesses[0];
                 if (proofWitness && proofWitness.length > 0) {
-                    // Restore proof to input 1 (the OP_RETURN input)
                     spellTx.updateInput(1, { 
                         finalScriptWitness: proofWitness 
                     });
@@ -695,17 +735,12 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                 } else {
                     console.warn('⚠️ Broadcast returned unexpected response format');
                 }
-                // =========================================================================
-                // CRITICAL FIX: Update backend with actual broadcasted txid
-                // This ensures the worker portal shows the correct token UTXO
-                // =========================================================================
+                
                 if (txidStrings.length > 0) {
                     const actualTxid = txidStrings[0];
                     console.log(`[WalletContext] Updating backend with actual txid: ${actualTxid}`);
                     
                     try {
-                        // Get the worker's planId from somewhere - you may need to pass it
-                        // For now, we'll use a placeholder - you need to get the actual planId
                         const workerRecord = await axios.get(`http://localhost:3002/api/workers/${address}`);
                         const planId = workerRecord.data.planId;
                         
@@ -713,7 +748,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
                             walletAddress: address,
                             planId: planId,
                             actualTxid: actualTxid,
-                            voutIndex: 0  // Worker token is always at output index 0
+                            voutIndex: 0
                         });
                         console.log('[WalletContext] ✅ Backend updated with actual txid');
                     } catch (updateError: any) {

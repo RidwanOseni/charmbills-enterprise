@@ -282,6 +282,8 @@ function getMultiSigConfig(multiSigRequired?: boolean, requestSigners?: string[]
  * 9. ADDED utxoAddress field for app_private_inputs conversion
  * 10. CRITICAL FIX: BOTH anchorTxHex AND fundingTxHex are now passed to prover
  * 11. ADDED fundingScript to accept the actual on-chain script for wallet signing
+ * 12. CRITICAL FIX: Collapsed Model - passes same UTXO for both anchor and fee when equal
+ * 13. CRITICAL FIX: Deduplicate prev_txs hexes when anchor and funding UTXOs are the same
  */
 export async function createPayrollPlan(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -430,14 +432,32 @@ export async function createPayrollPlan(req: Request, res: Response) {
     // NOTE: Pass remaining as the budget [14], compensationSats = 0 for Unified Model [15]
     // CRITICAL: Include utxoAddress for app_private_inputs conversion
     // CRITICAL: Include fundingScript if provided (for wallet signing context)
+    // CRITICAL FIX: Collapsed Model - pass the same UTXO for both anchor and fee when equal
+    // This satisfies the Type System while telling the Prover that the source of authority
+    // and the source of fees are the same UTXO, enabling single-input transaction for v14 scanner
     // ----------------------------------------------------------------------------
     console.log(`[PLANS API:${requestId}] 🔧 Building SpellRequest...`);
     
+    // CRITICAL DEDUPLICATION: Check if anchor and funding UTXOs are the same
+    const isCollapsed = anchorUtxo === fundingUtxo;
+    console.log(`[PLANS API:${requestId}] Input deduplication check: anchorUtxo === fundingUtxo? ${isCollapsed}`);
+    
+    if (isCollapsed) {
+      console.log(`[PLANS API:${requestId}] 🚀 Collapsed Model detected - using single UTXO for both anchor and fee`);
+      console.log(`[PLANS API:${requestId}] This reduces transaction to single input for v14 NFT Scanner compatibility`);
+    }
+    
+    // CRITICAL FIX: Pass the variables directly. If isCollapsed is true,
+    // they already contain the same UTXO ID and Value.
+    // This satisfies the 'string' and 'number' type requirements.
     const spellRequest: SpellRequest = {
       type: 'mint-nft',
-      anchorUtxo,
-      anchorValue,
-      fundingUtxo,
+      anchorUtxo: anchorUtxo,
+      anchorValue: anchorValue,
+      // FIX: Pass the variables directly. If isCollapsed is true,
+      // they already contain the same UTXO ID and Value.
+      // This satisfies the 'string' and 'number' type requirements.
+      fundingUtxo: fundingUtxo,
       fundingUtxoValue: fundingValue,
       changeAddress: employerAddress,
       utxoAddress: utxoAddress,      // REQUIRED: Address for app_private_inputs conversion
@@ -457,20 +477,44 @@ export async function createPayrollPlan(req: Request, res: Response) {
       ...getMultiSigConfig(multiSigRequired, multiSigSigners, multiSigThreshold)
     };
     
+    console.log(`[PLANS API:${requestId}] SpellRequest constructed with fundingUtxo: ${spellRequest.fundingUtxo ? spellRequest.fundingUtxo.substring(0, 20) + '...' : 'undefined'}`);
+    console.log(`[PLANS API:${requestId}] Collapsed mode: anchorUtxo === fundingUtxo? ${anchorUtxo === fundingUtxo}`);
+    
     // ----------------------------------------------------------------------------
     // Step 8: Generate unsigned transactions via prover
-    // CRITICAL FIX: BOTH hex strings (anchor + funding) MUST be passed to the prover
-    // The API requires prev_txs to contain transactions that create BOTH input UTXOs
-    // ----------------------------------------------------------------------------
+    // CRITICAL FIX: DEDUPLICATE prev_txs hexes when anchor and funding UTXOs are the same
+    // Pass only the unique hexes needed for context to avoid duplicate context
+    // The prover's collapsed model deduplication will handle the rest
+    // =========================================================================
+    // FRIEND'S FIX: Build the context array for the Prover
+    // If collapsed, we pass only 1 hex. If separate, we pass 2.
+    // This creates the single-input architecture the v12 Scanner requires [Source 144]
+    // =========================================================================
     console.log(`[PLANS API:${requestId}] ⏳ Calling proverClient...`);
-    console.log(`[PLANS API:${requestId}] Passing BOTH anchorTxHex and fundingTxHex to prover`);
     
+    // 1. Detect if we are in "Collapsed Model" (Same UTXO for authority and gas)
+    console.log(`[PLANS API:${requestId}] Collapsed Model detection: anchorUtxo === fundingUtxo? ${anchorUtxo === fundingUtxo}`);
+    
+    // 2. Build the context array for the Prover
+    // If collapsed, we pass only 1 hex. If separate, we pass 2.
+    const contextHexes = isCollapsed 
+      ? [cleanAnchorTxHex] 
+      : [cleanAnchorTxHex, cleanFundingTxHex];
+    
+    console.log(`[PLANS API:${requestId}] Context hexes count: ${contextHexes.length}`);
+    console.log(`[PLANS API:${requestId}] Context hexes details:`, contextHexes.map((hex, i) => ({
+      index: i,
+      length: hex.length,
+      prefix: hex.substring(0, 30) + '...'
+    })));
+    
+    // 3. Call the newly unlocked prover with the deduplicated context array
     const result = await generateUnsignedTransactions(
       spellRequest, 
-      [cleanAnchorTxHex, cleanFundingTxHex], // BOTH raw hex strings from frontend (anchor FIRST, funding SECOND)
-      company.treasuryHexDest,               // Pass treasuryHexDest from company lookup
-      undefined,                             // appId not needed for mint-nft
-      utxoAddress                            // Pass utxoAddress for app_private_inputs conversion
+      contextHexes,                               // Pass the deduplicated array (length 1 or 2)
+      company.treasuryHexDest,                   // Pass treasuryHexDest from company lookup
+      undefined,                                 // appId not needed for mint-nft
+      utxoAddress                                // Pass utxoAddress for app_private_inputs conversion
     );
     
     console.log(`[PLANS API:${requestId}] ✅ Transactions generated`);
@@ -558,19 +602,27 @@ export async function createPayrollPlan(req: Request, res: Response) {
 }
 
 // --------------------------------------------------------------------------------
-// Plan Query API - For frontend dashboard [9] - UPDATED
+// Plan Query API - For frontend dashboard [9] - UPDATED WITH NON-BLOCKING SYNC
 // --------------------------------------------------------------------------------
 
 /**
  * Retrieves plans from the database, optionally filtered by department or employer.
  * Endpoint: GET /api/plans
+ * 
+ * CRITICAL FIX: Non-blocking background sync - removed 'await' to return data instantly
+ * The indexer runs in background without blocking the HTTP response
  */
 export async function getPlans(req: Request, res: Response) {
   const db = req.app.locals.db;
   
   try {
-    // Trigger lazy indexer sync to update blockchain state before returning data
-    await syncIndexer(db, 50);
+    // CRITICAL FIX: Remove await - trigger indexer sync in background (non-blocking)
+    // This allows the API to return cached database data immediately
+    // while the indexer updates the blockchain state in the background
+    console.log('[PLANS API] Triggering background indexer sync (non-blocking)...');
+    syncIndexer(db, 10).catch(err => {
+      console.error('[PLANS API] Background indexer sync failed:', err);
+    });
     
     const { department, employerAddress, limit = '50', offset = '0' } = req.query;
     
@@ -608,6 +660,7 @@ export async function getPlans(req: Request, res: Response) {
       createdAt: row.createdAt
     }));
     
+    console.log(`[PLANS API] Returning ${rowsWithAnchor.length} plans (cached data)`);
     res.json(rowsWithAnchor);
   } catch (error: any) {
     console.error('[PLANS API] Error in getPlans:', error);
@@ -616,19 +669,25 @@ export async function getPlans(req: Request, res: Response) {
 }
 
 // --------------------------------------------------------------------------------
-// Plan Details API - Get single plan by appId - UPDATED
+// Plan Details API - Get single plan by appId - UPDATED WITH NON-BLOCKING SYNC
 // --------------------------------------------------------------------------------
 
 /**
  * Retrieves a single plan by its appId.
  * Endpoint: GET /api/plans/:appId
+ * 
+ * CRITICAL FIX: Non-blocking background sync - removed 'await' to return data instantly
+ * The indexer runs in background without blocking the HTTP response
  */
 export async function getPlanById(req: Request, res: Response) {
   const db = req.app.locals.db;
   
   try {
-    // Trigger lazy indexer sync to update blockchain state before returning data
-    await syncIndexer(db, 50);
+    // CRITICAL FIX: Remove await - trigger indexer sync in background (non-blocking)
+    console.log('[PLANS API] Triggering background indexer sync for single plan (non-blocking)...');
+    syncIndexer(db, 10).catch(err => {
+      console.error('[PLANS API] Background indexer sync failed:', err);
+    });
     
     const { appId } = req.params;
     
@@ -662,6 +721,7 @@ export async function getPlanById(req: Request, res: Response) {
       createdAt: row.createdAt
     };
     
+    console.log(`[PLANS API] Returning plan ${appId.substring(0, 16)}... (cached data)`);
     res.json(rowWithAnchor);
   } catch (error: any) {
     console.error('[PLANS API] Error in getPlanById:', error);

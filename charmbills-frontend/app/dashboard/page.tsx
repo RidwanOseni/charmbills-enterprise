@@ -118,53 +118,30 @@ export default function EmployerDashboard() {
     
     console.log(`[DEPARTMENT SETUP] Found ${utxos.length} UTXOs`);
     
-    const anchorUtxo = utxos.find((u: any) => u.value >= 10000 && u.status.confirmed);
-    
-    const feeUtxo = utxos.find((u: any) => 
-      u.value >= 5000 && 
-      u.status.confirmed && 
-      (u.txid !== anchorUtxo?.txid || u.vout !== anchorUtxo?.vout)
+    // For each UTXO, fetch its hex and script
+    const utxosWithDetails = await Promise.all(
+      utxos.map(async (utxo: any) => {
+        const hexResponse = await axios.get(`https://mempool.space/testnet4/api/tx/${utxo.txid}/hex`);
+        const tx = btc.RawTx.decode(hexToBytes(hexResponse.data));
+        const script = tx.outputs[utxo.vout].script;
+        return {
+          utxoId: `${utxo.txid}:${utxo.vout}`,
+          value: utxo.value,
+          hex: hexResponse.data,
+          script: bytesToHex(script),
+          confirmed: utxo.status?.confirmed
+        };
+      })
     );
     
-    if (!anchorUtxo) {
-      throw new Error("Insufficient funds: Need a UTXO >= 10,000 sats for Anchor (NFT identity).");
-    }
-    
-    if (!feeUtxo) {
-      throw new Error("Insufficient funds: Need a separate UTXO >= 5,000 sats for transaction fees.");
-    }
-    
-    console.log("[DEPARTMENT SETUP] Selected anchor UTXO:", anchorUtxo.txid, `value: ${anchorUtxo.value}`);
-    console.log("[DEPARTMENT SETUP] Selected fee UTXO:", feeUtxo.txid, `value: ${feeUtxo.value}`);
-    
-    const [anchorHex, feeHex] = await Promise.all([
-      axios.get(`https://mempool.space/testnet4/api/tx/${anchorUtxo.txid}/hex`),
-      axios.get(`https://mempool.space/testnet4/api/tx/${feeUtxo.txid}/hex`)
-    ]);
-    
-    // Decode transactions to extract the actual scripts
-    const anchorTx = btc.RawTx.decode(hexToBytes(anchorHex.data));
-    const anchorScript = anchorTx.outputs[anchorUtxo.vout].script;
-    
-    const feeTx = btc.RawTx.decode(hexToBytes(feeHex.data));
-    const feeScript = feeTx.outputs[feeUtxo.vout].script;
-    
-    console.log("[DEPARTMENT SETUP] Anchor script length:", anchorScript.length);
-    console.log("[DEPARTMENT SETUP] Fee script length:", feeScript.length);
+    // Filter to confirmed UTXOs only
+    const confirmedUtxos = utxosWithDetails.filter(u => u.confirmed);
+    console.log(`[DEPARTMENT SETUP] Confirmed UTXOs: ${confirmedUtxos.length}`);
     
     return {
-      anchor: {
-        utxoId: `${anchorUtxo.txid}:${anchorUtxo.vout}`,
-        value: anchorUtxo.value,
-        hex: anchorHex.data,
-        script: bytesToHex(anchorScript)
-      },
-      fee: {
-        utxoId: `${feeUtxo.txid}:${feeUtxo.vout}`,
-        value: feeUtxo.value,
-        hex: feeHex.data,
-        script: bytesToHex(feeScript)
-      }
+      utxos: confirmedUtxos,
+      anchor: confirmedUtxos[0] || null,
+      fee: confirmedUtxos[1] || confirmedUtxos[0] || null
     };
   };
 
@@ -262,7 +239,8 @@ export default function EmployerDashboard() {
 
   // ============================================================
   // STAGE 1: Setup Department (Mint Plan NFT - One per Department)
-  // CRITICAL FIX: Include fundingScript in payload for backend to pass to dualUtxoContext
+  // CRITICAL FIX: Use a single consolidated UTXO for both anchor and fee
+  // This ensures the prover generates a single-input transaction (v14 NFT Scanner requirement)
   // ============================================================
   const handleSetupDepartment = async () => {
     if (!setupDeptName) {
@@ -289,11 +267,23 @@ export default function EmployerDashboard() {
       
       const btcContext = await getBtcContext();
       
-      console.log("[DEPARTMENT SETUP] BTC Context obtained:", {
-        anchor: btcContext.anchor.utxoId,
-        fee: btcContext.fee.utxoId,
-        hasAnchorScript: !!btcContext.anchor.script,
-        hasFeeScript: !!btcContext.fee.script
+      console.log(`[DEPARTMENT SETUP] Found ${btcContext.utxos.length} confirmed UTXOs`);
+      btcContext.utxos.forEach((utxo: any, i: number) => {
+        console.log(`  UTXO ${i}: ${utxo.utxoId}, value=${utxo.value}`);
+      });
+      
+      // CRITICAL: Find a single UTXO >= 15,000 sats to satisfy the "Expected 1" scanner rule
+      const consolidatedUtxo = btcContext.utxos.find((u: any) => u.value >= 15000);
+      
+      if (!consolidatedUtxo) {
+        throw new Error("No UTXO found with >= 15,000 sats. Please fund your wallet with a larger UTXO for the Plan NFT.");
+      }
+      
+      console.log("[DEPARTMENT SETUP] Selected consolidated UTXO:", {
+        utxoId: consolidatedUtxo.utxoId,
+        value: consolidatedUtxo.value,
+        hasScript: !!consolidatedUtxo.script,
+        scriptLength: consolidatedUtxo.script?.length || 0
       });
       
       if (!(window as any).LeatherProvider) {
@@ -301,19 +291,21 @@ export default function EmployerDashboard() {
       }
       
       const sigRes = await (window as any).LeatherProvider.request("signMessage", {
-        message: `CharmBills Department Authority: ${setupDeptName}`,
+        message: `CharmsPay Department Authority: ${setupDeptName}`,
         paymentType: "p2tr",
         network: "testnet"
       });
       
+      // CRITICAL: Pass the SAME consolidated UTXO for both anchor and fee
+      // This forces the prover to generate a transaction with exactly 1 input
       const payload = {
-        anchorUtxo: btcContext.anchor.utxoId,
-        anchorTxHex: btcContext.anchor.hex,
-        anchorValue: btcContext.anchor.value,
-        fundingUtxo: btcContext.fee.utxoId,
-        fundingValue: btcContext.fee.value,
-        fundingTxHex: btcContext.fee.hex,
-        fundingScript: btcContext.fee.script, // ✅ CRITICAL: Pass the actual fee script
+        anchorUtxo: consolidatedUtxo.utxoId,
+        anchorTxHex: consolidatedUtxo.hex,
+        anchorValue: consolidatedUtxo.value,
+        fundingUtxo: consolidatedUtxo.utxoId,
+        fundingValue: consolidatedUtxo.value,
+        fundingTxHex: consolidatedUtxo.hex,
+        fundingScript: consolidatedUtxo.script,
         employerAddress: address,
         utxoAddress: address,
         department: setupDeptName.toLowerCase(),
@@ -327,6 +319,8 @@ export default function EmployerDashboard() {
         multiSigRequired: false
       };
       
+      console.log("[DEPARTMENT SETUP] Payload prepared with single consolidated UTXO");
+      
       const response = await axios.post('/api/plans/mint', payload, {
         timeout: 600000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
@@ -334,8 +328,14 @@ export default function EmployerDashboard() {
       
       const proverResult: ProverResult = response.data;
       
-      // Pass the btcContext which now includes the fee script
-      const signingResult = await signAndBroadcastPackage(proverResult, btcContext);
+      // Create a context with the same UTXO for both anchor and fee
+      const signingContext = {
+        anchor: consolidatedUtxo,
+        fee: consolidatedUtxo
+      };
+      
+      // Pass the signingContext which now has the same UTXO for both
+      const signingResult = await signAndBroadcastPackage(proverResult, signingContext);
       const txids = signingResult?.txids;
       
       if (txids && txids.length > 0) {
@@ -422,7 +422,8 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // Batch Token Issuance (Pay Your Team - All at Once)
-  // CRITICAL FIX: Include fundingScript in payload for backend to pass to dualUtxoContext
+  // CRITICAL FIX: Use a SEPARATE Treasury UTXO for fees (not the Plan NFT)
+  // Stage 2 requires two distinct inputs: Authority (Plan NFT) + Funding (Treasury UTXO)
   // ============================================================
   const handleIssueTokens = async () => {
     if (selectedWorkers.size === 0) {
@@ -449,19 +450,58 @@ export default function EmployerDashboard() {
       const btcContext = await getBtcContext();
       
       console.log("[BATCH MINT] BTC Context obtained:", {
-        anchor: btcContext.anchor.utxoId,
-        fee: btcContext.fee.utxoId,
-        hasAnchorScript: !!btcContext.anchor.script,
-        hasFeeScript: !!btcContext.fee.script
+        totalUtxos: btcContext.utxos.length,
+        anchor: btcContext.anchor?.utxoId,
+        fee: btcContext.fee?.utxoId,
+        hasAnchorScript: !!btcContext.anchor?.script,
+        hasFeeScript: !!btcContext.fee?.script
+      });
+      
+      // =========================================================================
+      // CRITICAL FIX FOR STAGE 2: Find a SEPARATE Treasury UTXO for fees
+      // The Plan NFT is the authority (Input 0). We need a distinct UTXO for gas (Input 1)
+      // Find a Treasury UTXO >= 15,000 sats to sponsor the batch
+      // =========================================================================
+      const authorityUtxoId = currentPlanNftUtxo;
+      console.log(`[BATCH MINT] Authority (Plan NFT) UTXO: ${authorityUtxoId}`);
+      
+      // Find a separate Treasury UTXO (different from the Plan NFT UTXO) with sufficient funds
+      const treasuryUtxo = btcContext.utxos.find((u: any) => {
+        // Must be different from the Plan NFT UTXO
+        if (u.utxoId === authorityUtxoId) {
+          console.log(`[BATCH MINT] Skipping Plan NFT UTXO for funding: ${u.utxoId}`);
+          return false;
+        }
+        // Must have at least 15,000 sats for fees
+        return u.value >= 15000;
+      });
+      
+      if (!treasuryUtxo) {
+        console.error("[BATCH MINT] No suitable Treasury UTXO found. Available UTXOs:", 
+          btcContext.utxos.map((u: any) => ({ utxoId: u.utxoId, value: u.value }))
+        );
+        throw new Error("No Treasury UTXO found with >= 15,000 sats. Please ensure your wallet has sufficient funds for transaction fees.");
+      }
+      
+      console.log("[BATCH MINT] Selected Treasury UTXO for fees:", {
+        utxoId: treasuryUtxo.utxoId,
+        value: treasuryUtxo.value,
+        hasScript: !!treasuryUtxo.script,
+        scriptLength: treasuryUtxo.script?.length || 0
       });
 
+      // =========================================================================
+      // Construct payload with TWO DISTINCT INPUTS:
+      // - authorityUtxo: The Plan NFT (1,000 sats) - Input 0
+      // - fundingUtxo: The Treasury UTXO (>=15,000 sats) - Input 1
+      // =========================================================================
       const payload = {
-        authorityUtxo: currentPlanNftUtxo,
-        authorityTxHex: btcContext.anchor.hex,
-        fundingUtxo: btcContext.fee.utxoId,
-        fundingValue: btcContext.fee.value,
-        fundingTxHex: btcContext.fee.hex,
-        fundingScript: btcContext.fee.script, // ✅ CRITICAL: Pass the actual fee script
+        authorityUtxo: authorityUtxoId,
+        authorityTxHex: btcContext.anchor?.hex,
+        fundingUtxo: treasuryUtxo.utxoId,
+        fundingValue: treasuryUtxo.value,
+        fundingTxHex: treasuryUtxo.hex,
+        fundingScript: treasuryUtxo.script,
         employerAddress: address,
         utxoAddress: address,
         workers: workerList.map(w => ({ 
@@ -474,14 +514,31 @@ export default function EmployerDashboard() {
         encryptionEntropy: "placeholder"
       };
 
-      console.log("[BATCH MINT] Workers count:", payload.workers.length);
+      console.log("[BATCH MINT] Payload prepared with two distinct inputs:", {
+        authorityUtxo: payload.authorityUtxo.substring(0, 30) + '...',
+        fundingUtxo: payload.fundingUtxo.substring(0, 30) + '...',
+        fundingValue: payload.fundingValue,
+        workersCount: payload.workers.length
+      });
 
       const response = await axios.post('/api/payrollhiring/mint', payload, {
         timeout: 600000,
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
-      const signingResult = await signAndBroadcastPackage(response.data, btcContext);
+      // Create signing context with TWO distinct UTXOs
+      const signingContext = {
+        anchor: {
+          utxoId: authorityUtxoId,
+          value: 1000, // Plan NFT is 1000 sats
+          hex: btcContext.anchor?.hex,
+          script: btcContext.anchor?.script
+        },
+        fee: treasuryUtxo,
+        isSingle: true
+      };
+      
+      const signingResult = await signAndBroadcastPackage(response.data, signingContext);
       const txids = signingResult?.txids;
       
       if (txids && txids.length > 0) {

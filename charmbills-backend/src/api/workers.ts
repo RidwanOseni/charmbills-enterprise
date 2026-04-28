@@ -18,14 +18,15 @@ function rowToObject(row: Record<string, any>): any {
  * GET /api/workers
  * Fetches all workers for the Workforce Registry table
  * Includes name field from IPFS enrichment and department ticker from plans table
+ * 
+ * FIX: Non-blocking sync - fire and forget, don't await
  */
 export async function getWorkers(req: Request, res: Response) {
-    try {
-        await syncIndexer(turso, 20);
-        console.log('[WORKERS API] Lazy sync completed for getWorkers');
-    } catch (syncError) {
-        console.error('[WORKERS API] Lazy sync failed (non-critical):', syncError);
-    }
+    // FIRE AND FORGET: Start sync in background, don't await
+    syncIndexer(turso, 5).catch((syncError) => {
+        console.error('[WORKERS API] Background sync failed (non-critical):', syncError);
+    });
+    console.log('[WORKERS API] Background sync triggered (non-blocking)');
     
     const query = `
         SELECT 
@@ -175,6 +176,8 @@ async function fetchTransactionHex(txid: string): Promise<string> {
  * MODIFIED: Joins with ipfs_mappings table to provide the CID required for
  * the frontend to load salary and role data from IPFS.
  * MODIFIED: Added planNftId and planNftHex for WASM verification context
+ * 
+ * FIX: Non-blocking sync - fire and forget, don't await
  */
 export async function getWorkerByAddress(req: Request, res: Response) {
     const { address } = req.params;
@@ -183,13 +186,11 @@ export async function getWorkerByAddress(req: Request, res: Response) {
         return res.status(400).json({ error: 'Address parameter is required' });
     }
 
-    try {
-        await syncIndexer(turso, 20);  // Scan up to 20 recent blocks
-        console.log('[WORKERS API] Lazy sync completed for getWorkerByAddress');
-    } catch (syncError) {
-        console.error('[WORKERS API] Lazy sync failed (non-critical):', syncError);
-        // Continue even if sync fails - don't block the response
-    }
+    // FIRE AND FORGET: Start sync in background, don't await
+    syncIndexer(turso, 5).catch((syncError) => {
+        console.error('[WORKERS API] Background sync failed (non-critical):', syncError);
+    });
+    console.log('[WORKERS API] Background sync triggered (non-blocking)');
 
     const query = `
         SELECT 

@@ -88,7 +88,7 @@ export default function HomePage() {
       {/* Footer */}
       <footer className="border-t border-border bg-card mt-20">
         <div className="max-w-6xl mx-auto px-6 py-12 flex flex-col md:flex-row justify-between items-center gap-8">
-          <div className="text-sm text-muted-foreground">© 2024 CharmBills. All rights reserved.</div>
+          <div className="text-sm text-muted-foreground">© 2026 CharmsPay. All rights reserved.</div>
           <div className="flex gap-6">
             <Link href="/dashboard" className="text-sm text-foreground hover:text-primary transition font-medium">
               Employer Dashboard

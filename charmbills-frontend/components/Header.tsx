@@ -27,7 +27,7 @@ export function Header() {
           <div className="flex items-center gap-2">
             <span className="text-2xl font-bold text-primary">₿</span>
             <Link href="/" className="text-2xl font-bold text-primary">
-              CharmBills
+              CharmsPay
             </Link>
           </div>
           {pathname !== '/' && (

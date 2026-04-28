@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 // Corrected base URL without extra "/scrolls" segment [Source 661, 737]
-const SCROLL_BASE = "https://scrolls-v12.charms.dev";
+const SCROLL_BASE = "https://scrolls-v14.charms.dev";
 
 /**
  * Centralized derivation logic.
@@ -13,8 +13,34 @@ export function deriveNonceFromAppId(appId: string): number {
 }
 
 /**
+ * Helper function to fetch with retries and longer timeout
+ * Makes the API call more resilient to temporary network slowness
+ */
+async function fetchWithRetry(url: string, retries: number = 2, delayMs: number = 1500): Promise<any> {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await axios.get(url, { 
+                timeout: 30000,  // Increased from 15000 to 30000 for better tolerance
+                headers: { 'Accept': 'application/json' },
+                family: 4  // Force IPv4 to avoid IPv6 connection hang
+            });
+            return response;
+        } catch (error: any) {
+            if (attempt === retries) {
+                throw error;
+            }
+            console.warn(`[Scrolls Client] Retry ${attempt + 1}/${retries} for ${url}: ${error.message}`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+    }
+    throw new Error('FetchWithRetry: Unexpected end of loop');
+}
+
+/**
  * Fetches the isolated vault address from the Scroll Protocol.
  * Uses the correct API path: /{network}/address/{nonce} [Source 661]
+ * 
+ * IMPROVED: Added retry mechanism and longer timeout for resilience
  * 
  * @param appId - The application ID (hex string) to derive the vault address
  * @returns The vault address as a string (e.g., "tb1...")
@@ -27,11 +53,7 @@ export async function getVaultAddress(appId: string): Promise<string> {
     try {
         console.log(`[Scrolls Client] Querying vault: ${targetUrl}`);
         
-        const res = await axios.get(targetUrl, { 
-            timeout: 15000,  // Increased for testnet latency [Source 737]
-            headers: { 'Accept': 'application/json' },
-            family: 4  // Force IPv4 to avoid IPv6 connection hang [Source 737]
-        });
+        const res = await fetchWithRetry(targetUrl, 2, 1500);
         
         if (!res.data || typeof res.data !== 'string') {
             throw new Error('Invalid response from Scroll API');
@@ -123,7 +145,7 @@ export async function getScrollPolicy(appId: string): Promise<any> {
         console.log(`[Scrolls Client] Fetching policy from: ${targetUrl}`);
         
         const res = await axios.get(targetUrl, {
-            timeout: 15000,
+            timeout: 30000,
             headers: { 'Accept': 'application/json' },
             family: 4  // Force IPv4 to avoid IPv6 connection hang
         });
@@ -156,7 +178,7 @@ export async function getVaultStatus(appId: string): Promise<{
         console.log(`[Scrolls Client] Fetching vault status from: ${targetUrl}`);
         
         const res = await axios.get(targetUrl, {
-            timeout: 15000,
+            timeout: 30000,
             headers: { 'Accept': 'application/json' },
             family: 4  // Force IPv4 to avoid IPv6 connection hang
         });
@@ -197,7 +219,7 @@ export async function getScrollConfig(): Promise<{
         console.log(`[Scrolls Client] Fetching config from: ${targetUrl}`);
         
         const res = await axios.get(targetUrl, {
-            timeout: 15000,
+            timeout: 30000,
             headers: { 'Accept': 'application/json' },
             family: 4  // Force IPv4 to avoid IPv6 connection hang
         });

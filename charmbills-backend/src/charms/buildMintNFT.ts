@@ -271,7 +271,7 @@ export function buildMintNFTJSON(
   appPublicInputs.set(["n", appIdBytes, appVkBytes], null);
   
   const spell = {
-    version: 12,
+    version: 14,
     tx: {
       ins: [anchorInputBytes, fundingInputBytes],
       outs: [

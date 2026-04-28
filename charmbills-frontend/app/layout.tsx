@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 })
 
 export const metadata: Metadata = {
-  title: 'CharmBills - Bitcoin Payroll',
+  title: 'CharmsPay - Bitcoin Payroll',
   description: 'Automated payroll for employees and freelancers.',
 }
 

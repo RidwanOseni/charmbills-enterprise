@@ -12,6 +12,7 @@ export interface PlanCache {
   metadataHash: string;
   scrollPolicy: ScrollPolicyType | number;
   remaining: number;
+  vaultAddress?: string;  // ADDED: Isolated vault address for this plan (for indexer tracking)
   lastIndexedBlock?: number;
   createdAt: string;
   updatedAt: string;
@@ -80,6 +81,7 @@ export async function initDatabase(db: any): Promise<void> {
         metadataHash TEXT NOT NULL,
         scrollPolicy INTEGER NOT NULL,
         remaining INTEGER NOT NULL DEFAULT 100,
+        vaultAddress TEXT,
         lastIndexedBlock INTEGER DEFAULT 0,
         createdAt TEXT NOT NULL,
         updatedAt TEXT NOT NULL
@@ -129,6 +131,12 @@ export async function initDatabase(db: any): Promise<void> {
         timestamp TEXT NOT NULL,
         status TEXT DEFAULT 'pending'
     )`,
+
+    `CREATE TABLE IF NOT EXISTS indexer_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+    )`,
     
     // Indexes
     `CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)`,
@@ -137,6 +145,7 @@ export async function initDatabase(db: any): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_plans_employer ON plans(employerAddress)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_nftUtxo ON plans(nftUtxoId)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_remaining ON plans(remaining)`,
+    `CREATE INDEX IF NOT EXISTS idx_plans_vaultAddress ON plans(vaultAddress)`,
     `CREATE INDEX IF NOT EXISTS idx_locked_utxos_employer ON locked_utxos(employerAddress)`,
     `CREATE INDEX IF NOT EXISTS idx_locked_utxos_expires ON locked_utxos(expiresAt)`,
     `CREATE INDEX IF NOT EXISTS idx_ipfs_hash ON ipfs_mappings(metadataHash)`,
@@ -144,7 +153,8 @@ export async function initDatabase(db: any): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_multisig_status ON multisig_transactions(status)`,
     `CREATE INDEX IF NOT EXISTS idx_audit_logs_type ON audit_logs(type)`,
     `CREATE INDEX IF NOT EXISTS idx_audit_logs_txid ON audit_logs(txid)`,
-    `CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)`
+    `CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp)`,
+    `CREATE INDEX IF NOT EXISTS idx_indexer_config_key ON indexer_config(key)`,
   ];
   
   for (const query of queries) {
@@ -292,8 +302,8 @@ export async function savePlanRecord(
     sql: `INSERT OR REPLACE INTO plans 
           (appId, nftUtxoId, ticker, employerAddress, department, 
            payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
-           lastIndexedBlock, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           vaultAddress, lastIndexedBlock, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       plan.appId,
       plan.nftUtxoId,
@@ -304,6 +314,7 @@ export async function savePlanRecord(
       plan.metadataHash,
       plan.scrollPolicy,
       plan.remaining,
+      plan.vaultAddress || null,
       plan.lastIndexedBlock || 0,
       plan.createdAt,
       plan.updatedAt
@@ -354,6 +365,17 @@ export async function updatePlanRemaining(
   await db.execute({
     sql: 'UPDATE plans SET remaining = ?, updatedAt = ? WHERE appId = ?',
     args: [newRemaining, new Date().toISOString(), appId]
+  });
+}
+
+export async function updatePlanVaultAddress(
+  db: any,
+  appId: string,
+  vaultAddress: string
+): Promise<void> {
+  await db.execute({
+    sql: 'UPDATE plans SET vaultAddress = ?, updatedAt = ? WHERE appId = ?',
+    args: [vaultAddress, new Date().toISOString(), appId]
   });
 }
 

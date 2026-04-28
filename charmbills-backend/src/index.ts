@@ -30,6 +30,19 @@ const db = turso;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// =========================================================================
+// FIX: Handle BigInt serialization for Turso responses
+// This applies to ALL routes automatically and prevents the
+// "Do not know how to serialize a BigInt" error
+// =========================================================================
+app.set('json replacer', (key: string, value: any) => {
+    if (typeof value === 'bigint') {
+        // Convert BigInt to Number for JSON serialization
+        return Number(value);
+    }
+    return value;
+});
+
 // Make db available to route handlers
 app.locals.db = db;
 

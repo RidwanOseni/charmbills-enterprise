@@ -1,8 +1,6 @@
 import { Request, Response } from 'express';
 import axios from 'axios';
 import * as constants from '@shared/constants';
-import { saveAuditLog } from '../db/schema';
-import * as crypto from 'crypto';
 
 // --------------------------------------------------------------------------------
 // Configuration for local Bitcoin node (Testnet4)
@@ -37,7 +35,9 @@ function getDb(req: Request): any {
  * 3. Handles both object and string transaction formats
  * 4. Supports single-transaction packages (v0.12 collapsed funding/spell model) [55, 225]
  * 5. Enhanced error logging for debugging
- * 6. MANUAL AUDIT LOGGING: Records standard BTC transfers (vault funding) that lack ZK-spells [Source 98]
+ * 
+ * NOTE: Audit logging for vault funding is now handled by the DerivableIndexer,
+ * which scans all on-chain movements and creates audit logs automatically.
  */
 export async function broadcastPackage(req: Request, res: Response) {
   const requestId = Math.random().toString(36).substring(7);
@@ -204,39 +204,10 @@ export async function broadcastPackage(req: Request, res: Response) {
     console.log(`[BROADCAST:${requestId}] Transaction IDs:`, txids);
 
     // =========================================================================
-    // CRITICAL FIX: MANUAL AUDIT LOGGING FOR STANDARD BTC TRANSFERS
+    // NOTE: Manual audit logging removed - handled by DerivableIndexer
+    // The indexer now tracks all on-chain movements including vault funding
+    // and withdrawals, creating audit logs automatically.
     // =========================================================================
-    // The indexer only detects ZK-spells (OP_RETURN metadata). Standard P2TR
-    // transfers (like vault funding) have no spell to index. Without manual
-    // logging, treasury funding transactions never appear in the audit trail.
-    // This implements the "Write-Ahead Log" pattern for production systems.
-    // =========================================================================
-    
-    // Determine if this is a treasury funding transaction (single transaction with no spell)
-    // For single transactions, we log as TREASURY_FUNDING since they're likely vault transfers
-    // For dual transactions, the indexer will detect the spell automatically
-    if (isSingle && txids.length > 0) {
-        const txid = txids[0];
-        console.log(`[BROADCAST:${requestId}] ✅ Recording treasury event for ${txid}`);
-        
-        try {
-            await saveAuditLog(
-                db,
-                crypto.randomUUID(),
-                'TREASURY_FUNDING',
-                'Liquidity locked in Scroll Vault',
-                txid,
-                'pending'  // Initial status - will be updated to 'confirmed' by indexer
-            );
-            console.log(`[BROADCAST:${requestId}] ✅ Audit log saved for treasury funding`);
-        } catch (auditError: any) {
-            // Don't fail the broadcast if audit logging fails
-            console.error(`[BROADCAST:${requestId}] ⚠️ Failed to save audit log:`, auditError.message);
-        }
-    } else if (!isSingle && txids.length > 0) {
-        // For dual transactions (ZK-spells), the indexer will handle logging
-        console.log(`[BROADCAST:${requestId}] Dual transaction mode - audit logging will be handled by indexer`);
-    }
 
     // CRITICAL FIX: Log the actual broadcasted txid for the token UTXO
     // The worker's token UTXO is at index 0 of the transaction outputs
