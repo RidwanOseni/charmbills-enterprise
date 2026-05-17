@@ -1,15 +1,19 @@
 import axios from 'axios';
+import * as crypto from 'crypto';
 
 // Corrected base URL without extra "/scrolls" segment [Source 661, 737]
 const SCROLL_BASE = "https://scrolls-v14.charms.dev";
 
 /**
- * Centralized derivation logic.
- * Converts a hex appId into a deterministic 64-bit nonce.
+ * NEW: Deterministic 64-bit nonce derived from the Employer's wallet.
+ * This ensures the vault is unique to the company, not the department.
  */
-export function deriveNonceFromAppId(appId: string): number {
-    // Take first 15 characters of the hex appId and parse as hex to get a number
-    return parseInt(appId.substring(0, 15), 16);
+export function deriveCompanyNonce(employerAddress: string): number {
+    const hash = crypto.createHash('sha256').update(employerAddress).digest('hex');
+    // Take first 15 characters of the hex hash (60 bits) to safely fit in a 64-bit unsigned int
+    const nonce = parseInt(hash.substring(0, 15), 16);
+    console.log(`[Scrolls Client] Derived company nonce: ${nonce} from employer address ${employerAddress.substring(0, 16)}...`);
+    return nonce;
 }
 
 /**
@@ -37,21 +41,21 @@ async function fetchWithRetry(url: string, retries: number = 2, delayMs: number 
 }
 
 /**
- * Fetches the isolated vault address from the Scroll Protocol.
- * Uses the correct API path: /{network}/address/{nonce} [Source 661]
+ * UPDATED: Fetches the single company vault address.
+ * Uses the deterministic nonce derived from the employer's wallet address.
+ * This gives each company its own mathematically isolated vault while ensuring
+ * the HR manager only has to fund one address for all departmental payrolls.
  * 
- * IMPROVED: Added retry mechanism and longer timeout for resilience
- * 
- * @param appId - The application ID (hex string) to derive the vault address
+ * @param employerAddress - The employer's wallet address (HR manager)
  * @returns The vault address as a string (e.g., "tb1...")
  */
-export async function getVaultAddress(appId: string): Promise<string> {
-    const nonce = deriveNonceFromAppId(appId);
+export async function getCompanyVaultAddress(employerAddress: string): Promise<string> {
+    const nonce = deriveCompanyNonce(employerAddress);
     const network = "testnet4";
     const targetUrl = `${SCROLL_BASE}/${network}/address/${nonce}`;
     
     try {
-        console.log(`[Scrolls Client] Querying vault: ${targetUrl}`);
+        console.log(`[Scrolls Client] Querying company vault: ${targetUrl}`);
         
         const res = await fetchWithRetry(targetUrl, 2, 1500);
         
@@ -63,7 +67,7 @@ export async function getVaultAddress(appId: string): Promise<string> {
         return res.data.trim().replace(/"/g, '');
     } catch (error: any) {
         const status = error.response?.status;
-        console.error('[Scrolls Client] Failed to get vault address:', error.message);
+        console.error('[Scrolls Client] Failed to get company vault address:', error.message);
         
         if (status === 404) {
             throw new Error(`Scroll API Error: Endpoint ${targetUrl} not found. Check network version.`);
@@ -130,14 +134,14 @@ export async function requestScrollSignature(
 }
 
 /**
- * Gets the current Scroll policy for a specific vault.
+ * Gets the current Scroll policy for a specific company vault.
  * Useful for debugging and understanding settlement rules.
  * 
- * @param appId - The application ID (hex string) to query policy for
+ * @param employerAddress - The employer's wallet address (HR manager)
  * @returns The Scroll policy object
  */
-export async function getScrollPolicy(appId: string): Promise<any> {
-    const nonce = deriveNonceFromAppId(appId);
+export async function getScrollPolicy(employerAddress: string): Promise<any> {
+    const nonce = deriveCompanyNonce(employerAddress);
     const network = "testnet4";
     const targetUrl = `${SCROLL_BASE}/${network}/policy/${nonce}`;
     
@@ -158,19 +162,19 @@ export async function getScrollPolicy(appId: string): Promise<any> {
 }
 
 /**
- * Verifies if a vault is properly funded for payroll.
+ * Verifies if a company vault is properly funded for payroll.
  * 
- * @param appId - The application ID (hex string)
+ * @param employerAddress - The employer's wallet address (HR manager)
  * @returns The vault status including balance and funding requirements
  */
-export async function getVaultStatus(appId: string): Promise<{
+export async function getVaultStatus(employerAddress: string): Promise<{
     vaultAddress: string;
     currentBalance: number;
     requiredFunding: number;
     isFullyFunded: boolean;
 }> {
-    const vaultAddress = await getVaultAddress(appId);
-    const nonce = deriveNonceFromAppId(appId);
+    const vaultAddress = await getCompanyVaultAddress(employerAddress);
+    const nonce = deriveCompanyNonce(employerAddress);
     const network = "testnet4";
     const targetUrl = `${SCROLL_BASE}/${network}/status/${nonce}`;
     

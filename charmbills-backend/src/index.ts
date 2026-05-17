@@ -175,19 +175,54 @@ async function startServer() {
   try {
     console.log('🔧 Initializing database connection with Turso...');
     
-    // Initialize tables
+    // Initialize tables using the updated schema [4]
     await initDatabase(db);
     console.log('✅ Database tables created/verified');
-    
-    // Verify companies table exists using Turso syntax
-    const tableCheck = await db.execute({
-      sql: "SELECT name FROM sqlite_master WHERE type='table' AND name='companies'",
-      args: []
+
+    // Verify companies table exists
+    const tableCheck = await db.execute({ 
+      sql: "SELECT name FROM sqlite_master WHERE type='table' AND name='companies'", 
+      args: [] 
     });
-    
+
     if (!tableCheck.rows || tableCheck.rows.length === 0) {
       throw new Error('companies table not found after initialization');
     }
+    
+    // =========================================================================
+    // LOG RECOGNITION: Confirm the unified vault column is accessible
+    // This verifies the company table has the vaultAddress column for the new architecture
+    // =========================================================================
+    try {
+      const vaultCheck = await db.execute({ 
+        sql: "SELECT vaultAddress FROM companies LIMIT 1", 
+        args: [] 
+      });
+      
+      if (vaultCheck.rows && vaultCheck.rows.length > 0) {
+        console.log('✅ Verified "vaultAddress" column is present in schema');
+        
+        // FIX: Use type assertion 'as string' so TypeScript allows the substring method
+        const firstRow = vaultCheck.rows[0];
+        const rawAddress = firstRow.vaultAddress as string;
+        
+        if (rawAddress) {
+          console.log(`   Sample vault address: ${rawAddress.substring(0, 30)}...`);
+        } else {
+          console.log('   (Vault address column exists but no companies registered yet)');
+        }
+      } else {
+        // Table has no rows yet, but column exists
+        console.log('✅ Verified "vaultAddress" column is present in schema (table empty)');
+      }
+    } catch (e: any) {
+      console.warn('⚠️ WARNING: "vaultAddress" column missing from companies table!');
+      console.warn('   Please run the ALTER TABLE command to add it:');
+      console.warn('   ALTER TABLE companies ADD COLUMN vaultAddress TEXT;');
+      // Continue startup - don't crash, just warn
+    }
+
+    // Verify companies table exists using Turso syntax
     console.log('✅ Verified companies table exists');
     
     // Start server

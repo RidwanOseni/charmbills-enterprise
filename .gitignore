@@ -109,3 +109,4 @@ debug/
 transactions/*.json
 run_test.sh
 *.db
+charmbills-backend/payload.json

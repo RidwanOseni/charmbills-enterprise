@@ -9,11 +9,13 @@ export interface PlanCache {
   employerAddress: string;
   department?: string;
   payPeriodSeconds: number;
+  compensationSats: number;
   metadataHash: string;
   scrollPolicy: ScrollPolicyType | number;
   remaining: number;
   vaultAddress?: string;  // ADDED: Isolated vault address for this plan (for indexer tracking)
   lastIndexedBlock?: number;
+  status: 'pending' | 'active' | 'failed';  // 👈 ADDED: State tracking for on-chain confirmation
   createdAt: string;
   updatedAt: string;
 }
@@ -23,7 +25,7 @@ export interface WorkerCache {
   name?: string;
   planId: string;
   engagementType: EngagementType;
-  status: 'active' | 'terminated' | 'pending';
+  status: 'active' | 'terminated' | 'pending' | 'minting_pending';  // 👈 ADDED 'minting_pending' for in-flight minting
   lastMintedPeriod: string;
   currentTokenUtxo?: string;
   expiresAt?: string;
@@ -39,6 +41,7 @@ export interface CompanyRecord {
   employerAddress: string;
   treasuryAddress: string;
   treasuryHexDest: string;
+  vaultAddress: string;  // ADDED: Unified company Scroll vault
   createdAt: string;
   updatedAt?: string;
 }
@@ -59,6 +62,7 @@ export async function initDatabase(db: any): Promise<void> {
         employerAddress TEXT PRIMARY KEY,
         treasuryAddress TEXT NOT NULL,
         treasuryHexDest TEXT NOT NULL,
+        vaultAddress TEXT,
         createdAt TEXT NOT NULL,
         updatedAt TEXT
     )`,
@@ -71,21 +75,23 @@ export async function initDatabase(db: any): Promise<void> {
     )`,
     
     `CREATE TABLE IF NOT EXISTS plans (
-        appId TEXT PRIMARY KEY,
-        nftUtxoId TEXT UNIQUE NOT NULL,
-        anchorUtxo TEXT NOT NULL,
-        ticker TEXT NOT NULL,
-        employerAddress TEXT NOT NULL,
-        department TEXT,
-        payPeriodSeconds INTEGER NOT NULL,
-        metadataHash TEXT NOT NULL,
-        scrollPolicy INTEGER NOT NULL,
-        remaining INTEGER NOT NULL DEFAULT 100,
-        vaultAddress TEXT,
-        lastIndexedBlock INTEGER DEFAULT 0,
-        createdAt TEXT NOT NULL,
-        updatedAt TEXT NOT NULL
-    )`,
+      appId TEXT PRIMARY KEY,
+      nftUtxoId TEXT UNIQUE NOT NULL,
+      anchorUtxo TEXT NOT NULL,
+      ticker TEXT NOT NULL,
+      employerAddress TEXT NOT NULL,
+      department TEXT,
+      payPeriodSeconds INTEGER NOT NULL,
+      compensationSats INTEGER DEFAULT 0,
+      metadataHash TEXT NOT NULL,
+      scrollPolicy INTEGER NOT NULL,
+      remaining INTEGER NOT NULL DEFAULT 100,
+      vaultAddress TEXT,
+      lastIndexedBlock INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'pending',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+  )`,
     
     `CREATE TABLE IF NOT EXISTS workers (
         walletAddress TEXT,
@@ -146,6 +152,7 @@ export async function initDatabase(db: any): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_plans_nftUtxo ON plans(nftUtxoId)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_remaining ON plans(remaining)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_vaultAddress ON plans(vaultAddress)`,
+    `CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status)`,  // 👈 ADDED: Index for status queries
     `CREATE INDEX IF NOT EXISTS idx_locked_utxos_employer ON locked_utxos(employerAddress)`,
     `CREATE INDEX IF NOT EXISTS idx_locked_utxos_expires ON locked_utxos(expiresAt)`,
     `CREATE INDEX IF NOT EXISTS idx_ipfs_hash ON ipfs_mappings(metadataHash)`,
@@ -160,6 +167,9 @@ export async function initDatabase(db: any): Promise<void> {
   for (const query of queries) {
     try {
       await db.execute(query);
+      if (query.includes('CREATE TABLE')) {
+        console.log(`[DB INIT] ✅ Table created: ${query.match(/CREATE TABLE IF NOT EXISTS (\w+)/)?.[1] || 'unknown'}`);
+      }
     } catch (err: any) {
       console.error(`[DB INIT] Error: ${err.message}`);
     }
@@ -176,14 +186,19 @@ export async function saveCompanyConfig(
   db: any,
   employerAddress: string,
   treasuryAddress: string,
-  treasuryHexDest: string
+  treasuryHexDest: string,
+  vaultAddress: string
 ): Promise<void> {
   const now = new Date().toISOString();
+  console.log(`[SCHEMA] Saving company config: ${employerAddress.substring(0, 16)}..., vault: ${vaultAddress.substring(0, 20)}...`);
+  
   await db.execute({
-    sql: `INSERT OR REPLACE INTO companies (employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, ?)`,
-    args: [employerAddress, treasuryAddress, treasuryHexDest, now, now]
+    sql: `INSERT OR REPLACE INTO companies (employerAddress, treasuryAddress, treasuryHexDest, vaultAddress, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+    args: [employerAddress, treasuryAddress, treasuryHexDest, vaultAddress, now, now]
   });
+  
+  console.log(`[SCHEMA] ✅ Company config saved`);
 }
 
 export async function getCompanyConfig(
@@ -191,7 +206,7 @@ export async function getCompanyConfig(
   employerAddress: string
 ): Promise<CompanyRecord | null> {
   const result = await db.execute({
-    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, vaultAddress, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
     args: [employerAddress]
   });
   return result.rows[0] || null;
@@ -203,7 +218,7 @@ export async function listCompanies(
   offset: number = 0
 ): Promise<CompanyRecord[]> {
   const result = await db.execute({
-    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, vaultAddress, createdAt, updatedAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
     args: [limit, offset]
   });
   return result.rows || [];
@@ -213,10 +228,12 @@ export async function deleteCompany(
   db: any,
   employerAddress: string
 ): Promise<void> {
+  console.log(`[SCHEMA] Deleting company: ${employerAddress.substring(0, 16)}...`);
   await db.execute({
     sql: 'DELETE FROM companies WHERE employerAddress = ?',
     args: [employerAddress]
   });
+  console.log(`[SCHEMA] ✅ Company deleted`);
 }
 
 // ============================================================
@@ -298,12 +315,14 @@ export async function savePlanRecord(
   db: any,
   plan: PlanCache
 ): Promise<void> {
+  console.log(`[SCHEMA] Saving plan record: ${plan.appId.substring(0, 16)}..., status: ${plan.status || 'pending'}`);
+  
   await db.execute({
     sql: `INSERT OR REPLACE INTO plans 
           (appId, nftUtxoId, ticker, employerAddress, department, 
            payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
-           vaultAddress, lastIndexedBlock, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           vaultAddress, lastIndexedBlock, status, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       plan.appId,
       plan.nftUtxoId,
@@ -316,10 +335,13 @@ export async function savePlanRecord(
       plan.remaining,
       plan.vaultAddress || null,
       plan.lastIndexedBlock || 0,
+      plan.status || 'pending',
       plan.createdAt,
       plan.updatedAt
     ]
   });
+  
+  console.log(`[SCHEMA] ✅ Plan record saved`);
 }
 
 export async function getPlanByAppId(
@@ -390,6 +412,27 @@ export async function updatePlanLastIndexedBlock(
   });
 }
 
+/**
+ * ADDED: Update Plan Status for on-chain confirmation tracking
+ * This allows distinguishing between "intended" (pending) and "confirmed" (active) assets
+ * 
+ * @param db - Database connection
+ * @param appId - Plan appId
+ * @param status - New status ('active' for confirmed, 'failed' for failed)
+ */
+export async function updatePlanStatus(
+  db: any,
+  appId: string,
+  status: 'active' | 'failed'
+): Promise<void> {
+  console.log(`[SCHEMA] Updating plan status: ${appId.substring(0, 16)}... -> ${status}`);
+  await db.execute({
+    sql: 'UPDATE plans SET status = ?, updatedAt = ? WHERE appId = ?',
+    args: [status, new Date().toISOString(), appId]
+  });
+  console.log(`[SCHEMA] ✅ Plan status updated`);
+}
+
 // ============================================================
 // WORKER HELPERS
 // ============================================================
@@ -398,6 +441,8 @@ export async function saveWorkerRecord(
   db: any,
   worker: WorkerCache
 ): Promise<void> {
+  console.log(`[SCHEMA] Saving worker record: ${worker.walletAddress.substring(0, 16)}..., status: ${worker.status}`);
+  
   await db.execute({
     sql: `INSERT OR REPLACE INTO workers 
           (walletAddress, name, planId, engagementType, status, lastMintedPeriod, 
@@ -419,6 +464,8 @@ export async function saveWorkerRecord(
       worker.historicalTokens || '[]'
     ]
   });
+  
+  console.log(`[SCHEMA] ✅ Worker record saved`);
 }
 
 export async function getWorkersByPlan(
@@ -447,12 +494,14 @@ export async function updateWorkerStatus(
   db: any,
   walletAddress: string,
   planId: string,
-  status: 'active' | 'terminated' | 'pending'
+  status: 'active' | 'terminated' | 'pending' | 'minting_pending'
 ): Promise<void> {
+  console.log(`[SCHEMA] Updating worker status: ${walletAddress.substring(0, 16)}... -> ${status}`);
   await db.execute({
     sql: 'UPDATE workers SET status = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
     args: [status, new Date().toISOString(), walletAddress, planId]
   });
+  console.log(`[SCHEMA] ✅ Worker status updated`);
 }
 
 export async function updateWorkerToken(
@@ -493,6 +542,8 @@ export async function updateWorkerPostMint(
   expiresAt: string,
   lastMintedPeriod: string
 ): Promise<void> {
+  console.log(`[SCHEMA] Updating worker post-mint: ${walletAddress.substring(0, 16)}..., token: ${tokenUtxo.substring(0, 20)}...`);
+  
   await db.execute({
     sql: `UPDATE workers 
           SET status = 'active', 
@@ -510,6 +561,8 @@ export async function updateWorkerPostMint(
       planId
     ]
   });
+  
+  console.log(`[SCHEMA] ✅ Worker post-mint update complete`);
 }
 
 /**

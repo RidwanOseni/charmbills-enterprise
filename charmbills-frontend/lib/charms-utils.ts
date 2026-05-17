@@ -146,10 +146,10 @@ export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean
     
     try {
         const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`, {
-            timeout: 10000
+            timeout: 30000
         });
         const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`, {
-            timeout: 10000
+            timeout: 30000
         });
         
         return {
@@ -191,7 +191,7 @@ export async function getWalletStatus(address: string): Promise<{
   
   try {
     const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
-      timeout: 10000
+      timeout: 30000
     });
     const utxos = response.data;
     
@@ -235,7 +235,7 @@ export async function debugUtxos(address: string): Promise<any> {
   
   try {
     const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
-      timeout: 10000
+      timeout: 30000
     });
     const utxos = response.data;
     

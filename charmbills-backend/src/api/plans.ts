@@ -196,6 +196,7 @@ async function getCompanyByEmployer(db: any, employerAddress: string): Promise<C
 /**
  * Save plan record with employer reference - UPDATED for Unified Model
  * Now includes remaining field (department budget)
+ * CRITICAL FIX: Added 'status' field set to 'pending' for derivable model tracking
  */
 async function savePlanRecord(
   db: any,
@@ -210,9 +211,11 @@ async function savePlanRecord(
   scrollPolicy: number
 ): Promise<void> {
   const now = new Date().toISOString();
+  console.log(`[PLANS API] Saving plan record with status 'pending': ${appId.substring(0, 16)}...`);
+  
   await db.execute({
-    sql: `INSERT INTO plans (appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, createdAt, updatedAt) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO plans (appId, nftUtxoId, anchorUtxo, ticker, employerAddress, department, payPeriodSeconds, remaining, metadataHash, scrollPolicy, status, createdAt, updatedAt) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       appId, 
       planUtxo, 
@@ -223,11 +226,14 @@ async function savePlanRecord(
       payPeriodSeconds, 
       remaining,
       metadataHash, 
-      scrollPolicy, 
+      scrollPolicy,
+      'pending',                                    // 👈 ADDED: Initial status for derivable model
       now,
       now
     ]
   });
+  
+  console.log(`[PLANS API] ✅ Plan record saved with status 'pending'`);
 }
 
 // --------------------------------------------------------------------------------
@@ -531,9 +537,11 @@ export async function createPayrollPlan(req: Request, res: Response) {
     const planUtxo = `${spellTx.getId()}:0`;
     
     // ----------------------------------------------------------------------------
-    // Step 11: Save plan record with employer reference [9] - UPDATED
+    // Step 11: Save plan record with employer reference [9] - UPDATED with status 'pending'
+    // CRITICAL FIX: Initial status is set to 'pending' for derivable model tracking
+    // The indexer will update this to 'active' when the transaction is confirmed on-chain
     // ----------------------------------------------------------------------------
-    console.log(`[PLANS API:${requestId}] 💾 Saving plan record...`);
+    console.log(`[PLANS API:${requestId}] 💾 Saving plan record with status 'pending'...`);
     
     await savePlanRecord(
       db,
@@ -548,7 +556,7 @@ export async function createPayrollPlan(req: Request, res: Response) {
       scrollPolicy
     );
     
-    console.log(`[PLANS API:${requestId}] ✅ Plan record saved with budget: ${remaining}`);
+    console.log(`[PLANS API:${requestId}] ✅ Plan record saved with budget: ${remaining} and status: pending`);
     
     // ----------------------------------------------------------------------------
     // Step 12: Return success response

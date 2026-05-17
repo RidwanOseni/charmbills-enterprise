@@ -1,6 +1,8 @@
 // src/api/companies.ts
 import { Request, Response } from 'express';
 import * as crypto from 'crypto';
+import * as scrolls from '../bitcoin/scrollsClient';
+import { saveCompanyConfig } from '../db/schema';
 
 // --------------------------------------------------------------------------------
 // Types
@@ -16,6 +18,7 @@ interface CompanyResponse {
   employerAddress: string;
   treasuryAddress: string;
   treasuryHexDest: string;
+  vaultAddress: string;      // ADDED: Unified company Scroll vault
   createdAt: string;
 }
 
@@ -68,11 +71,16 @@ function getDb(req: Request) {
 /**
  * Register a new company's infrastructure details
  * POST /api/companies/register
+ * 
+ * UPDATED: When a company is onboarded, calculate their unique vault address
+ * from the Scroll protocol once and save it in the companies table for easy lookup.
+ * This gives each company its own mathematically isolated vault while ensuring
+ * the HR manager only has to fund one address for all departmental payrolls.
  */
 export async function registerCompany(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
   const db = getDb(req);
-  
+
   console.log(`\n[COMPANY API:${requestId}] ===== START registerCompany =====`);
   
   try {
@@ -80,57 +88,57 @@ export async function registerCompany(req: Request, res: Response) {
     validateCompanyRequest(req.body);
     
     const { employerAddress, treasuryAddress, treasuryHexDest } = req.body;
+
+    console.log(`[COMPANY API:${requestId}] Registering: ${employerAddress.substring(0, 16)}...`);
+    console.log(`[COMPANY API:${requestId}] Treasury address: ${treasuryAddress.substring(0, 20)}...`);
+    console.log(`[COMPANY API:${requestId}] Treasury hex dest: ${treasuryHexDest.substring(0, 30)}...`);
+
+    // 1. DERIVE DETERMINISTIC VAULT: Call Scroll Client to get the unique vault address
+    // This uses the deriveCompanyNonce logic implemented in scrollsClient.ts [1, 2]
+    console.log(`[COMPANY API:${requestId}] 🏦 Deriving unique Scroll vault address...`);
     
-    console.log(`[COMPANY API:${requestId}] Registering company:`, {
-      employerAddress: `${employerAddress.substring(0, 20)}...`,
-      treasuryAddress: `${treasuryAddress.substring(0, 20)}...`,
-      treasuryHexDest: `${treasuryHexDest.substring(0, 30)}...`
-    });
-    
-    // Check if company already exists
-    const existingResult = await db.execute({
-      sql: 'SELECT employerAddress FROM companies WHERE employerAddress = ?',
-      args: [employerAddress]
-    });
-    
-    const exists = existingResult.rows && existingResult.rows.length > 0;
-    
-    const now = new Date().toISOString();
-    
-    // Insert or replace company record
-    await db.execute({
-      sql: `
-        INSERT OR REPLACE INTO companies 
-        (employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt) 
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      args: [employerAddress, treasuryAddress, treasuryHexDest, now, now]
-    });
-    
-    console.log(`[COMPANY API:${requestId}] ✅ Company registered successfully`);
-    if (exists) {
-      console.log(`[COMPANY API:${requestId}] Updated existing company record`);
+    let vaultAddress: string;
+    try {
+      vaultAddress = await scrolls.getCompanyVaultAddress(employerAddress);
+      console.log(`[COMPANY API:${requestId}] Derived vault address: ${vaultAddress.substring(0, 30)}...`);
+    } catch (scrollError: any) {
+      console.error(`[COMPANY API:${requestId}] ❌ Failed to derive vault address:`, scrollError.message);
+      throw new Error(`Cannot register company: Scroll API error - ${scrollError.message}`);
     }
+
+    // 2. SAVE TO DATABASE: Store all infra details including the new vault address
+    // Matches the updated schema.ts requirement [3]
+    console.log(`[COMPANY API:${requestId}] 💾 Saving company configuration to database...`);
+    
+    await saveCompanyConfig(
+      db,
+      employerAddress,
+      treasuryAddress,
+      treasuryHexDest,
+      vaultAddress
+    );
+
+    const response: CompanyResponse = {
+      employerAddress,
+      treasuryAddress,
+      treasuryHexDest,
+      vaultAddress,
+      createdAt: new Date().toISOString()
+    };
+
+    console.log(`[COMPANY API:${requestId}] ✅ Company and Vault registered successfully`);
+    console.log(`[COMPANY API:${requestId}]   Vault: ${vaultAddress.substring(0, 30)}...`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
-    return res.status(200).json({
-      success: true,
-      message: exists ? 'Company infrastructure updated' : 'Company infrastructure registered',
-      data: {
-        employerAddress,
-        treasuryAddress,
-        treasuryHexDest: `${treasuryHexDest.substring(0, 20)}...`,
-        createdAt: now
-      }
-    });
-    
+    return res.status(201).json({ success: true, ...response });
+
   } catch (error: any) {
     console.error(`[COMPANY API:${requestId}] ❌ ERROR:`, error.message);
     console.error(`[COMPANY API:${requestId}] ===== END =====\n`);
     
     const statusCode = error.message.includes('Missing') || error.message.includes('must be') ? 400 : 500;
-    return res.status(statusCode).json({
-      success: false,
+    return res.status(statusCode).json({ 
+      success: false, 
       error: error.message,
       requestId
     });
@@ -140,6 +148,10 @@ export async function registerCompany(req: Request, res: Response) {
 /**
  * Get company details by employer address
  * GET /api/companies/:employerAddress
+ * 
+ * UPDATED: Returns vaultAddress as well
+ * UPDATED: LAZY POPULATION - If vaultAddress is missing (legacy company), 
+ * calculate it on-the-fly and save it back to the database
  */
 export async function getCompany(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -155,8 +167,9 @@ export async function getCompany(req: Request, res: Response) {
     
     console.log(`[COMPANY API:${requestId}] Fetching company: ${employerAddress.substring(0, 20)}...`);
     
+    // 1. Fetch the existing record
     const result = await db.execute({
-      sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt FROM companies WHERE employerAddress = ?',
+      sql: 'SELECT * FROM companies WHERE employerAddress = ?',
       args: [employerAddress]
     });
     
@@ -172,7 +185,31 @@ export async function getCompany(req: Request, res: Response) {
       });
     }
     
+    // 2. LAZY POPULATION: If vaultAddress is missing (legacy company), calculate and save it now
+    if (!company.vaultAddress) {
+      console.log(`[COMPANY API:${requestId}] 🔄 Migrating legacy company: vaultAddress missing, deriving from Scroll...`);
+      
+      try {
+        const derivedVault = await scrolls.getCompanyVaultAddress(employerAddress);
+        console.log(`[COMPANY API:${requestId}] Derived vault address: ${derivedVault.substring(0, 30)}...`);
+        
+        await db.execute({
+          sql: 'UPDATE companies SET vaultAddress = ?, updatedAt = ? WHERE employerAddress = ?',
+          args: [derivedVault, new Date().toISOString(), employerAddress]
+        });
+        
+        // Update the local object for the response
+        company.vaultAddress = derivedVault;
+        
+        console.log(`[COMPANY API:${requestId}] ✅ Legacy company migrated with vault address`);
+      } catch (migrationError: any) {
+        console.error(`[COMPANY API:${requestId}] ❌ Failed to derive vault for legacy company:`, migrationError.message);
+        // Continue without vault address - don't fail the request
+      }
+    }
+    
     console.log(`[COMPANY API:${requestId}] ✅ Company found`);
+    console.log(`[COMPANY API:${requestId}]   Vault: ${company.vaultAddress ? company.vaultAddress.substring(0, 30) + '...' : 'not set'}`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json({
@@ -180,8 +217,10 @@ export async function getCompany(req: Request, res: Response) {
       data: {
         employerAddress: company.employerAddress,
         treasuryAddress: company.treasuryAddress,
-        treasuryHexDest: `${company.treasuryHexDest.substring(0, 20)}...`, // Truncate for response
-        createdAt: company.createdAt
+        treasuryHexDest: `${company.treasuryHexDest.substring(0, 20)}...`,
+        vaultAddress: company.vaultAddress ? company.vaultAddress : null,
+        createdAt: company.createdAt,
+        updatedAt: company.updatedAt
       }
     });
     
@@ -200,6 +239,8 @@ export async function getCompany(req: Request, res: Response) {
 /**
  * Get all companies (for admin dashboard)
  * GET /api/companies
+ * 
+ * UPDATED: Returns vaultAddress as well
  */
 export async function listCompanies(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -210,7 +251,7 @@ export async function listCompanies(req: Request, res: Response) {
   
   try {
     const result = await db.execute({
-      sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
+      sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, vaultAddress, createdAt, updatedAt FROM companies ORDER BY createdAt DESC LIMIT ? OFFSET ?',
       args: [parseInt(limit as string), parseInt(offset as string)]
     });
     
@@ -219,12 +260,14 @@ export async function listCompanies(req: Request, res: Response) {
     console.log(`[COMPANY API:${requestId}] Found ${companies.length} companies`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
-    // Truncate hex destinations for response
+    // Return full data for admin dashboard (no truncation for internal use)
     const sanitized = companies.map((c: any) => ({
       employerAddress: c.employerAddress,
       treasuryAddress: c.treasuryAddress,
-      treasuryHexDest: `${c.treasuryHexDest.substring(0, 20)}...`,
-      createdAt: c.createdAt
+      treasuryHexDest: c.treasuryHexDest,
+      vaultAddress: c.vaultAddress,
+      createdAt: c.createdAt,
+      updatedAt: c.updatedAt
     }));
     
     return res.status(200).json({

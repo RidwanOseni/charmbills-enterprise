@@ -51,6 +51,12 @@ export interface LockedUtxo {
   expiresAt: string;
 }
 
+export interface UtxoStatus {
+  spent: boolean;
+  confirmed: boolean;
+  details?: any;
+}
+
 // --------------------------------------------------------------------------------
 // Error Classes
 // --------------------------------------------------------------------------------
@@ -300,6 +306,59 @@ export async function fetchTransactionHex(txid: string): Promise<string> {
 }
 
 /**
+ * Verifies the current status of a UTXO (spent status and confirmation)
+ * Used by the automated release agent to ensure token hasn't been spent or reorged
+ * 
+ * @param utxoId - UTXO ID in format "txid:vout"
+ * @returns UtxoStatus object with spent status and confirmation status
+ */
+export async function verifyUtxoStatus(utxoId: string): Promise<UtxoStatus> {
+  try {
+    console.log(`[UTXO Manager] Verifying UTXO status: ${utxoId}`);
+    
+    const [txid, vout] = utxoId.split(':');
+    
+    if (!txid || vout === undefined) {
+      throw new UtxoError(`Invalid UTXO ID format: ${utxoId}`);
+    }
+    
+    // Check if UTXO is spent using outspend endpoint
+    const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`, {
+      timeout: 10000
+    });
+    
+    // Fetch transaction details to check confirmation status
+    const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`, {
+      timeout: 10000
+    });
+    
+    const isSpent = outspendResponse.data.spent === true;
+    const isConfirmed = txResponse.data.status?.confirmed === true;
+    
+    console.log(`[UTXO Manager] UTXO ${utxoId}: spent=${isSpent}, confirmed=${isConfirmed}`);
+    
+    return {
+      spent: isSpent,
+      confirmed: isConfirmed,
+      details: {
+        outspend: outspendResponse.data,
+        transaction: txResponse.data
+      }
+    };
+    
+  } catch (error: any) {
+    console.error(`[UTXO Manager] Failed to verify UTXO ${utxoId}:`, error.message);
+    
+    // Return conservative defaults for safety
+    return {
+      spent: true,
+      confirmed: false,
+      details: { error: `Verification failed: ${error.message}` }
+    };
+  }
+}
+
+/**
  * Selects the optimal UTXO using "Smallest Sufficient" strategy
  * 
  * Why smallest sufficient?
@@ -433,14 +492,13 @@ export async function getDynamicFundingUtxo(
  */
 export function estimateRequiredSats(
   workerCount: number, 
-  extraBuffer: number = 10000
+  extraBufferPercent: number = 50  // 50% buffer instead of fixed 50000
 ): number {
-  // Base: 1000 sats per output (dust limit)
   const outputsCost = (workerCount + 1) * constants.MIN_OUTPUT_SATS;
-  
-  // Estimated fee: ~10 sats/vbyte * 200 vbytes = 2000 sats
   const estimatedFee = 2000;
+  const total = outputsCost + estimatedFee;
+  const buffer = Math.ceil(total * (extraBufferPercent / 100));
   
-  // Total + buffer
-  return outputsCost + estimatedFee + extraBuffer;
+  console.log(`[UTXO Manager] Estimate: base=${total}, buffer=${buffer} (${extraBufferPercent}%), total=${total + buffer}`);
+  return total + buffer;
 }

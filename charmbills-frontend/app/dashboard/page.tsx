@@ -23,11 +23,13 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
-import { Wallet, Users, CheckCircle, Building2, PlusCircle, CreditCard } from 'lucide-react'
+import { Wallet, Users, CheckCircle, Building2, PlusCircle, CreditCard, Clock } from 'lucide-react'
 import { useWallet } from '@/lib/WalletContext';
 import { getWalletStatus } from '@/lib/charms-utils';
 import { WorkerStatus, ProverResult } from '../../shared/types';
 import * as constants from '../../shared/constants';
+import { decryptPayrollData, EncryptedData } from '../../shared/encryption';
+import { getFromIPFS } from '@/lib/ipfs-pinner';
 
 // Import for company onboarding hex derivation
 import * as btc from '@scure/btc-signer';
@@ -48,6 +50,92 @@ const frequencyToSeconds = (freq: string) => {
     'demo': constants.DEMO_SECONDS_PER_PERIOD
   };
   return map[freq] || constants.SECONDS_PER_BIWEEK;
+};
+
+// =========================================================================
+// Helper function to get status badge based on worker status
+// Supports: 'active' (on-chain confirmed), 'minting_pending' (in mempool),
+//           'pending' (needs tokens), and other states
+// =========================================================================
+const getStatusBadge = (status: string) => {
+  switch(status) {
+    case 'active': 
+      return <Badge className="bg-green-500 hover:bg-green-600">Active (On-Chain)</Badge>;
+    case 'minting_pending': 
+      return <Badge className="bg-blue-500 animate-pulse hover:bg-blue-600">Confirming (Mempool)...</Badge>;
+    case 'pending': 
+      return <Badge variant="outline" className="text-yellow-600 border-yellow-600">Needs Tokens</Badge>;
+    default: 
+      return <Badge variant="secondary">Inactive</Badge>;
+  }
+};
+
+// =========================================================================
+// Helper function to decrypt department metadata using wallet entropy
+// Fetches CID from backend, retrieves encrypted blob from IPFS, and decrypts
+// =========================================================================
+const decryptDepartmentMetadata = async (metadataHash: string, entropy: string): Promise<any> => {
+  try {
+    console.log(`[DECRYPT] Decrypting metadata for hash: ${metadataHash.substring(0, 16)}...`);
+    
+    // 1. Fetch CID from backend
+    const cidResponse = await api.get(`/api/ipfs/cid/${metadataHash}`);
+    const cid = cidResponse.data.cid;
+    
+    if (!cid) {
+      console.error(`[DECRYPT] No CID found for metadata hash: ${metadataHash}`);
+      return null;
+    }
+    
+    console.log(`[DECRYPT] Retrieved CID: ${cid}`);
+    
+    // 2. Fetch encrypted blob from IPFS
+    const encryptedBlob = await getFromIPFS(cid);
+    
+    // 3. CRITICAL: Convert hex strings to Uint8Arrays
+    // Web Crypto API requires raw bytes, not hex strings
+    const preparedBlob = {
+      content: hexToBytes(encryptedBlob.content),
+      iv: hexToBytes(encryptedBlob.iv),
+      tag: hexToBytes(encryptedBlob.tag)
+    };
+    
+    console.log(`[DECRYPT] Converted hex to bytes - content: ${preparedBlob.content.length} bytes, iv: ${preparedBlob.iv.length} bytes`);
+    
+    // 4. Decrypt using wallet entropy
+    const decrypted = await decryptPayrollData(preparedBlob as any, entropy);
+    
+    console.log(`[DECRYPT] Successfully decrypted metadata`);
+    return decrypted;
+  } catch (error) {
+    console.error('[DECRYPT] Failed to decrypt metadata:', error);
+    return null;
+  }
+};
+
+// =========================================================================
+// Dynamic fee estimation based on current network conditions
+// Fetches recommended fees from Mempool.space API and calculates total requirement
+// =========================================================================
+const estimateDynamicFee = async (workerCount: number): Promise<number> => {
+  try {
+    // Fetch recommended fees from Mempool.space API
+    const response = await axios.get('https://mempool.space/testnet4/api/v1/fees/recommended');
+    const { fastestFee, halfHourFee, hourFee } = response.data;
+    
+    // Use fastestFee + 20% buffer for safety during congestion
+    const feeRate = fastestFee + Math.ceil(fastestFee * 0.2);
+    
+    // Estimate transaction size: base 200 vbytes + ~50 vbytes per worker output
+    const estimatedTxSize = 200 + (workerCount * 50);
+    const estimatedFee = feeRate * estimatedTxSize;
+    
+    console.log(`[FEE ESTIMATE] Rate: ${feeRate} sats/vb, Size: ${estimatedTxSize} vb, Fee: ${estimatedFee} sats`);
+    return estimatedFee;
+  } catch (error) {
+    console.warn('[FEE ESTIMATE] Failed to fetch, using fallback of 5000 sats');
+    return 5000; // Fallback
+  }
 };
 
 export default function EmployerDashboard() {
@@ -143,6 +231,28 @@ export default function EmployerDashboard() {
       anchor: confirmedUtxos[0] || null,
       fee: confirmedUtxos[1] || confirmedUtxos[0] || null
     };
+  };
+
+  // ============================================================
+  // Helper: Get wallet entropy for decryption
+  // ============================================================
+  const getWalletEntropy = async (): Promise<string | null> => {
+    if (!(window as any).LeatherProvider) {
+      console.error('[DECRYPT] Leather wallet not detected');
+      return null;
+    }
+    
+    try {
+      const sigRes = await (window as any).LeatherProvider.request("signMessage", {
+        message: constants.PAYROLL_AUTH_MESSAGE,
+        paymentType: "p2tr",
+        network: "testnet"
+      });
+      return sigRes.result.signature;
+    } catch (error) {
+      console.error('[DECRYPT] Failed to get wallet entropy:', error);
+      return null;
+    }
   };
 
   // ============================================================
@@ -291,7 +401,7 @@ export default function EmployerDashboard() {
       }
       
       const sigRes = await (window as any).LeatherProvider.request("signMessage", {
-        message: `CharmsPay Department Authority: ${setupDeptName}`,
+        message: constants.PAYROLL_AUTH_MESSAGE,
         paymentType: "p2tr",
         network: "testnet"
       });
@@ -460,10 +570,25 @@ export default function EmployerDashboard() {
       // =========================================================================
       // CRITICAL FIX FOR STAGE 2: Find a SEPARATE Treasury UTXO for fees
       // The Plan NFT is the authority (Input 0). We need a distinct UTXO for gas (Input 1)
-      // Find a Treasury UTXO >= 15,000 sats to sponsor the batch
+      // Find a Treasury UTXO with dynamic fee estimation to ensure sufficient funds
       // =========================================================================
       const authorityUtxoId = currentPlanNftUtxo;
       console.log(`[BATCH MINT] Authority (Plan NFT) UTXO: ${authorityUtxoId}`);
+      
+      // =========================================================================
+      // DYNAMIC FEE ESTIMATION: Calculate required satoshis based on current network fees
+      // This prevents "Insufficient Fuel" errors during network congestion
+      // =========================================================================
+      const estimatedFee = await estimateDynamicFee(workerList.length);
+      
+      // Calculate total requirement: outputs cost (workers + NFT return + change) + estimated fee + 50% buffer
+      const outputsCost = (workerList.length + 3) * constants.MIN_OUTPUT_SATS;
+      const totalNeeded = outputsCost + estimatedFee + Math.ceil(estimatedFee * 0.5); // 50% buffer on fees
+      
+      console.log(`[BATCH MINT] Dynamic requirement calculation:`);
+      console.log(`  Outputs cost (${workerList.length + 3} outputs): ${outputsCost} sats`);
+      console.log(`  Estimated fee: ${estimatedFee} sats`);
+      console.log(`  Total needed: ${totalNeeded} sats`);
       
       // Find a separate Treasury UTXO (different from the Plan NFT UTXO) with sufficient funds
       const treasuryUtxo = btcContext.utxos.find((u: any) => {
@@ -472,20 +597,21 @@ export default function EmployerDashboard() {
           console.log(`[BATCH MINT] Skipping Plan NFT UTXO for funding: ${u.utxoId}`);
           return false;
         }
-        // Must have at least 15,000 sats for fees
-        return u.value >= 15000;
+        // Must have enough sats based on dynamic calculation
+        return u.value >= totalNeeded;
       });
       
       if (!treasuryUtxo) {
         console.error("[BATCH MINT] No suitable Treasury UTXO found. Available UTXOs:", 
           btcContext.utxos.map((u: any) => ({ utxoId: u.utxoId, value: u.value }))
         );
-        throw new Error("No Treasury UTXO found with >= 15,000 sats. Please ensure your wallet has sufficient funds for transaction fees.");
+        throw new Error(`No Treasury UTXO found with >= ${totalNeeded} sats. Please ensure your wallet has sufficient funds for transaction fees.`);
       }
       
       console.log("[BATCH MINT] Selected Treasury UTXO for fees:", {
         utxoId: treasuryUtxo.utxoId,
         value: treasuryUtxo.value,
+        required: totalNeeded,
         hasScript: !!treasuryUtxo.script,
         scriptLength: treasuryUtxo.script?.length || 0
       });
@@ -493,7 +619,7 @@ export default function EmployerDashboard() {
       // =========================================================================
       // Construct payload with TWO DISTINCT INPUTS:
       // - authorityUtxo: The Plan NFT (1,000 sats) - Input 0
-      // - fundingUtxo: The Treasury UTXO (>=15,000 sats) - Input 1
+      // - fundingUtxo: The Treasury UTXO (>= totalNeeded sats) - Input 1
       // =========================================================================
       const payload = {
         authorityUtxo: authorityUtxoId,
@@ -518,6 +644,7 @@ export default function EmployerDashboard() {
         authorityUtxo: payload.authorityUtxo.substring(0, 30) + '...',
         fundingUtxo: payload.fundingUtxo.substring(0, 30) + '...',
         fundingValue: payload.fundingValue,
+        requiredNeeded: totalNeeded,
         workersCount: payload.workers.length
       });
 
@@ -558,15 +685,59 @@ export default function EmployerDashboard() {
   };
   
   // ============================================================
-  // Data Fetching Helpers
+  // Data Fetching Helpers with Lazy Decryption Loop
   // ============================================================
   const fetchPlans = async () => {
     if (!address) return;
     try {
+      console.log('[FETCH PLANS] Fetching plans for employer:', address);
       const res = await api.get(`/api/plans?employerAddress=${address}`);
-      setRegisteredDepts(res.data);
-      if (res.data.length > 0 && !selectedDeptId) {
-        setSelectedDeptId(res.data[0].appId);
+      let plans = res.data;
+      
+      console.log(`[FETCH PLANS] Received ${plans.length} plans from backend`);
+      
+      // =========================================================================
+      // LAZY DECRYPTION LOOP: Unlock missing department names if wallet is connected
+      // This is the core of Non-Custodial Mode - decryption happens in the browser
+      // =========================================================================
+      if (walletConnected && plans.length > 0) {
+        console.log('[FETCH PLANS] Wallet connected, attempting to decrypt missing department names...');
+        
+        // Get wallet entropy for decryption
+        const entropy = await getWalletEntropy();
+        
+        if (entropy) {
+          const unlockedPlans = await Promise.all(plans.map(async (plan: any) => {
+            // Check if department name is missing but metadataHash exists
+            if (!plan.department && plan.metadataHash) {
+              console.log(`[FETCH PLANS] 🔓 Attempting to decrypt plan ${plan.appId.substring(0, 8)}... with hash ${plan.metadataHash.substring(0, 16)}...`);
+              
+              const decrypted = await decryptDepartmentMetadata(plan.metadataHash, entropy);
+              
+              if (decrypted && decrypted.department) {
+                console.log(`[FETCH PLANS] ✅ Successfully decrypted department name: ${decrypted.department}`);
+                return { ...plan, department: decrypted.department };
+              } else {
+                console.log(`[FETCH PLANS] ⚠️ Failed to decrypt department name for plan ${plan.appId.substring(0, 8)}...`);
+                return plan;
+              }
+            }
+            return plan;
+          }));
+          
+          plans = unlockedPlans;
+          console.log('[FETCH PLANS] Lazy decryption loop completed');
+        } else {
+          console.log('[FETCH PLANS] ⚠️ Failed to get wallet entropy, skipping decryption');
+        }
+      } else {
+        console.log('[FETCH PLANS] Wallet not connected or no plans, skipping decryption');
+      }
+      
+      setRegisteredDepts(plans);
+      
+      if (plans.length > 0 && !selectedDeptId) {
+        setSelectedDeptId(plans[0].appId);
       }
     } catch (error) {
       console.error('Failed to fetch plans:', error);
@@ -627,6 +798,7 @@ export default function EmployerDashboard() {
   // Fetch initial data when wallet connects
   useEffect(() => {
     if (walletConnected && address) {
+      console.log('[DASHBOARD] Wallet connected, fetching plans and workers...');
       fetchPlans();
       refreshWorkers();
     }
@@ -879,7 +1051,7 @@ export default function EmployerDashboard() {
                     <SelectItem value="weekly">Weekly</SelectItem>
                     <SelectItem value="biweekly">Bi-weekly (Standard)</SelectItem>
                     <SelectItem value="monthly">Monthly</SelectItem>
-                    <SelectItem value="demo">Investor Demo (8 Minute)</SelectItem>
+                    <SelectItem value="demo">Investor Demo (4 Hours)</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground mt-1">Sets the on-chain pay period for all workers in this department.</p>
@@ -949,7 +1121,9 @@ export default function EmployerDashboard() {
                   <SelectContent>
                     {registeredDepts.map((dept) => (
                       <SelectItem key={dept.appId} value={dept.appId}>
-                        {dept.department.charAt(0).toUpperCase() + dept.department.slice(1)}
+                        {dept.department 
+                          ? (dept.department.charAt(0).toUpperCase() + dept.department.slice(1)) 
+                          : `Dept (${dept.ticker || 'SALES-PAY'})`}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1036,7 +1210,9 @@ export default function EmployerDashboard() {
                 <SelectContent>
                   {registeredDepts.map((dept) => (
                     <SelectItem key={dept.appId} value={dept.department}>
-                      {dept.department.charAt(0).toUpperCase() + dept.department.slice(1)}
+                      {dept.department 
+                        ? (dept.department.charAt(0).toUpperCase() + dept.department.slice(1)) 
+                        : `Dept (${dept.ticker || 'SALES-PAY'})`}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1047,7 +1223,7 @@ export default function EmployerDashboard() {
             <div className="mb-6">
               <div className="flex items-center justify-between mb-3">
                 <p className="text-sm font-medium text-foreground">
-                  Workers in {selectedDept ? selectedDept.charAt(0).toUpperCase() + selectedDept.slice(1) : 'selected department'}
+                  Workers in {selectedDept ? (selectedDept.charAt(0).toUpperCase() + selectedDept.slice(1)) : 'selected department'}
                 </p>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -1078,16 +1254,11 @@ export default function EmployerDashboard() {
                           <TableCell className="text-sm font-medium text-foreground py-2">{worker.name || 'Unnamed'}</TableCell>
                           <TableCell className="text-sm text-muted-foreground py-2">{worker.role}</TableCell>
                           <TableCell className="py-2">
-                            <Badge className={`rounded-full px-2 py-0.5 text-xs ${
-                              worker.status === 'active'
-                                ? 'bg-secondary/20 text-secondary'
-                                : 'bg-yellow-100 text-yellow-700'
-                            }`}>
-                              {worker.status === 'active' ? 'Active' : 'Needs Tokens'}
-                            </Badge>
+                            {/* FIX: Use getStatusBadge for consistent status display */}
+                            {getStatusBadge(worker.status)}
                           </TableCell>
                           <TableCell className="text-sm text-muted-foreground py-2">
-                            {worker.currentPeriod?.validTo ? new Date(worker.currentPeriod.validTo).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}
+                            {worker.lastMintedPeriod ? new Date(worker.lastMintedPeriod).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}
                           </TableCell>
                         </TableRow>
                       ))}
@@ -1197,22 +1368,14 @@ export default function EmployerDashboard() {
                   <TableRow key={worker.walletAddress || worker.id} className="border-b border-border hover:bg-muted/30 transition">
                     <TableCell className="font-medium text-foreground">{worker.name || 'Unnamed'}</TableCell>
                     <TableCell className="text-foreground">{worker.role || 'Team Member'}</TableCell>
-                    {/* FIX: Display the department name from API (p.ticker as department) */}
                     <TableCell>
                       <Badge className="rounded-full px-3 py-1 text-xs bg-primary/10 text-primary">
                         {worker.department ? worker.department.charAt(0).toUpperCase() + worker.department.slice(1) : 'General'}
                       </Badge>
                     </TableCell>
                     <TableCell>
-                      <Badge
-                        className={`rounded-full px-3 py-1 text-sm ${
-                          worker.status === 'active'
-                            ? 'bg-secondary/20 text-secondary'
-                            : 'bg-yellow-100 text-yellow-700'
-                        }`}
-                      >
-                        {worker.status === 'active' ? 'Active' : 'Needs Tokens'}
-                      </Badge>
+                      {/* FIX: Use getStatusBadge for consistent status display */}
+                      {getStatusBadge(worker.status)}
                     </TableCell>
                     <TableCell className="text-foreground text-sm">
                       {worker.lastMintedPeriod ? new Date(worker.lastMintedPeriod).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) : 'Not paid'}

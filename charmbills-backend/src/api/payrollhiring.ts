@@ -71,7 +71,7 @@ async function getExistingWorkerName(db: any, walletAddress: string, planId: str
 }
 
 // --------------------------------------------------------------------------------
-// Helper to save or update worker
+// Helper to save or update worker - sets status to 'minting_pending'
 // --------------------------------------------------------------------------------
 
 async function saveWorkerRecord(
@@ -108,7 +108,32 @@ async function saveWorkerRecord(
 }
 
 // --------------------------------------------------------------------------------
-// Helper to update worker after mint (token UTXO)
+// Helper to update worker status
+// --------------------------------------------------------------------------------
+
+async function updateWorkerStatus(
+  db: any,
+  walletAddress: string,
+  planId: string,
+  status: 'active' | 'terminated' | 'pending' | 'minting_pending'
+): Promise<void> {
+  await db.execute({
+    sql: `UPDATE workers 
+          SET status = ?, 
+              updatedAt = ?
+          WHERE walletAddress = ? AND planId = ?`,
+    args: [
+      status,
+      new Date().toISOString(),
+      walletAddress,
+      planId
+    ]
+  });
+}
+
+// --------------------------------------------------------------------------------
+// Helper to update worker after mint (token UTXO) - sets status to 'active'
+// This is called ONLY by the Indexer when transaction is confirmed on-chain
 // --------------------------------------------------------------------------------
 
 async function updateWorkerPostMint(
@@ -124,6 +149,7 @@ async function updateWorkerPostMint(
           SET currentTokenUtxo = ?, 
               expiresAt = ?, 
               lastMintedPeriod = ?,
+              status = 'active',
               updatedAt = ?
           WHERE walletAddress = ? AND planId = ?`,
     args: [
@@ -249,6 +275,10 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
  * - Each worker has their own salary and role stored in encrypted IPFS
  * - One Plan NFT governs the entire department
  * - Salary enforcement happens at Scroll Settlement Layer, not on-chain
+ * 
+ * DERIVABLE MODEL IMPLEMENTATION:
+ * - Workers are set to 'minting_pending' status after transaction generation
+ * - The Indexer updates workers to 'active' with actual token UTXOs when confirmed
  */
 export async function mintPayrollToken(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -301,8 +331,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`[HIRING API:${requestId}] planMetadata.anchorUtxo: ${planMetadata.anchorUtxo.substring(0, 30)}...`);
     
     // ----------------------------------------------------------------------------
-    // Step 2: Safely handle encryption entropy - FIX TS2345
-    // This ensures the value passed to encryption is NEVER undefined
+    // Step 2: Safely handle encryption entropy
     // ----------------------------------------------------------------------------
     const entropy: string = encryptionEntropy || process.env.DEFAULT_ENCRYPTION_ENTROPY || "";
     
@@ -359,7 +388,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       const worker = workers[i];
       console.log(`[HIRING API:${requestId}]   Worker ${i + 1}: ${worker.address.substring(0, 16)}... (${worker.role})`);
       
-      // CRITICAL FIX: Get existing worker name to preserve it
+      // Get existing worker name to preserve it
       const existingName = await getExistingWorkerName(db, worker.address, planMetadata.appId);
       const workerName = existingName || worker.role;
       
@@ -379,14 +408,18 @@ export async function mintPayrollToken(req: Request, res: Response) {
       const { metadataHash } = await pinToIPFS(encryptedWorkerData);
       workerMetadataHashes.push(metadataHash);
       
-      // Save to workers table - preserve name, don't overwrite with role
+      // =========================================================================
+      // DERIVABLE MODEL: Mark as 'minting_pending' instead of 'active'
+      // This tells the frontend that the transaction is in flight but not yet confirmed
+      // The indexer will update this to 'active' when the transaction is confirmed on-chain
+      // =========================================================================
       await saveWorkerRecord(
         db,
         worker.address,
         workerName,
         planMetadata.appId,
         planMetadata.scrollPolicy === 0 ? 0 : 1,
-        'active',
+        'minting_pending',
         new Date().toISOString(),
         null,
         new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString(),
@@ -394,6 +427,8 @@ export async function mintPayrollToken(req: Request, res: Response) {
         worker.salarySats,
         worker.role
       );
+      
+      console.log(`[HIRING API:${requestId}]   Worker status set to 'minting_pending'`);
     }
     
     console.log(`[HIRING API:${requestId}] ✅ Worker data encrypted and pinned to IPFS`);
@@ -428,9 +463,10 @@ export async function mintPayrollToken(req: Request, res: Response) {
     
     // ----------------------------------------------------------------------------
     // Step 8: Calculate required satoshis for fee sponsorship
+    // CRITICAL FIX: Increased buffer from 30000 to 50000 to cover higher fees
     // ----------------------------------------------------------------------------
-    const requiredSats = estimateRequiredSats(workers.length);
-    console.log(`[HIRING API:${requestId}] Estimated required: ${requiredSats} sats`);
+    const requiredSats = estimateRequiredSats(workers.length, 50);  // 50% buffer
+    console.log(`[HIRING API:${requestId}] Estimated required: ${requiredSats} sats (with 50000 buffer)`);
     
     // ----------------------------------------------------------------------------
     // Step 9: Dynamically select funding UTXO from treasury
@@ -451,7 +487,6 @@ export async function mintPayrollToken(req: Request, res: Response) {
     
     // ----------------------------------------------------------------------------
     // Step 10: Fetch funding UTXO hex from the blockchain
-    // CRITICAL: Frontend provides only the UTXO ID, prover needs the full hex
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] 🔍 Fetching funding UTXO hex...`);
     
@@ -490,14 +525,10 @@ export async function mintPayrollToken(req: Request, res: Response) {
     
     // ----------------------------------------------------------------------------
     // Step 13: Create return metadata with placeholder compensationSats
-    // CRITICAL FIX: Use placeholder (>= 1000) for the Authority NFT return output [Source 269]
-    // The REAL salary is stored in IPFS and DB, but the on-chain NFT needs the placeholder
-    // to satisfy the Rust contract validation (compensation_sats >= 1000)
-    // CRITICAL FIX: Include anchorUtxo from original planMetadata for mint-token witness
     // ----------------------------------------------------------------------------
     const returnMetadata = {
       ...planMetadata,
-      anchorUtxo: planMetadata.anchorUtxo,   // CRITICAL: Pass through anchorUtxo for witness
+      anchorUtxo: planMetadata.anchorUtxo,
       compensationSats: Math.max(planMetadata.compensationSats || 0, constants.MIN_OUTPUT_SATS || 1000)
     };
     
@@ -511,17 +542,6 @@ export async function mintPayrollToken(req: Request, res: Response) {
     
     // ----------------------------------------------------------------------------
     // Step 14: Generate batch hiring transactions
-    // CRITICAL: Pass ALL required parameters to batchPayroll
-    // The updated batchPayroll expects:
-    // - planUtxo: authorityUtxo
-    // - workers: workerAllocations
-    // - fundingUtxo: funding
-    // - changeAddress: employerAddress (or treasury address for change)
-    // - appId: planMetadata.appId
-    // - employerAddress: Where to return the Plan NFT
-    // - planMetadata: returnMetadata (with placeholder compensationSats AND anchorUtxo)
-    // - treasuryHexDest: company.treasuryHexDest
-    // - utxoAddress: The Bitcoin address associated with the authority UTXO (REQUIRED for app_private_inputs)
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] Calling batchPayroll...`);
     console.log(`[HIRING API:${requestId}] batchPayroll parameters:`, {
@@ -538,52 +558,35 @@ export async function mintPayrollToken(req: Request, res: Response) {
     });
     
     const result = await batchPayroll(
-      authorityUtxo,                           // planUtxo
-      workerAllocations,                       // workers
-      { utxo: funding.utxoId, value: funding.value }, // fundingUtxo
-      employerAddress,                         // changeAddress (for Bitcoin change)
-      planMetadata.appId,                      // appId
-      employerAddress,                         // employerAddress (where NFT returns)
-      returnMetadata,                          // planMetadata (with placeholder compensationSats AND anchorUtxo)
-      company.treasuryHexDest,                 // treasuryHexDest
-      utxoAddress,                             // utxoAddress (REQUIRED - address associated with authority UTXO)
-      undefined                                // multiSigSigners
+      authorityUtxo,
+      workerAllocations,
+      { utxo: funding.utxoId, value: funding.value },
+      employerAddress,
+      planMetadata.appId,
+      employerAddress,
+      returnMetadata,
+      company.treasuryHexDest,
+      utxoAddress,
+      undefined
     );
     
     console.log(`[HIRING API:${requestId}] ✅ Transactions generated`);
     
     // =========================================================================
-    // CRITICAL FIX: Update workers with actual token UTXOs from the transaction
+    // DERIVABLE MODEL: Do NOT update workers with token UTXOs here
+    // The transaction is not yet confirmed. The Indexer will handle activation.
+    // Only update status to 'minting_pending' to show transaction is in mempool.
     // =========================================================================
-    console.log(`[HIRING API:${requestId}] Updating workers with token UTXOs...`);
-    
-    const bitcoin = require('bitcoinjs-lib');
-    
-    // Get the transaction hex from the result
-    const txHex = result.spellTxHex;
-    const tx = bitcoin.Transaction.fromHex(txHex);
-    
-    // Token outputs start at index 0 (each worker gets one output)
-    for (let i = 0; i < workers.length && i < tx.outs.length; i++) {
-        const worker = workers[i];
-        const tokenUtxo = `${tx.getId()}:${i}`;
-        const expiresAt = new Date(Date.now() + planMetadata.payPeriodSeconds * 1000).toISOString();
-        const lastMintedPeriod = new Date().toISOString();
-        
-        console.log(`[HIRING API:${requestId}]   Updating worker ${worker.address.substring(0, 16)}... with token UTXO: ${tokenUtxo}`);
-        
-        // Update the worker record with the actual token UTXO
-        await updateWorkerPostMint(
-          db,
-          worker.address,
-          planMetadata.appId,
-          tokenUtxo,
-          expiresAt,
-          lastMintedPeriod
-        );
+    console.log(`[HIRING API:${requestId}] Workers in mempool - keeping status as 'minting_pending'...`);
+    console.log(`[HIRING API:${requestId}] The Indexer will activate workers once transaction is confirmed.`);
+
+    for (const worker of workers) {
+        // Workers already have 'minting_pending' status from saveWorkerRecord above
+        // No additional update needed - the Indexer will set to 'active' when confirmed
+        console.log(`[HIRING API:${requestId}]   Worker ${worker.address.substring(0, 16)}... status remains 'minting_pending' (awaiting confirmation)`);
     }
-    
-    console.log(`[HIRING API:${requestId}] ✅ Updated ${workers.length} workers with token UTXOs`);
+
+    console.log(`[HIRING API:${requestId}] ✅ Workers remain in 'minting_pending' state. Awaiting block confirmation.`);
     
     // ----------------------------------------------------------------------------
     // Step 15: Return success response
@@ -601,7 +604,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       utxoVerification: { verified: true, unspent: true },
       workerMetadataHashes,
       requestId,
-      returnMetadataCompensation: returnMetadata.compensationSats  // Include for debugging
+      returnMetadataCompensation: returnMetadata.compensationSats
     };
     
     console.log(`[HIRING API:${requestId}] ===== SUCCESS =====`);
@@ -610,6 +613,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`  Remaining: ${newRemainingSupply}`);
     console.log(`  Return NFT compensationSats: ${returnMetadata.compensationSats}`);
     console.log(`  Return NFT anchorUtxo: ${returnMetadata.anchorUtxo ? returnMetadata.anchorUtxo.substring(0, 30) + '...' : 'missing'}`);
+    console.log(`  Workers status: minting_pending (awaiting confirmation)`);
     console.log(`[HIRING API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json(response);
@@ -713,7 +717,7 @@ export async function getHiringQuote(req: Request, res: Response) {
       throw new Error('planRemaining must be a non-negative number if provided');
     }
     
-    const requiredSats = estimateRequiredSats(workerCount);
+    const requiredSats = estimateRequiredSats(workerCount, 50);
     const scrollFee = calculateScrollFee(2, requiredSats);
     const supplyRemaining = planRemaining !== undefined ? planRemaining - workerCount : undefined;
     

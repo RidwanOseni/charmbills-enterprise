@@ -18,19 +18,61 @@ interface CompanyRecord {
   employerAddress: string;
   treasuryAddress: string;
   treasuryHexDest: string;
+  vaultAddress: string;        // ADDED: Unified company Scroll vault
   createdAt: string;
   updatedAt?: string;
 }
 
 /**
  * Get company configuration by employer address (Turso version)
+ * UPDATED: Now includes vaultAddress
  */
 async function getCompanyByEmployer(db: any, employerAddress: string): Promise<CompanyRecord | null> {
   const result = await db.execute({
-    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
+    sql: 'SELECT employerAddress, treasuryAddress, treasuryHexDest, vaultAddress, createdAt, updatedAt FROM companies WHERE employerAddress = ?',
     args: [employerAddress]
   });
   return result.rows[0] || null;
+}
+
+/**
+ * Helper to fetch balance from mempool for a single address
+ */
+async function fetchBalanceFromMempool(address: string): Promise<number> {
+  if (!address) return 0;
+  
+  try {
+    const utxoRes = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
+      timeout: 10000
+    });
+    const utxos = utxoRes.data;
+    const balance = utxos.reduce((sum: number, u: any) => sum + u.value, 0);
+    console.log(`[TREASURY API] Fetched balance for ${address.substring(0, 16)}...: ${balance} sats`);
+    return balance;
+  } catch (mempoolError: any) {
+    console.error(`[TREASURY API] ⚠️ Failed to fetch balance from mempool:`, mempoolError.message);
+    return 0;
+  }
+}
+
+/**
+ * Helper to get departmental allocations (liabilities) grouped by department
+ */
+async function getDepartmentalAllocations(db: any, employerAddress: string): Promise<any[]> {
+  const result = await db.execute({
+    sql: `SELECT 
+            p.department, 
+            p.appId,
+            COALESCE(SUM(w.salarySats), 0) as totalAllocation,
+            COUNT(w.walletAddress) as workerCount
+          FROM plans p
+          LEFT JOIN workers w ON w.planId = p.appId AND w.status = 'active'
+          WHERE p.employerAddress = ?
+          GROUP BY p.appId, p.department`,
+    args: [employerAddress]
+  });
+  
+  return result.rows || [];
 }
 
 /**
@@ -86,15 +128,18 @@ export async function getAuditLogs(req: Request, res: Response) {
 /**
  * GET /api/treasury/stats/:employerAddress
  * Aggregates vault liquidity and allocations for the treasury dashboard
- * Uses Deterministic Nonce Model for isolated vaults per employer [Source 628, 734]
  * 
- * - totalLockedSats: ACTUAL physical BTC in the employer's isolated vault (queried from mempool)
- * - employeeAllocationSats: LIABILITY (sum of active salaries)
+ * SIMPLIFIED: Now queries a single vault per company from the companies table.
+ * No longer loops through departments to derive vault addresses.
+ * 
+ * - totalLockedSats: ACTUAL physical BTC in the company's unified vault (queried from mempool)
+ * - employeeAllocationSats: LIABILITY (sum of active salaries across all departments)
  * - requiredFundingSats: TARGET (allocation + buffer) - Desired State
  * - freelancerEscrowSats: Sats held in escrow for freelancers
- * - vaultAddress: Isolated Bitcoin vault address for this employer
+ * - vaultAddress: Unified Bitcoin vault address for this company
+ * - allocations: Departmental breakdown of allocations (for UI display)
  * 
- * MODIFIED: Now uses centralized scrollsClient for vault address derivation [Source 629]
+ * MODIFIED: Uses vaultAddress from companies table instead of deriving from appId
  */
 export async function getTreasuryStats(req: Request, res: Response) {
     const db = req.app.locals.db;
@@ -108,59 +153,47 @@ export async function getTreasuryStats(req: Request, res: Response) {
     
     try {
         // =========================================================================
-        // STEP 1: Get the department's appId to use as a nonce source [Source 724]
-        // The appId is unique per department, derived from the anchor UTXO
+        // STEP 1: Get the single vault address from the company record
+        // This is the unified company vault, not department-specific
         // =========================================================================
-        const planResult = await db.execute({
-            sql: 'SELECT appId FROM plans WHERE employerAddress = ? LIMIT 1',
-            args: [employerAddress]
-        });
+        const company = await getCompanyByEmployer(db, employerAddress);
         
-        const plan = planResult.rows[0];
-        
-        if (!plan || !plan.appId) {
-            console.warn(`[TREASURY API] No plan found for employer: ${employerAddress}`);
-            // Return default stats with zero balances
+        if (!company) {
+            console.warn(`[TREASURY API] No company found for employer: ${employerAddress}`);
             return res.json({
                 totalLockedSats: 0,
                 employeeAllocationSats: 0,
                 requiredFundingSats: 0,
                 freelancerEscrowSats: 0,
                 vaultAddress: null,
-                message: 'No active plan found for this employer'
+                allocations: [],
+                message: 'Company not found. Please complete onboarding first.'
             });
         }
         
-        // =========================================================================
-        // STEP 2: Use centralized scrollsClient to get the isolated vault address [Source 629]
-        // This keeps business logic clean and delegates Scroll interaction to the client
-        // =========================================================================
-        const vaultAddress = await scrolls.getVaultAddress(plan.appId);
-        console.log(`[TREASURY API] Isolated vault address: ${vaultAddress}`);
+        const vaultAddress = company.vaultAddress;
+        const treasuryAddress = company.treasuryAddress;
+        
+        console.log(`[TREASURY API] Company vault address: ${vaultAddress ? vaultAddress.substring(0, 20) + '...' : 'not set'}`);
+        console.log(`[TREASURY API] Treasury address: ${treasuryAddress.substring(0, 20)}...`);
         
         // =========================================================================
-        // STEP 3: Query Mempool for the REAL balance of THIS isolated vault [Source 812]
-        // This will show 0 until the employer actually sends funds to their vault
+        // STEP 2: Fetch balance for just this ONE vault address
         // =========================================================================
         let actualLockedSats = 0;
-        try {
-            const utxoRes = await axios.get(`${MEMPOOL_API}/address/${vaultAddress}/utxo`, {
-                timeout: 10000
-            });
-            const utxos = utxoRes.data;
-            actualLockedSats = utxos.reduce((sum: number, u: any) => sum + u.value, 0);
+        if (vaultAddress) {
+            actualLockedSats = await fetchBalanceFromMempool(vaultAddress);
             console.log(`[TREASURY API] Actual vault balance: ${actualLockedSats} sats (${actualLockedSats / 1e8} BTC)`);
-        } catch (mempoolError: any) {
-            console.error(`[TREASURY API] ⚠️ Failed to fetch vault balance from mempool:`, mempoolError.message);
-            actualLockedSats = 0;
+        } else {
+            console.warn(`[TREASURY API] No vault address found for company`);
         }
         
         // =========================================================================
-        // STEP 4: Calculate Liabilities (Source of Truth from DB) [Source 870]
-        // Fetch all active workers for this employer's plan
+        // STEP 3: Calculate Liabilities (Source of Truth from DB) [Source 870]
+        // Fetch all active workers across ALL departments for this employer
         // =========================================================================
         const workersResult = await db.execute({
-            sql: `SELECT w.salarySats, w.currentTokenUtxo, w.status 
+            sql: `SELECT w.salarySats, w.currentTokenUtxo, w.status, p.department
                   FROM workers w
                   JOIN plans p ON w.planId = p.appId 
                   WHERE w.status = 'active' AND p.employerAddress = ?`,
@@ -169,7 +202,7 @@ export async function getTreasuryStats(req: Request, res: Response) {
         
         const workers = workersResult.rows || [];
         
-        console.log(`[TREASURY API] Found ${workers.length} active workers`);
+        console.log(`[TREASURY API] Found ${workers.length} active workers across all departments`);
         
         // Calculate total employee allocation (sum of all active worker salaries) - LIABILITY
         const employeeAllocationSats = workers.reduce((sum: number, w: any) => sum + (w.salarySats || 0), 0);
@@ -181,26 +214,34 @@ export async function getTreasuryStats(req: Request, res: Response) {
         const bufferSats = Math.floor(employeeAllocationSats * 0.05);
         
         // =========================================================================
-        // SEPARATE "TARGET" FROM "ACTUAL" [Source 76, 77]
+        // SEPARATE "TARGET" FROM "ACTUAL"
         // requiredFundingSats: TARGET (Desired State) = allocation + buffer
-        // totalLockedSats: ACTUAL (Physical BTC in the employer's isolated vault)
+        // totalLockedSats: ACTUAL (Physical BTC in the company's unified vault)
         // =========================================================================
         const requiredFundingSats = employeeAllocationSats + bufferSats + freelancerEscrowSats;
+        
+        // =========================================================================
+        // STEP 4: Get departmental allocations for UI display
+        // =========================================================================
+        const allocations = await getDepartmentalAllocations(db, employerAddress);
         
         console.log(`[TREASURY API] ✅ Stats calculated:`, {
             totalLockedSats: actualLockedSats,
             employeeAllocationSats: employeeAllocationSats,
             requiredFundingSats: requiredFundingSats,
             freelancerEscrowSats: freelancerEscrowSats,
-            vaultAddress: vaultAddress
+            vaultAddress: vaultAddress ? vaultAddress.substring(0, 20) + '...' : null,
+            departmentsCount: allocations.length
         });
         
         res.json({
-            totalLockedSats: actualLockedSats,        // ACTUAL: Real on-chain data from isolated vault
-            employeeAllocationSats: employeeAllocationSats,    // LIABILITY: Sum of active salaries
-            requiredFundingSats: requiredFundingSats,          // TARGET: Allocation + Buffer (Desired State)
-            freelancerEscrowSats: freelancerEscrowSats,        // Sats held in escrow for freelancers
-            vaultAddress: vaultAddress                         // Isolated Bitcoin vault address for this employer
+            totalLockedSats: actualLockedSats,                    // ACTUAL: Real on-chain data from company vault
+            employeeAllocationSats: employeeAllocationSats,       // LIABILITY: Sum of active salaries
+            requiredFundingSats: requiredFundingSats,             // TARGET: Allocation + Buffer (Desired State)
+            freelancerEscrowSats: freelancerEscrowSats,           // Sats held in escrow for freelancers
+            vaultAddress: vaultAddress,                           // Unified Bitcoin vault address for this company
+            treasuryAddress: treasuryAddress,                     // Treasury address for gas sponsorship
+            allocations: allocations                               // Departmental breakdown for UI
         });
         
     } catch (error: any) {
@@ -273,7 +314,8 @@ export async function terminateWorker(req: Request, res: Response) {
         
         console.log(`[TERMINATION API] ✅ Company found:`, {
             treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...',
-            treasuryAddress: company.treasuryAddress.substring(0, 20) + '...'
+            treasuryAddress: company.treasuryAddress.substring(0, 20) + '...',
+            vaultAddress: company.vaultAddress ? company.vaultAddress.substring(0, 20) + '...' : 'not set'
         });
         
         // Begin transaction for atomicity
