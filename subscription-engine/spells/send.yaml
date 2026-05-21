@@ -1,0 +1,14 @@
+version: 11
+tx:
+  ins:
+    - utxo_id: ${in_utxo_token}
+      charms:
+        1: ${send_amount}
+    - ${funding_utxo}
+  outs:
+    - 1: ${send_amount}
+  coins:
+    - amount: 1000
+      dest: ${recipient_hex_dest}
+app_public_inputs:
+  t/${app_id}/${app_vk}: ~

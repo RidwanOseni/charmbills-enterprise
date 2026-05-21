@@ -1,0 +1,18 @@
+version: 8
+apps:
+  $00: n/${app_id}/${app_vk}
+private_inputs:
+  # The private input must match the UTXO being spent to establish app_id/identity.
+  $00: "${in_utxo_0}"
+ins:
+  # This input is a dummy, empty charm input used solely for calculating the app_id hash and satisfying the contract.
+  - utxo_id: ${in_utxo_0}
+    charms: {}
+outs:
+  # Output address for the newly minted NFT
+  - address: ${addr_0}
+    charms:
+      $00:
+        ticker: ${ticker}
+        remaining: ${remaining_supply}
+        # Additional CHIP-420 metadata fields can go here

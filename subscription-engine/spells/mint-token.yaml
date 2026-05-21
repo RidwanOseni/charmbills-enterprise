@@ -1,0 +1,37 @@
+version: 11
+apps:
+  $00: n/${app_id}/${app_vk}
+  $01: t/${app_id}/${app_vk}
+private_inputs:
+  $00: ~
+  $01: ~
+app_public_inputs:
+  n/${app_id}/${app_vk}: ~
+  t/${app_id}/${app_vk}: ~
+tx:
+  ins:
+    # FIX: Simple strings required here. The CLI extracts metadata from prev_txs.
+    - ${plan_utxo}
+    - ${funding_utxo}
+  outs:
+    # Asset Content (Fungible tokens and updated NFT state)
+    - 1: ${worker_amount_1}
+    - 1: ${worker_amount_2}
+    - 1: ${worker_amount_3}
+    - 0:
+        ticker: ${ticker}
+        remaining: ${new_remaining}
+        metadataHash: ${metadataHash}
+        scrollPolicy: ${scrollPolicy}
+        payPeriodSeconds: ${payPeriodSeconds}
+        compensationSats: ${compensationSats}
+  coins:
+    # Bitcoin Destinations (Maps to the outputs above)
+    - amount: 1000
+      dest: ${worker_hex_dest_1}
+    - amount: 1000
+      dest: ${worker_hex_dest_2}
+    - amount: 1000
+      dest: ${worker_hex_dest_3}
+    - amount: ${change_amount}
+      dest: ${treasury_hex_dest}

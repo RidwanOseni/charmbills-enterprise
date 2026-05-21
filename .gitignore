@@ -1,0 +1,112 @@
+# === ENVIRONMENT & SECRETS ===
+.env
+.env.*
+!.env.example
+*.local.yaml
+
+# === DEPENDENCIES ===
+node_modules/
+/charmbills-backend/node_modules/
+/charmbills-frontend/node_modules/
+/subscription-engine/target/
+/subscription-engine/Cargo.lock
+
+# === BUILD OUTPUTS ===
+dist/
+.next/
+out/
+build/
+/charmbills-backend/dist/
+/charmbills-frontend/.next/
+/charmbills-backend/ts-node
+
+# === RUNTIME DATA ===
+transactions/
+/charmbills-backend/transactions/
+*.pid
+*.seed
+*.pid.lock
+debug/
+*.debug
+
+# === LOGS ===
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# === OS FILES ===
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# === IDE FILES ===
+.vscode/
+.idea/
+*.sublime-*
+.project
+.classpath
+
+# === TEMPORARY ARTIFACTS ===
+*.tmp
+*.temp
+tree.bat
+*.b64
+app-binary.b64
+test-spell.json
+
+# === TEST COVERAGE ===
+coverage/
+.nyc_output/
+*.lcov
+
+# === BACKEND SPECIFIC ===
+/charmbills-backend/charmbills-backend@1.0.0
+/charmbills-backend/transactions/
+
+# === FRONTEND SPECIFIC ===
+/charmbills-frontend/.vercel
+/charmbills-frontend/.env.local
+
+# === SUBSCRIPTION ENGINE (Rust) ===
+/subscription-engine/target/
+/subscription-engine/Cargo.lock
+**/*.rs.bk
+
+# === DOCS - Temporarily Ignored (Old Merchant Docs) ===
+/docs/
+!/docs/README.md
+
+# === KEEP THESE FILES (DO NOT IGNORE) ===
+# WASM files - Required for trustless infrastructure
+!**/*.wasm
+!charmbills-backend/src/charms/wasm/*.wasm
+!charmbills-frontend/public/*.wasm
+!charmbills-frontend/lib/wasm/*.wasm
+
+# Type definitions - Required for TypeScript
+!**/*.d.ts
+!charmbills-backend/src/charms/wasm/*.d.ts
+!charmbills-frontend/lib/wasm/*.d.ts
+
+# JSON config files - Keep all except specific lock files
+!*.json
+!package.json
+!tsconfig.json
+!components.json
+!**/tsconfig.json
+!**/package.json
+# But ignore these specific JSON files
+package-lock.json
+yarn.lock
+pnpm-lock.yamlrun_test.sh
+generate-hex.ts
+anchor_hex.txt
+debug/
+*.log
+transactions/*.json
+run_test.sh
+*.db
+charmbills-backend/payload.json
