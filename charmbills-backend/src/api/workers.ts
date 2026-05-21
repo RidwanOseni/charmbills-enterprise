@@ -37,6 +37,7 @@ export async function getWorkers(req: Request, res: Response) {
             w.status, 
             w.lastMintedPeriod,
             w.salarySats,
+            w.planId,
             p.department as department 
         FROM workers w
         LEFT JOIN plans p ON w.planId = p.appId
@@ -45,6 +46,9 @@ export async function getWorkers(req: Request, res: Response) {
     try {
         const result = await turso.execute({ sql: query, args: [] });
         const rows = result.rows.map(row => rowToObject(row));
+
+        console.log('[WORKERS API] First worker raw data:', rows[0]);
+
         res.json(rows);
     } catch (err: any) {
         console.error('[WORKERS API] Database error:', err);

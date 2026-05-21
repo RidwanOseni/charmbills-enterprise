@@ -23,13 +23,14 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
-import { Wallet, Users, CheckCircle, Building2, PlusCircle, CreditCard, Clock } from 'lucide-react'
+import { Wallet, Users, CheckCircle, Building2, PlusCircle, CreditCard, Clock, Download, Lock } from 'lucide-react'
 import { useWallet } from '@/lib/WalletContext';
 import { getWalletStatus } from '@/lib/charms-utils';
 import { WorkerStatus, ProverResult } from '../../shared/types';
 import * as constants from '../../shared/constants';
 import { decryptPayrollData, EncryptedData } from '../../shared/encryption';
 import { getFromIPFS } from '@/lib/ipfs-pinner';
+import { ExportPayrollButton } from '@/components/ExportPayrollButton';
 
 // Import for company onboarding hex derivation
 import * as btc from '@scure/btc-signer';
@@ -71,7 +72,7 @@ const getStatusBadge = (status: string) => {
 };
 
 // =========================================================================
-// Helper function to decrypt department metadata using wallet entropy
+// Helper function to decrypt department metadata using deterministic entropy
 // Fetches CID from backend, retrieves encrypted blob from IPFS, and decrypts
 // =========================================================================
 const decryptDepartmentMetadata = async (metadataHash: string, entropy: string): Promise<any> => {
@@ -93,7 +94,6 @@ const decryptDepartmentMetadata = async (metadataHash: string, entropy: string):
     const encryptedBlob = await getFromIPFS(cid);
     
     // 3. CRITICAL: Convert hex strings to Uint8Arrays
-    // Web Crypto API requires raw bytes, not hex strings
     const preparedBlob = {
       content: hexToBytes(encryptedBlob.content),
       iv: hexToBytes(encryptedBlob.iv),
@@ -102,7 +102,7 @@ const decryptDepartmentMetadata = async (metadataHash: string, entropy: string):
     
     console.log(`[DECRYPT] Converted hex to bytes - content: ${preparedBlob.content.length} bytes, iv: ${preparedBlob.iv.length} bytes`);
     
-    // 4. Decrypt using wallet entropy
+    // 4. Decrypt using deterministic entropy
     const decrypted = await decryptPayrollData(preparedBlob as any, entropy);
     
     console.log(`[DECRYPT] Successfully decrypted metadata`);
@@ -144,7 +144,8 @@ export default function EmployerDashboard() {
     walletConnected, 
     connectWallet, 
     disconnectWallet, 
-    signAndBroadcastPackage 
+    signAndBroadcastPackage,
+    taprootPublicKey
   } = useWallet();
 
   // ============================================================
@@ -156,6 +157,14 @@ export default function EmployerDashboard() {
   const [setupFrequency, setSetupFrequency] = useState('biweekly');
   const [setupType, setSetupType] = useState('employee');
   const [isSettingUpDept, setIsSettingUpDept] = useState(false);
+  
+  // ============================================================
+  // Master Access Key State (for deterministic encryption)
+  // ============================================================
+  const [masterAccessKey, setMasterAccessKey] = useState<string>('');
+  const [showKeyModal, setShowKeyModal] = useState<boolean>(false);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [pendingSetupData, setPendingSetupData] = useState<any>(null);
   
   // ============================================================
   // Hiring State (Workers assigned to Departments)
@@ -190,6 +199,162 @@ export default function EmployerDashboard() {
   
   const [currentPlanNftUtxo, setCurrentPlanNftUtxo] = useState('');
   const [currentPlanMetadata, setCurrentPlanMetadata] = useState<any>(null);
+
+  // ============================================================
+  // Helper: Get deterministic entropy for encryption/decryption
+  // Uses: Public Key (stable) + Master Access Key (user-provided)
+  // This solves the non-deterministic signature problem
+  // ============================================================
+  const getDeterministicEntropy = async (): Promise<string | null> => {
+    // First, check if we have a master access key
+    let accessKey = masterAccessKey;
+    
+    // If not in state, check sessionStorage
+    if (!accessKey) {
+      const savedKey = sessionStorage.getItem('charm_master_key');
+      if (savedKey) {
+        setMasterAccessKey(savedKey);
+        accessKey = savedKey;
+      }
+    }
+    
+    // If still no key, return null - caller will show modal
+    if (!accessKey) {
+      console.log('[ENTROPY] No master access key found');
+      return null;
+    }
+    
+    try {
+      // Use taprootPublicKey from WalletContext if available
+      let pubKey = taprootPublicKey;
+      
+      // If not in context, fetch from wallet
+      if (!pubKey && (window as any).LeatherProvider) {
+        const response = await (window as any).LeatherProvider.request("getAddresses");
+        if (response?.result?.addresses) {
+          const p2tr = response.result.addresses.find((a: any) => a.type === 'p2tr');
+          if (p2tr && p2tr.publicKey) {
+            pubKey = p2tr.publicKey;
+          }
+        }
+      }
+      
+      if (!pubKey) {
+        console.error('[ENTROPY] No public key available');
+        return null;
+      }
+      
+      // Combine Public Key + Master Access Key to create deterministic entropy
+      const encoder = new TextEncoder();
+      const data = encoder.encode(pubKey + accessKey);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const entropy = bytesToHex(new Uint8Array(hashBuffer));
+      
+      console.log('[ENTROPY] Derived deterministic entropy (length: ' + entropy.length + ')');
+      return entropy;
+      
+    } catch (error) {
+      console.error('[ENTROPY] Failed to derive entropy:', error);
+      return null;
+    }
+  };
+
+  // ============================================================
+  // Helper: Show modal and wait for key
+  // ============================================================
+  const requireMasterKey = async (action: string): Promise<boolean> => {
+    const existingKey = sessionStorage.getItem('charm_master_key');
+    if (existingKey) {
+      setMasterAccessKey(existingKey);
+      return true;
+    }
+    
+    setPendingAction(action);
+    setShowKeyModal(true);
+    return false;
+  };
+
+  // ============================================================
+  // Master Access Key Modal Component
+  // ============================================================
+  const KeyEntryModal = () => {
+    const [tempKey, setTempKey] = useState('');
+    const [error, setError] = useState('');
+
+    const handleSubmit = async () => {
+      if (!tempKey.trim()) {
+        setError('Please enter your Master Access Key');
+        return;
+      }
+      
+      // Store in sessionStorage (clears when tab closes)
+      sessionStorage.setItem('charm_master_key', tempKey);
+      setMasterAccessKey(tempKey);
+      setShowKeyModal(false);
+      
+      // Retry the pending action
+      if (pendingAction === 'fetchPlans') {
+        await fetchPlans();
+      } else if (pendingAction === 'refreshWorkers') {
+        await refreshWorkers();
+      } else if (pendingAction === 'setupDepartment' && pendingSetupData) {
+        await executeDepartmentSetup(pendingSetupData);
+        setPendingSetupData(null);
+      }
+      setPendingAction(null);
+    };
+
+    return (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+        <Card className="max-w-md w-full mx-4 p-6">
+          <div className="text-center mb-4">
+            <div className="mx-auto w-12 h-12 bg-primary/10 rounded-full flex items-center justify-center mb-3">
+              <Lock className="w-6 h-6 text-primary" />
+            </div>
+            <h2 className="text-xl font-bold text-primary">Unlock Payroll Data</h2>
+            <p className="text-sm text-muted-foreground mt-2">
+              Enter your company's Master Access Key to view and manage payroll data.
+              This key is only stored in your browser for this session.
+            </p>
+          </div>
+          
+          <div className="space-y-4">
+            <div>
+              <Label className="text-sm font-medium text-foreground block mb-2">
+                Master Access Key
+              </Label>
+              <Input
+                type="password"
+                placeholder="Enter your company's access key"
+                value={tempKey}
+                onChange={(e) => {
+                  setTempKey(e.target.value);
+                  setError('');
+                }}
+                onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
+                className="rounded-lg border-border bg-background text-foreground"
+                autoFocus
+              />
+              {error && (
+                <p className="text-xs text-destructive mt-1">{error}</p>
+              )}
+            </div>
+            
+            <div className="text-xs text-muted-foreground bg-muted/30 p-3 rounded-lg">
+              <p className="font-medium mb-1">🔐 What is this?</p>
+              <p>This key is combined with your wallet's public key to create a secure encryption key. It never leaves your browser.</p>
+              <p className="mt-2 font-medium">⚠️ Important:</p>
+              <p>You need the SAME key to access data later. Store it securely.</p>
+            </div>
+            
+            <Button onClick={handleSubmit} className="w-full">
+              Unlock Dashboard
+            </Button>
+          </div>
+        </Card>
+      </div>
+    );
+  };
 
   // ============================================================
   // Helper: Scan wallet for UTXO context with script extraction
@@ -234,24 +399,50 @@ export default function EmployerDashboard() {
   };
 
   // ============================================================
-  // Helper: Get wallet entropy for decryption
+  // Helper: Execute department setup (separate function for retry)
   // ============================================================
-  const getWalletEntropy = async (): Promise<string | null> => {
-    if (!(window as any).LeatherProvider) {
-      console.error('[DECRYPT] Leather wallet not detected');
-      return null;
-    }
+  const executeDepartmentSetup = async (payload: any) => {
+    console.log("[DEPARTMENT SETUP] Executing with payload");
     
-    try {
-      const sigRes = await (window as any).LeatherProvider.request("signMessage", {
-        message: constants.PAYROLL_AUTH_MESSAGE,
-        paymentType: "p2tr",
-        network: "testnet"
-      });
-      return sigRes.result.signature;
-    } catch (error) {
-      console.error('[DECRYPT] Failed to get wallet entropy:', error);
-      return null;
+    const response = await axios.post('/api/plans/mint', payload, {
+      timeout: 600000,
+      baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
+    });
+    
+    const proverResult: ProverResult = response.data;
+    
+    // Create a context with the same UTXO for both anchor and fee
+    const signingContext = {
+      anchor: payload.consolidatedUtxo,
+      fee: payload.consolidatedUtxo
+    };
+    
+    // Pass the signingContext which now has the same UTXO for both
+    const signingResult = await signAndBroadcastPackage(proverResult, signingContext);
+    const txids = signingResult?.txids;
+    
+    if (txids && txids.length > 0) {
+      // Add newly created department to local state with human-readable name
+      const newDept = {
+        appId: proverResult.appId || crypto.randomUUID(),
+        department: payload.setupDeptName.toLowerCase(),
+        ticker: `${payload.setupDeptName.substring(0, 3).toUpperCase()}-PAY`,
+        remaining: payload.budgetValue,
+        status: 'pending'
+      };
+      
+      setRegisteredDepts(prev => [...prev, newDept]);
+      setSelectedDeptId(proverResult.appId);
+      
+      setToast(`✅ ${payload.setupDeptName} Department created with ${payload.budgetValue} pay periods budget!`);
+      await fetchPlans();
+      
+      setSetupDeptName('');
+      setSetupBudget('100');
+      setSetupFrequency('biweekly');
+      setSetupType('employee');
+    } else {
+      setToast('⚠️ Department setup was cancelled or failed');
     }
   };
 
@@ -369,6 +560,19 @@ export default function EmployerDashboard() {
       return;
     }
     
+    // Check for master access key before proceeding
+    const hasKey = await requireMasterKey('setupDepartment');
+    if (!hasKey) {
+      // Save the data for retry after key entry
+      setPendingSetupData({
+        setupDeptName,
+        budgetValue,
+        setupFrequency,
+        setupType
+      });
+      return;
+    }
+    
     setIsSettingUpDept(true);
     
     try {
@@ -400,11 +604,14 @@ export default function EmployerDashboard() {
         throw new Error("Leather wallet not detected");
       }
       
-      const sigRes = await (window as any).LeatherProvider.request("signMessage", {
-        message: constants.PAYROLL_AUTH_MESSAGE,
-        paymentType: "p2tr",
-        network: "testnet"
-      });
+      // Get deterministic entropy using master access key (no signature needed!)
+      const encryptionEntropy = await getDeterministicEntropy();
+      
+      if (!encryptionEntropy) {
+        throw new Error("Failed to derive encryption entropy. Please ensure master access key is set.");
+      }
+      
+      console.log("[DEPARTMENT SETUP] Using deterministic entropy for encryption (not signature)");
       
       // CRITICAL: Pass the SAME consolidated UTXO for both anchor and fee
       // This forces the prover to generate a transaction with exactly 1 input
@@ -425,40 +632,16 @@ export default function EmployerDashboard() {
         payPeriodSeconds: frequencyToSeconds(setupFrequency),
         scrollPolicy: setupType === 'employee' ? 0 : 1,
         remaining: budgetValue,
-        encryptionEntropy: sigRes.result.signature,
-        multiSigRequired: false
+        encryptionEntropy: encryptionEntropy,  // Use deterministic entropy!
+        multiSigRequired: false,
+        consolidatedUtxo: consolidatedUtxo,  // Store for retry
+        setupDeptName: setupDeptName,
+        budgetValue: budgetValue
       };
       
       console.log("[DEPARTMENT SETUP] Payload prepared with single consolidated UTXO");
       
-      const response = await axios.post('/api/plans/mint', payload, {
-        timeout: 600000,
-        baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
-      });
-      
-      const proverResult: ProverResult = response.data;
-      
-      // Create a context with the same UTXO for both anchor and fee
-      const signingContext = {
-        anchor: consolidatedUtxo,
-        fee: consolidatedUtxo
-      };
-      
-      // Pass the signingContext which now has the same UTXO for both
-      const signingResult = await signAndBroadcastPackage(proverResult, signingContext);
-      const txids = signingResult?.txids;
-      
-      if (txids && txids.length > 0) {
-        setToast(`✅ ${setupDeptName} Department created with ${budgetValue} pay periods budget!`);
-        await fetchPlans();
-        
-        setSetupDeptName('');
-        setSetupBudget('100');
-        setSetupFrequency('biweekly');
-        setSetupType('employee');
-      } else {
-        setToast('⚠️ Department setup was cancelled or failed');
-      }
+      await executeDepartmentSetup(payload);
       
     } catch (err: any) {
       console.error("[DEPARTMENT SETUP] Failed:", err.message);
@@ -514,12 +697,12 @@ export default function EmployerDashboard() {
       setToast(`✅ Worker added to registry. They'll receive tokens in the next run.`);
       await refreshWorkers();
       
-      // Clear inputs
+      // Clear worker details but KEEP the selected department for adding another worker
       setFullName('');
       setRole('');
       setSalary('');
       setBitcoinAddress('');
-      setSelectedDeptId('');
+      // Do NOT clear selectedDeptId - allows adding multiple workers to same department
       
     } catch (err: any) {
       console.error("[HIRE ADMIN] Failed:", err.message);
@@ -532,21 +715,34 @@ export default function EmployerDashboard() {
   
   // ============================================================
   // Batch Token Issuance (Pay Your Team - All at Once)
-  // CRITICAL FIX: Use a SEPARATE Treasury UTXO for fees (not the Plan NFT)
+  // CRITICAL FIX: Use the EXACT UTXO selected by the backend
   // Stage 2 requires two distinct inputs: Authority (Plan NFT) + Funding (Treasury UTXO)
+  // 
+  // FIX: Removed getBtcContext() call - now uses funding UTXO returned by backend
+  // This prevents UTXO mismatch that causes artificially high fees
   // ============================================================
   const handleIssueTokens = async () => {
+    console.log('[BATCH MINT] ===== START =====');
+    console.log('[BATCH MINT] selectedWorkers.size:', selectedWorkers.size);
+    console.log('[BATCH MINT] currentPlanNftUtxo:', currentPlanNftUtxo);
+    console.log('[BATCH MINT] currentPlanMetadata:', currentPlanMetadata ? 'exists' : 'null');
+    console.log('[BATCH MINT] registeredDepts.length:', registeredDepts.length);
+    console.log('[BATCH MINT] isProcessing:', isProcessing);
+    
     if (selectedWorkers.size === 0) {
+      console.log('[BATCH MINT] ❌ No workers selected');
       setToast("❌ Please select workers to issue tokens.");
       return;
     }
     
     if (!currentPlanNftUtxo) {
+      console.log('[BATCH MINT] ❌ No currentPlanNftUtxo');
       setToast("❌ No active Plan NFT found for this department.");
       return;
     }
 
     if (!currentPlanMetadata) {
+      console.log('[BATCH MINT] ❌ No currentPlanMetadata');
       setToast("❌ Plan metadata not found. Please refresh the page.");
       return;
     }  
@@ -555,22 +751,12 @@ export default function EmployerDashboard() {
 
     try {
       const workerList = workers.filter(w => selectedWorkers.has(w.walletAddress));
+      console.log('[BATCH MINT] workerList length:', workerList.length);
       const periods = parseInt(selectedPeriods);
       
-      const btcContext = await getBtcContext();
-      
-      console.log("[BATCH MINT] BTC Context obtained:", {
-        totalUtxos: btcContext.utxos.length,
-        anchor: btcContext.anchor?.utxoId,
-        fee: btcContext.fee?.utxoId,
-        hasAnchorScript: !!btcContext.anchor?.script,
-        hasFeeScript: !!btcContext.fee?.script
-      });
-      
       // =========================================================================
-      // CRITICAL FIX FOR STAGE 2: Find a SEPARATE Treasury UTXO for fees
-      // The Plan NFT is the authority (Input 0). We need a distinct UTXO for gas (Input 1)
-      // Find a Treasury UTXO with dynamic fee estimation to ensure sufficient funds
+      // CRITICAL FIX FOR STAGE 2: Do NOT use getBtcContext() for UTXO selection
+      // The backend selects the optimal UTXO. We must use that exact UTXO.
       // =========================================================================
       const authorityUtxoId = currentPlanNftUtxo;
       console.log(`[BATCH MINT] Authority (Plan NFT) UTXO: ${authorityUtxoId}`);
@@ -589,45 +775,14 @@ export default function EmployerDashboard() {
       console.log(`  Outputs cost (${workerList.length + 3} outputs): ${outputsCost} sats`);
       console.log(`  Estimated fee: ${estimatedFee} sats`);
       console.log(`  Total needed: ${totalNeeded} sats`);
-      
-      // Find a separate Treasury UTXO (different from the Plan NFT UTXO) with sufficient funds
-      const treasuryUtxo = btcContext.utxos.find((u: any) => {
-        // Must be different from the Plan NFT UTXO
-        if (u.utxoId === authorityUtxoId) {
-          console.log(`[BATCH MINT] Skipping Plan NFT UTXO for funding: ${u.utxoId}`);
-          return false;
-        }
-        // Must have enough sats based on dynamic calculation
-        return u.value >= totalNeeded;
-      });
-      
-      if (!treasuryUtxo) {
-        console.error("[BATCH MINT] No suitable Treasury UTXO found. Available UTXOs:", 
-          btcContext.utxos.map((u: any) => ({ utxoId: u.utxoId, value: u.value }))
-        );
-        throw new Error(`No Treasury UTXO found with >= ${totalNeeded} sats. Please ensure your wallet has sufficient funds for transaction fees.`);
-      }
-      
-      console.log("[BATCH MINT] Selected Treasury UTXO for fees:", {
-        utxoId: treasuryUtxo.utxoId,
-        value: treasuryUtxo.value,
-        required: totalNeeded,
-        hasScript: !!treasuryUtxo.script,
-        scriptLength: treasuryUtxo.script?.length || 0
-      });
 
       // =========================================================================
-      // Construct payload with TWO DISTINCT INPUTS:
-      // - authorityUtxo: The Plan NFT (1,000 sats) - Input 0
-      // - fundingUtxo: The Treasury UTXO (>= totalNeeded sats) - Input 1
+      // Construct payload - Let backend select the optimal Treasury UTXO
+      // Do NOT pass fundingUtxo or fundingValue - backend will select
       // =========================================================================
       const payload = {
         authorityUtxo: authorityUtxoId,
-        authorityTxHex: btcContext.anchor?.hex,
-        fundingUtxo: treasuryUtxo.utxoId,
-        fundingValue: treasuryUtxo.value,
-        fundingTxHex: treasuryUtxo.hex,
-        fundingScript: treasuryUtxo.script,
+        authorityTxHex: '',  // Backend will fetch this
         employerAddress: address,
         utxoAddress: address,
         workers: workerList.map(w => ({ 
@@ -637,14 +792,11 @@ export default function EmployerDashboard() {
           role: w.role || "Team Member"
         })),
         planMetadata: currentPlanMetadata,
-        encryptionEntropy: "placeholder"
+        encryptionEntropy: "placeholder"  // Will be replaced by backend with stored entropy
       };
 
-      console.log("[BATCH MINT] Payload prepared with two distinct inputs:", {
+      console.log("[BATCH MINT] Payload prepared (backend will select funding UTXO):", {
         authorityUtxo: payload.authorityUtxo.substring(0, 30) + '...',
-        fundingUtxo: payload.fundingUtxo.substring(0, 30) + '...',
-        fundingValue: payload.fundingValue,
-        requiredNeeded: totalNeeded,
         workersCount: payload.workers.length
       });
 
@@ -653,15 +805,44 @@ export default function EmployerDashboard() {
         baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
       });
       
-      // Create signing context with TWO distinct UTXOs
+      console.log('[BATCH MINT] Response received from payrollhiring/mint');
+      console.log('[BATCH MINT] Backend selected funding UTXO:', {
+        utxoId: response.data.fundingUsed,
+        value: response.data.fundingValue,
+        hasHex: !!response.data.fundingTxHex
+      });
+      
+      // =========================================================================
+      // CRITICAL FIX: Use the EXACT UTXO and hex returned by the backend
+      // This ensures the frontend signs the same UTXO the backend proved
+      // =========================================================================
+      const backendFundingUtxo = {
+        utxoId: response.data.fundingUsed,
+        value: response.data.fundingValue,
+        hex: response.data.fundingTxHex,
+        script: ''  // Will be extracted from hex in WalletContext
+      };
+      
+      console.log('[BATCH MINT] Using backend-selected funding UTXO:', {
+        utxoId: backendFundingUtxo.utxoId,
+        value: backendFundingUtxo.value,
+        hexLength: backendFundingUtxo.hex?.length || 0
+      });
+      
+      // Fetch the anchor (Plan NFT) hex for context
+      const [anchorTxid] = authorityUtxoId.split(':');
+      const anchorHexResponse = await axios.get(`https://mempool.space/testnet4/api/tx/${anchorTxid}/hex`, { responseType: 'text' });
+      const anchorHex = anchorHexResponse.data;
+      
+      // Create signing context with TWO distinct UTXOs using backend-selected values
       const signingContext = {
         anchor: {
           utxoId: authorityUtxoId,
           value: 1000, // Plan NFT is 1000 sats
-          hex: btcContext.anchor?.hex,
-          script: btcContext.anchor?.script
+          hex: anchorHex,
+          script: ''  // Will be extracted in WalletContext
         },
-        fee: treasuryUtxo,
+        fee: backendFundingUtxo,
         isSingle: true
       };
       
@@ -682,6 +863,7 @@ export default function EmployerDashboard() {
       setIsProcessing(false);
       setTimeout(() => setToast(''), 4000);
     }
+    console.log('[BATCH MINT] ===== END =====');
   };
   
   // ============================================================
@@ -703,11 +885,16 @@ export default function EmployerDashboard() {
       if (walletConnected && plans.length > 0) {
         console.log('[FETCH PLANS] Wallet connected, attempting to decrypt missing department names...');
         
-        // Get wallet entropy for decryption
-        const entropy = await getWalletEntropy();
+        // Get deterministic entropy for decryption
+        const entropy = await getDeterministicEntropy();
         
         if (entropy) {
-          const unlockedPlans = await Promise.all(plans.map(async (plan: any) => {
+          // Collect decryption results first, then update state once
+          const updatedPlans = [...plans];
+          let hasUpdates = false;
+          
+          for (let i = 0; i < updatedPlans.length; i++) {
+            const plan = updatedPlans[i];
             // Check if department name is missing but metadataHash exists
             if (!plan.department && plan.metadataHash) {
               console.log(`[FETCH PLANS] 🔓 Attempting to decrypt plan ${plan.appId.substring(0, 8)}... with hash ${plan.metadataHash.substring(0, 16)}...`);
@@ -716,25 +903,30 @@ export default function EmployerDashboard() {
               
               if (decrypted && decrypted.department) {
                 console.log(`[FETCH PLANS] ✅ Successfully decrypted department name: ${decrypted.department}`);
-                return { ...plan, department: decrypted.department };
+                updatedPlans[i] = { ...plan, department: decrypted.department };
+                hasUpdates = true;
               } else {
                 console.log(`[FETCH PLANS] ⚠️ Failed to decrypt department name for plan ${plan.appId.substring(0, 8)}...`);
-                return plan;
               }
             }
-            return plan;
-          }));
+          }
           
-          plans = unlockedPlans;
+          if (hasUpdates) {
+            plans = updatedPlans;
+          }
+          
           console.log('[FETCH PLANS] Lazy decryption loop completed');
         } else {
-          console.log('[FETCH PLANS] ⚠️ Failed to get wallet entropy, skipping decryption');
+          console.log('[FETCH PLANS] ⚠️ No entropy available, showing key modal');
+          await requireMasterKey('fetchPlans');
+          return; // Modal will retry
         }
       } else {
         console.log('[FETCH PLANS] Wallet not connected or no plans, skipping decryption');
       }
       
       setRegisteredDepts(plans);
+      console.log('[FETCH PLANS] registeredDepts updated with', plans.length, 'plans');
       
       if (plans.length > 0 && !selectedDeptId) {
         setSelectedDeptId(plans[0].appId);
@@ -744,15 +936,64 @@ export default function EmployerDashboard() {
     }
   };
   
+  // =========================================================================
+  // FIX: refreshWorkers - Fetches workers and enriches with department names from registeredDepts
+  // This eliminates the separate cache state and uses the plan objects directly
+  // =========================================================================
   const refreshWorkers = async () => {
     try {
+      console.log('[REFRESH WORKERS] Starting refresh...');
+      
+      // Create a map of appId -> department name from registeredDepts
+      const deptMap: Record<string, string> = {};
+      registeredDepts.forEach((dept: any) => {
+        if (dept.appId && dept.department) {
+          deptMap[dept.appId] = dept.department;
+        }
+      });
+      
+      console.log('[DEBUG] Department map from registeredDepts:', deptMap);
+      
       const response = await api.get('/api/workers');
-      setWorkers(response.data);
-      await fetchPlans();
+      let workersData = response.data;
+      
+      console.log('[DEBUG] Workers from API:', workersData.map((w: any) => ({ 
+        name: w.name, 
+        planId: w.planId, 
+        department: w.department 
+      })));
+      
+      // Enrich workers with department names from the map
+      const enrichedWorkers = workersData.map((worker: any) => {
+        if (worker.planId && deptMap[worker.planId]) {
+          console.log(`[DEBUG] Enriching worker ${worker.name} (planId: ${worker.planId}) with department: ${deptMap[worker.planId]}`);
+          return { ...worker, department: deptMap[worker.planId] };
+        }
+        return worker;
+      });
+      
+      console.log('[DEBUG] Enriched workers:', enrichedWorkers.map((w: any) => ({ 
+        name: w.name, 
+        department: w.department 
+      })));
+      
+      setWorkers(enrichedWorkers);
+      console.log('[REFRESH WORKERS] Completed');
     } catch (error) {
       console.error('Failed to refresh workers:', error);
     }
   };
+  
+  // =========================================================================
+  // FIX: When registeredDepts updates, refresh workers to get department names
+  // This ensures workers are enriched AFTER department names are decrypted
+  // =========================================================================
+  useEffect(() => {
+    if (registeredDepts.length > 0) {
+      console.log('[USE EFFECT] registeredDepts changed, refreshing workers...');
+      refreshWorkers();
+    }
+  }, [registeredDepts]);
   
   // Fetch dashboard stats
   useEffect(() => {
@@ -795,23 +1036,49 @@ export default function EmployerDashboard() {
     fetchVaultBalance();
   }, [walletConnected, address]);
   
-  // Fetch initial data when wallet connects
+  // Fetch initial data when wallet connects - fetch plans only (workers will be refreshed via useEffect)
   useEffect(() => {
     if (walletConnected && address) {
-      console.log('[DASHBOARD] Wallet connected, fetching plans and workers...');
+      console.log('[DASHBOARD] Wallet connected, fetching plans...');
       fetchPlans();
-      refreshWorkers();
     }
   }, [walletConnected, address]);
   
   // Fetch plan metadata when department selection changes
+  // This populates currentPlanNftUtxo and currentPlanMetadata for the Issue Tokens button
   useEffect(() => {
     const fetchPlanForDepartment = async () => {
-      if (!selectedDept || !address) return;
+      console.log('[FETCH PLAN FOR DEPT] selectedDept changed to:', selectedDept);
+      if (!selectedDept || !address) {
+        console.log('[FETCH PLAN FOR DEPT] No department selected or no address');
+        return;
+      }
       try {
+        // First try to find the department in registeredDepts by department name
+        const deptFromState = registeredDepts.find(d => d.department === selectedDept);
+        if (deptFromState) {
+          console.log('[FETCH PLAN FOR DEPT] Found department in state:', deptFromState);
+          setCurrentPlanNftUtxo(deptFromState.nftUtxoId || '');
+          setCurrentPlanMetadata({
+            appId: deptFromState.appId,
+            ticker: deptFromState.ticker,
+            remaining: deptFromState.remaining,
+            metadataHash: deptFromState.metadataHash,
+            scrollPolicy: deptFromState.scrollPolicy,
+            payPeriodSeconds: deptFromState.payPeriodSeconds,
+            compensationSats: deptFromState.compensationSats || 0,
+            anchorUtxo: deptFromState.anchorUtxo || ''
+          });
+          console.log('[FETCH PLAN FOR DEPT] Set currentPlanNftUtxo from state:', deptFromState.nftUtxoId);
+          return;
+        }
+        
+        // Fallback to API call
+        console.log('[FETCH PLAN FOR DEPT] Department not in state, fetching from API...');
         const response = await api.get(`/api/plans?department=${selectedDept}&employerAddress=${address}`);
         if (response.data && response.data.length > 0) {
           const plan = response.data[0];
+          console.log('[FETCH PLAN FOR DEPT] Plan from API:', plan);
           setCurrentPlanNftUtxo(plan.nftUtxoId);
           setCurrentPlanMetadata({
             appId: plan.appId,
@@ -823,13 +1090,16 @@ export default function EmployerDashboard() {
             compensationSats: plan.compensationSats,
             anchorUtxo: plan.anchorUtxo
           });
+          console.log('[FETCH PLAN FOR DEPT] Set currentPlanNftUtxo from API:', plan.nftUtxoId);
+        } else {
+          console.log('[FETCH PLAN FOR DEPT] No plan found for department:', selectedDept);
         }
       } catch (error) {
         console.error('Failed to fetch plan metadata:', error);
       }
     };
     fetchPlanForDepartment();
-  }, [selectedDept, address]);
+  }, [selectedDept, address, registeredDepts]);
 
   // Worker filtering and selection helpers
   const totalWorkers = workers.length;
@@ -859,13 +1129,17 @@ export default function EmployerDashboard() {
       newSelected.add(wallet);
     }
     setSelectedWorkers(newSelected);
+    console.log('[TOGGLE] selectedWorkers size:', newSelected.size);
   };
 
   const selectAllDeptWorkers = () => {
     if (selectedWorkers.size === deptWorkers.length && deptWorkers.length > 0) {
       setSelectedWorkers(new Set());
+      console.log('[SELECT ALL] Cleared all selections');
     } else {
-      setSelectedWorkers(new Set(deptWorkers.map((w: any) => w.walletAddress)));
+      const newSelected = new Set(deptWorkers.map((w: any) => w.walletAddress));
+      setSelectedWorkers(newSelected);
+      console.log('[SELECT ALL] Selected', newSelected.size, 'workers');
     }
   };
 
@@ -881,6 +1155,21 @@ export default function EmployerDashboard() {
       setToast("❌ Failed to initiate termination.");
       setTimeout(() => setToast(''), 4000);
     }
+  };
+
+  // Helper function to get display name for department dropdown
+  const getDepartmentDisplayName = (dept: any): string => {
+    // Priority 1: Use department field from the plan object (decrypted and stored)
+    if (dept.department) {
+      return dept.department.charAt(0).toUpperCase() + dept.department.slice(1);
+    }
+    // Priority 2: Extract from ticker (e.g., "SALES-PAY" -> "Sales")
+    if (dept.ticker) {
+      const tickerName = dept.ticker.replace('-PAY', '');
+      return tickerName.charAt(0).toUpperCase() + tickerName.slice(1).toLowerCase();
+    }
+    // Priority 3: Fallback
+    return 'Department';
   };
 
   // UI States
@@ -996,10 +1285,18 @@ export default function EmployerDashboard() {
           </Card>
         </div>
 
-        {/* Welcome Section */}
-        <div className="mb-8">
-          <h1 className="text-3xl font-bold text-primary mb-2">Employer Orchestration</h1>
-          <p className="text-foreground">Create departments, hire workers, and manage payroll with one-click batch payments</p>
+        {/* Welcome Section with Export Button */}
+        <div className="mb-8 flex justify-between items-center">
+          <div>
+            <h1 className="text-3xl font-bold text-primary mb-2">Employer Orchestration</h1>
+            <p className="text-foreground">Create departments, hire workers, and manage payroll with one-click batch payments</p>
+          </div>
+          {/* FIX 2: Export Payroll Button */}
+          <ExportPayrollButton 
+            workers={workers}
+            registeredDepts={registeredDepts}
+            decryptedDeptNames={{}}
+          />
         </div>
 
         {/* Two-Column Layout: Setup Department + Add Worker */}
@@ -1116,14 +1413,18 @@ export default function EmployerDashboard() {
                 <Label className="text-sm font-medium text-foreground block mb-2">Select Department</Label>
                 <Select value={selectedDeptId} onValueChange={setSelectedDeptId} disabled={isProcessing || registeredDepts.length === 0}>
                   <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
-                    <SelectValue placeholder={registeredDepts.length === 0 ? "Create a department first" : "Select department"} />
+                    <SelectValue>
+                      {selectedDeptId ? (
+                        getDepartmentDisplayName(registeredDepts.find(d => d.appId === selectedDeptId) || {})
+                      ) : (
+                        registeredDepts.length === 0 ? "Create a department first" : "Select department"
+                      )}
+                    </SelectValue>
                   </SelectTrigger>
                   <SelectContent>
                     {registeredDepts.map((dept) => (
                       <SelectItem key={dept.appId} value={dept.appId}>
-                        {dept.department 
-                          ? (dept.department.charAt(0).toUpperCase() + dept.department.slice(1)) 
-                          : `Dept (${dept.ticker || 'SALES-PAY'})`}
+                        {getDepartmentDisplayName(dept)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -1205,14 +1506,14 @@ export default function EmployerDashboard() {
               <Label className="text-sm font-medium text-foreground block mb-2">Select Department</Label>
               <Select value={selectedDept} onValueChange={setSelectedDept} disabled={isProcessing || registeredDepts.length === 0}>
                 <SelectTrigger className="rounded-lg border-border bg-background text-foreground">
-                  <SelectValue placeholder={registeredDepts.length === 0 ? "Create a department first" : "Select department"} />
+                  <SelectValue>
+                    {selectedDept ? getDepartmentDisplayName(registeredDepts.find(d => d.department === selectedDept) || {}) : "Select department"}
+                  </SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {registeredDepts.map((dept) => (
-                    <SelectItem key={dept.appId} value={dept.department}>
-                      {dept.department 
-                        ? (dept.department.charAt(0).toUpperCase() + dept.department.slice(1)) 
-                        : `Dept (${dept.ticker || 'SALES-PAY'})`}
+                    <SelectItem key={dept.appId} value={dept.department || getDepartmentDisplayName(dept).toLowerCase()}>
+                      {getDepartmentDisplayName(dept)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1223,7 +1524,7 @@ export default function EmployerDashboard() {
             <div className="mb-6">
               <div className="flex items-center justify-between mb-3">
                 <p className="text-sm font-medium text-foreground">
-                  Workers in {selectedDept ? (selectedDept.charAt(0).toUpperCase() + selectedDept.slice(1)) : 'selected department'}
+                  Workers in {selectedDept ? getDepartmentDisplayName(registeredDepts.find(d => d.department === selectedDept) || {}) : 'selected department'}
                 </p>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -1254,7 +1555,6 @@ export default function EmployerDashboard() {
                           <TableCell className="text-sm font-medium text-foreground py-2">{worker.name || 'Unnamed'}</TableCell>
                           <TableCell className="text-sm text-muted-foreground py-2">{worker.role}</TableCell>
                           <TableCell className="py-2">
-                            {/* FIX: Use getStatusBadge for consistent status display */}
                             {getStatusBadge(worker.status)}
                           </TableCell>
                           <TableCell className="text-sm text-muted-foreground py-2">
@@ -1374,7 +1674,6 @@ export default function EmployerDashboard() {
                       </Badge>
                     </TableCell>
                     <TableCell>
-                      {/* FIX: Use getStatusBadge for consistent status display */}
                       {getStatusBadge(worker.status)}
                     </TableCell>
                     <TableCell className="text-foreground text-sm">
@@ -1410,6 +1709,9 @@ export default function EmployerDashboard() {
           </p>
         </div>
       </main>
+      
+      {/* Master Access Key Modal */}
+      {showKeyModal && <KeyEntryModal />}
     </div>
   )
 }

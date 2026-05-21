@@ -49,6 +49,184 @@ export interface IndexerConfig {
   scanIntervalMs?: number;
 }
 
+// =========================================================================
+// Structured Payment History Interface
+// =========================================================================
+
+export interface StructuredPaymentRecord {
+  utxoId: string;
+  timestamp: number;           // Unix timestamp when payment was confirmed
+  blockHeight: number;         // Block height when payment was confirmed
+  amountSats: number;          // Amount paid in satoshis
+  salarySats: number;          // Worker's salary per period in satoshis
+  periodsPaid: number;         // Number of periods covered by this payment
+  paymentType: 'regular' | 'backpay' | 'bonus' | 'adjustment';
+  txid: string;                // Transaction ID that made the payment
+  spentAt: string;             // ISO string when payment was spent/redeemed
+  departmentId: string;        // Plan/Department appId
+  departmentName: string;      // Department name (decrypted or from ticker)
+  workerRole: string;          // Worker's role at time of payment
+  status: 'pending' | 'confirmed' | 'spent';
+}
+
+// =========================================================================
+// Helper Functions for Structured Payment History
+// =========================================================================
+
+/**
+ * Adds a structured payment record to worker's historicalTokens
+ * This stores complete payment details for tax/accounting export
+ * 
+ * @param db - Database connection
+ * @param walletAddress - Worker's Bitcoin address
+ * @param planId - Department appId
+ * @param paymentRecord - Structured payment record to add
+ */
+async function addStructuredPaymentRecord(
+  db: any,
+  walletAddress: string,
+  planId: string,
+  paymentRecord: StructuredPaymentRecord
+): Promise<void> {
+  console.log(`[INDEXER] Adding structured payment record for worker ${walletAddress.substring(0, 16)}...`);
+  console.log(`[INDEXER] Payment: ${paymentRecord.amountSats} sats, period: ${paymentRecord.periodsPaid}, tx: ${paymentRecord.txid.substring(0, 16)}...`);
+  
+  // Get current historicalTokens
+  const result = await db.execute({
+    sql: 'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
+    args: [walletAddress, planId]
+  });
+  
+  let history: StructuredPaymentRecord[] = [];
+  const row = result.rows[0];
+  if (row && row.historicalTokens) {
+    try {
+      history = JSON.parse(row.historicalTokens);
+    } catch (e) {
+      console.warn(`[INDEXER] Failed to parse historicalTokens, starting fresh array`);
+      history = [];
+    }
+  }
+  
+  // Add new structured record
+  history.push(paymentRecord);
+  
+  // Update the database
+  await db.execute({
+    sql: 'UPDATE workers SET historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+    args: [JSON.stringify(history), new Date().toISOString(), walletAddress, planId]
+  });
+  
+  console.log(`[INDEXER] ✅ Structured payment record added. History now has ${history.length} entries`);
+}
+
+/**
+ * Updates an existing payment record status (e.g., from 'pending' to 'confirmed')
+ * 
+ * @param db - Database connection
+ * @param walletAddress - Worker's Bitcoin address
+ * @param planId - Department appId
+ * @param txid - Transaction ID to find
+ * @param status - New status
+ */
+async function updatePaymentRecordStatus(
+  db: any,
+  walletAddress: string,
+  planId: string,
+  txid: string,
+  status: 'confirmed' | 'spent'
+): Promise<void> {
+  console.log(`[INDEXER] Updating payment record status for worker ${walletAddress.substring(0, 16)}..., tx: ${txid.substring(0, 16)}..., status: ${status}`);
+  
+  const result = await db.execute({
+    sql: 'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
+    args: [walletAddress, planId]
+  });
+  
+  const row = result.rows[0];
+  if (!row || !row.historicalTokens) {
+    console.warn(`[INDEXER] No historicalTokens found for worker ${walletAddress.substring(0, 16)}...`);
+    return;
+  }
+  
+  let history: StructuredPaymentRecord[] = [];
+  try {
+    history = JSON.parse(row.historicalTokens);
+  } catch (e) {
+    console.error(`[INDEXER] Failed to parse historicalTokens`);
+    return;
+  }
+  
+  let updated = false;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i].txid === txid) {
+      history[i].status = status;
+      updated = true;
+      console.log(`[INDEXER] Updated payment record status for tx: ${txid.substring(0, 16)}...`);
+      break;
+    }
+  }
+  
+  if (updated) {
+    await db.execute({
+      sql: 'UPDATE workers SET historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+      args: [JSON.stringify(history), new Date().toISOString(), walletAddress, planId]
+    });
+    console.log(`[INDEXER] ✅ Payment record status updated`);
+  }
+}
+
+/**
+ * Gets department name for a planId
+ * 
+ * @param db - Database connection
+ * @param planId - Department appId
+ * @returns Department name or ticker-based fallback
+ */
+async function getDepartmentName(db: any, planId: string): Promise<string> {
+  const result = await db.execute({
+    sql: 'SELECT department, ticker FROM plans WHERE appId = ?',
+    args: [planId]
+  });
+  
+  const row = result.rows[0];
+  if (!row) {
+    return 'Unknown Department';
+  }
+  
+  if (row.department) {
+    return row.department;
+  }
+  
+  if (row.ticker) {
+    return row.ticker.replace('-PAY', '');
+  }
+  
+  return 'Unknown Department';
+}
+
+/**
+ * Gets worker role for a wallet address and planId
+ * 
+ * @param db - Database connection
+ * @param walletAddress - Worker's Bitcoin address
+ * @param planId - Department appId
+ * @returns Worker role
+ */
+async function getWorkerRole(db: any, walletAddress: string, planId: string): Promise<string> {
+  const result = await db.execute({
+    sql: 'SELECT role FROM workers WHERE walletAddress = ? AND planId = ?',
+    args: [walletAddress, planId]
+  });
+  
+  const row = result.rows[0];
+  return row?.role || 'Team Member';
+}
+
+// =========================================================================
+// MARK: DerivableIndexer Class
+// =========================================================================
+
 export class DerivableIndexer {
   private db: any;
   private config: IndexerConfig;
@@ -438,6 +616,8 @@ export class DerivableIndexer {
   // FIX: Added Asset-Ledger Filtering to prevent calling WASM on irrelevant transactions
   // FIX: Optimized filter catches both Stage 1 (Plan NFT) and Stage 2 (Token) transactions
   // FIX: Always call processPayrollSpell for any extracted spell
+  // FIX: Added full context fetching for ALL inputs to satisfy 1:1 mapping requirement
+  // FIX: SIMPLIFIED - Always pass only bitcoin hex for all transactions
   // =========================================================================
   private async indexBlock(blockHash: string): Promise<void> {
     const blockStart = Date.now();
@@ -473,6 +653,8 @@ export class DerivableIndexer {
         // =========================================================================
         const hasCharmsPattern = this.isCharmsPayTransaction(rawTxHex);
         const spendsKnownAsset = await this.isSpendingKnownAsset(tx);
+
+        console.log(`[INDEXER] 📊 Tx ${tx.txid}: hasCharmsPattern=${hasCharmsPattern}, spendsKnownAsset=${spendsKnownAsset}`);
         
         if (!hasCharmsPattern && !spendsKnownAsset) {
           skippedCount++;
@@ -483,49 +665,55 @@ export class DerivableIndexer {
         console.log(`[INDEXER]   hasCharmsPattern: ${hasCharmsPattern}, spendsKnownAsset: ${spendsKnownAsset}`);
         
         // =========================================================================
-        // Fetch authority parent (first input) for context
+        // CRITICAL FIX: Fetch parent hexes for ALL inputs to satisfy 1:1 mapping
+        // This ensures the context array length matches the transaction's input count
         // =========================================================================
-        let authorityParentHex: string | null = null;
         let madeRpcCalls = false;
+        const prevTxs: string[] = [];
         
-        // Fetch parent for the first input (authority UTXO) only
-        if (tx.vin && Array.isArray(tx.vin) && tx.vin.length > 0) {
-          const firstInput = tx.vin[0];
+        // Fetch parent hex for EVERY input in the transaction
+        if (tx.vin && Array.isArray(tx.vin)) {
+          console.log(`[INDEXER]   🔍 Fetching parent hexes for ${tx.vin.length} input(s)...`);
           
-          if (firstInput && firstInput.txid) {
-            console.log(`[INDEXER]   🔍 fetching authority parent (Input 0)...`);
-            
-            try {
-              authorityParentHex = await this.fetchRawTransactionHex(firstInput.txid);
-              console.log(`[INDEXER]     ✓ Fetched authority parent: ${firstInput.txid.substring(0, 16)}... (${authorityParentHex.length} bytes)`);
-              madeRpcCalls = true;
-            } catch (err: any) {
-              console.warn(`[INDEXER]     ✗ Failed to fetch authority parent: ${firstInput.txid.substring(0, 16)}... - ${err.message}`);
+          for (let i = 0; i < tx.vin.length; i++) {
+            const input = tx.vin[i];
+            if (input && input.txid) {
+              try {
+                const parentHex = await this.fetchRawTransactionHex(input.txid);
+                prevTxs.push(parentHex);
+                console.log(`[INDEXER]     ✓ Fetched parent for input ${i}: ${input.txid.substring(0, 16)}... (${parentHex.length} bytes)`);
+                madeRpcCalls = true;
+              } catch (err: any) {
+                console.warn(`[INDEXER]     ✗ Failed to fetch parent for input ${i}: ${input.txid.substring(0, 16)}... - ${err.message}`);
+                // Push empty string as placeholder to maintain array length
+                prevTxs.push('');
+              }
+            } else {
+              console.warn(`[INDEXER]     ⚠️ Input ${i} missing txid, skipping`);
+              prevTxs.push('');
             }
           }
         }
         
         // =========================================================================
-        // UNIVERSAL WASM FIX (Stage 1 & Stage 2)
-        // We pass ONLY the 'bitcoin' hex string to the scanner.
-        // This prevents the "Length 2" crash caused by the 'prev_txs' key.
-        // The scanner will successfully extract the asset data (NFT or Token).
+        // SIMPLIFIED: Always pass only bitcoin hex for ALL transactions
+        // This removes the conditional logic and treats NFT mint and token mint the same
         // =========================================================================
-        if (authorityParentHex) {
-          // CRITICAL FIX: Pass ONLY the bitcoin hex, NO prev_txs
-          const spellInput: any = { 
-            bitcoin: rawTxHex
-          };
-          
-          console.log(`[INDEXER]   📝 Built spellInput with ONLY bitcoin (no prev_txs)`);
-          
-          // =========================================================================
-          // DEBUG: Log exact object being passed to WASM for debugging
-          // This shows the structure and keys to verify correct format
-          // =========================================================================
+        let spellInput: any = null;
+        const inputCount = tx.vin?.length || 0;
+        
+        // Always pass only bitcoin hex (no prev_txs) for all transactions
+        spellInput = { 
+          bitcoin: rawTxHex
+        };
+        console.log(`[INDEXER]   📦 Passing raw bitcoin hex only (${rawTxHex.length} bytes). Input count: ${inputCount}, spendsKnownAsset: ${spendsKnownAsset}`);
+        console.log(`[INDEXER]   [DEBUG] No prev_txs passed.`);
+        
+        // =========================================================================
+        // Call WASM scanner only if spellInput was constructed
+        // =========================================================================
+        if (spellInput) {
           console.log("[INDEXER]   [DEBUG] Exact object keys being passed to WASM:", Object.keys(spellInput));
-          console.log("[INDEXER]   [DEBUG] spellInput structure (first 500 chars):", JSON.stringify(spellInput).substring(0, 500));
-          console.log("[INDEXER]   [DEBUG] spellInput.bitcoin length:", spellInput.bitcoin?.length);
           
           try {
             console.log(`[INDEXER]   🧪 Calling extractAndVerifySpell...`);
@@ -638,8 +826,6 @@ export class DerivableIndexer {
             console.error(`[INDEXER]   ❌ WASM threw exception: ${spellError.message || spellError}`);
             this.stats.totalErrors++;
           }
-        } else {
-          console.log(`[INDEXER]   ⚠️ No authority parent hex found - skipping spell extraction`);
         }
         
         // =========================================================================
@@ -649,6 +835,7 @@ export class DerivableIndexer {
         
         // =========================================================================
         // PART 3: Check for spent worker tokens (Settlement Reconciliation)
+        // FIX: Modified to use structured payment history
         // =========================================================================
         await this.reconcileSettlements(tx, block.height);
         
@@ -764,444 +951,525 @@ export class DerivableIndexer {
   // FIX: Added employerAddress resolution from treasuryHexDest or existing plan
   // FIX: Non-Custodial Mode - Skip backend decryption, only save metadata hash
   // =========================================================================
-private async processPayrollSpell(spell: any, blockHeight: number, txid: string): Promise<boolean> {
-  console.log(`[INDEXER] 🔍 Processing payroll spell at block ${blockHeight}, txid: ${txid}`);
-  
-  // =========================================================================
-  // DIAGNOSTIC: Dump the ENTIRE spell structure to understand where data lives
-  // This eliminates all guesswork about the spell format
-  // =========================================================================
-  console.log("[INDEXER] 🔍 ========== SPELL DIAGNOSTIC START ==========");
-  console.log("[INDEXER] 🔍 spell type:", typeof spell);
-  console.log("[INDEXER] 🔍 spell constructor:", spell?.constructor?.name);
-  console.log("[INDEXER] 🔍 spell keys:", Object.keys(spell));
-  
-  // Check for appId in various possible locations
-  console.log("[INDEXER] 🔍 spell.appId:", spell.appId);
-  console.log("[INDEXER] 🔍 spell.app_id:", spell.app_id);
-  console.log("[INDEXER] 🔍 spell.id:", spell.id);
-  
-  // Check if spell has a 'data' or 'metadata' field
-  if (spell.data) {
-    console.log("[INDEXER] 🔍 spell.data type:", typeof spell.data);
-    console.log("[INDEXER] 🔍 spell.data keys:", Object.keys(spell.data));
-  }
-  if (spell.metadata) {
-    console.log("[INDEXER] 🔍 spell.metadata type:", typeof spell.metadata);
-    console.log("[INDEXER] 🔍 spell.metadata keys:", Object.keys(spell.metadata));
-  }
-  
-  // Check tx structure
-  if (spell.tx) {
-    console.log("[INDEXER] 🔍 spell.tx keys:", Object.keys(spell.tx));
-    console.log("[INDEXER] 🔍 spell.tx.ins length:", spell.tx.ins?.length);
-    console.log("[INDEXER] 🔍 spell.tx.outs type:", spell.tx.outs?.constructor?.name);
-    console.log("[INDEXER] 🔍 spell.tx.outs length:", spell.tx.outs?.length);
-    console.log("[INDEXER] 🔍 spell.tx.coins length:", spell.tx.coins?.length);
+  private async processPayrollSpell(spell: any, blockHeight: number, txid: string): Promise<boolean> {
+    console.log(`[INDEXER] 🔍 Processing payroll spell at block ${blockHeight}, txid: ${txid}`);
     
-    // Deep inspect tx.outs if it's an array
-    if (Array.isArray(spell.tx.outs)) {
-      for (let i = 0; i < spell.tx.outs.length; i++) {
-        const out = spell.tx.outs[i];
-        console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] type:`, out?.constructor?.name);
-        
-        if (out instanceof Map) {
-          console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] Map keys:`, Array.from(out.keys()));
-          // Check each value in the Map
-          for (const [key, value] of out.entries()) {
-            console.log(`[INDEXER] 🔍   Map key "${key}" -> type: ${value?.constructor?.name}`);
-            if (value instanceof Map) {
-              console.log(`[INDEXER] 🔍     Inner Map keys:`, Array.from(value.keys()));
-              // Try to extract ticker from inner Map
-              const innerTicker = value.get('ticker');
-              console.log(`[INDEXER] 🔍     Inner Map ticker:`, innerTicker);
-            } else if (typeof value === 'object' && value !== null) {
-              console.log(`[INDEXER] 🔍     Object keys:`, Object.keys(value));
-              console.log(`[INDEXER] 🔍     Object ticker:`, value.ticker);
+    // =========================================================================
+    // DIAGNOSTIC: Dump the ENTIRE spell structure to understand where data lives
+    // This eliminates all guesswork about the spell format
+    // =========================================================================
+    console.log("[INDEXER] 🔍 ========== SPELL DIAGNOSTIC START ==========");
+    console.log("[INDEXER] 🔍 spell type:", typeof spell);
+    console.log("[INDEXER] 🔍 spell constructor:", spell?.constructor?.name);
+    console.log("[INDEXER] 🔍 spell keys:", Object.keys(spell));
+    
+    // Check for appId in various possible locations
+    console.log("[INDEXER] 🔍 spell.appId:", spell.appId);
+    console.log("[INDEXER] 🔍 spell.app_id:", spell.app_id);
+    console.log("[INDEXER] 🔍 spell.id:", spell.id);
+    
+    // Check if spell has a 'data' or 'metadata' field
+    if (spell.data) {
+      console.log("[INDEXER] 🔍 spell.data type:", typeof spell.data);
+      console.log("[INDEXER] 🔍 spell.data keys:", Object.keys(spell.data));
+    }
+    if (spell.metadata) {
+      console.log("[INDEXER] 🔍 spell.metadata type:", typeof spell.metadata);
+      console.log("[INDEXER] 🔍 spell.metadata keys:", Object.keys(spell.metadata));
+    }
+    
+    // Check tx structure
+    if (spell.tx) {
+      console.log("[INDEXER] 🔍 spell.tx keys:", Object.keys(spell.tx));
+      console.log("[INDEXER] 🔍 spell.tx.ins length:", spell.tx.ins?.length);
+      console.log("[INDEXER] 🔍 spell.tx.outs type:", spell.tx.outs?.constructor?.name);
+      console.log("[INDEXER] 🔍 spell.tx.outs length:", spell.tx.outs?.length);
+      console.log("[INDEXER] 🔍 spell.tx.coins length:", spell.tx.coins?.length);
+      
+      // Deep inspect tx.outs if it's an array
+      if (Array.isArray(spell.tx.outs)) {
+        for (let i = 0; i < spell.tx.outs.length; i++) {
+          const out = spell.tx.outs[i];
+          console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] type:`, out?.constructor?.name);
+          
+          if (out instanceof Map) {
+            console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] Map keys:`, Array.from(out.keys()));
+            // Check each value in the Map
+            for (const [key, value] of out.entries()) {
+              console.log(`[INDEXER] 🔍   Map key "${key}" -> type: ${value?.constructor?.name}`);
+              if (value instanceof Map) {
+                console.log(`[INDEXER] 🔍     Inner Map keys:`, Array.from(value.keys()));
+                // Try to extract ticker from inner Map
+                const innerTicker = value.get('ticker');
+                console.log(`[INDEXER] 🔍     Inner Map ticker:`, innerTicker);
+              } else if (typeof value === 'object' && value !== null) {
+                console.log(`[INDEXER] 🔍     Object keys:`, Object.keys(value));
+                console.log(`[INDEXER] 🔍     Object ticker:`, value.ticker);
+              }
             }
+          } else if (typeof out === 'object' && out !== null) {
+            console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] object keys:`, Object.keys(out));
+            console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] ticker:`, out.ticker);
           }
-        } else if (typeof out === 'object' && out !== null) {
-          console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] object keys:`, Object.keys(out));
-          console.log(`[INDEXER] 🔍 spell.tx.outs[${i}] ticker:`, out.ticker);
         }
       }
     }
-  }
-  
-  // Check spell.outputs (alternative format)
-  if (spell.outputs) {
-    console.log("[INDEXER] 🔍 spell.outputs type:", spell.outputs?.constructor?.name);
-    console.log("[INDEXER] 🔍 spell.outputs length:", spell.outputs?.length);
-    if (Array.isArray(spell.outputs)) {
-      for (let i = 0; i < spell.outputs.length; i++) {
-        const out = spell.outputs[i];
-        console.log(`[INDEXER] 🔍 spell.outputs[${i}] type:`, out?.constructor?.name);
-        if (out instanceof Map) {
-          console.log(`[INDEXER] 🔍 spell.outputs[${i}] Map keys:`, Array.from(out.keys()));
-        } else if (typeof out === 'object' && out !== null) {
-          console.log(`[INDEXER] 🔍 spell.outputs[${i}] object keys:`, Object.keys(out));
-          console.log(`[INDEXER] 🔍 spell.outputs[${i}] ticker:`, out.ticker);
-          console.log(`[INDEXER] 🔍 spell.outputs[${i}] appId:`, out.appId);
+    
+    // Check spell.outputs (alternative format)
+    if (spell.outputs) {
+      console.log("[INDEXER] 🔍 spell.outputs type:", spell.outputs?.constructor?.name);
+      console.log("[INDEXER] 🔍 spell.outputs length:", spell.outputs?.length);
+      if (Array.isArray(spell.outputs)) {
+        for (let i = 0; i < spell.outputs.length; i++) {
+          const out = spell.outputs[i];
+          console.log(`[INDEXER] 🔍 spell.outputs[${i}] type:`, out?.constructor?.name);
+          if (out instanceof Map) {
+            console.log(`[INDEXER] 🔍 spell.outputs[${i}] Map keys:`, Array.from(out.keys()));
+          } else if (typeof out === 'object' && out !== null) {
+            console.log(`[INDEXER] 🔍 spell.outputs[${i}] object keys:`, Object.keys(out));
+            console.log(`[INDEXER] 🔍 spell.outputs[${i}] ticker:`, out.ticker);
+            console.log(`[INDEXER] 🔍 spell.outputs[${i}] appId:`, out.appId);
+          }
         }
       }
     }
-  }
-  
-  // Check spell.app_public_inputs for appId
-  if (spell.app_public_inputs) {
-    console.log("[INDEXER] 🔍 spell.app_public_inputs type:", spell.app_public_inputs?.constructor?.name);
-    if (spell.app_public_inputs instanceof Map) {
-      console.log("[INDEXER] 🔍 spell.app_public_inputs Map keys:", Array.from(spell.app_public_inputs.keys()));
-    } else if (typeof spell.app_public_inputs === 'object') {
-      console.log("[INDEXER] 🔍 spell.app_public_inputs keys:", Object.keys(spell.app_public_inputs));
+    
+    // Check spell.app_public_inputs for appId
+    if (spell.app_public_inputs) {
+      console.log("[INDEXER] 🔍 spell.app_public_inputs type:", spell.app_public_inputs?.constructor?.name);
+      if (spell.app_public_inputs instanceof Map) {
+        console.log("[INDEXER] 🔍 spell.app_public_inputs Map keys:", Array.from(spell.app_public_inputs.keys()));
+      } else if (typeof spell.app_public_inputs === 'object') {
+        console.log("[INDEXER] 🔍 spell.app_public_inputs keys:", Object.keys(spell.app_public_inputs));
+      }
     }
-  }
-  
-  // Try to stringify the whole spell (with Map handling)
-  const seen = new WeakSet();
-  const mapToObj = (obj: any): any => {
-    if (obj === null || typeof obj !== 'object') return obj;
-    if (seen.has(obj)) return "[Circular]";
-    seen.add(obj);
-    if (obj instanceof Map) {
+    
+    // Try to stringify the whole spell (with Map handling)
+    const seen = new WeakSet();
+    const mapToObj = (obj: any): any => {
+      if (obj === null || typeof obj !== 'object') return obj;
+      if (seen.has(obj)) return "[Circular]";
+      seen.add(obj);
+      if (obj instanceof Map) {
+        const result: any = {};
+        for (const [k, v] of obj.entries()) {
+          result[k] = mapToObj(v);
+        }
+        return result;
+      }
+      if (Array.isArray(obj)) {
+        return obj.map(mapToObj);
+      }
       const result: any = {};
-      for (const [k, v] of obj.entries()) {
-        result[k] = mapToObj(v);
+      for (const key of Object.keys(obj)) {
+        result[key] = mapToObj(obj[key]);
       }
       return result;
+    };
+    
+    console.log("[INDEXER] 🔍 Full spell as object:", JSON.stringify(mapToObj(spell), null, 2).substring(0, 2000));
+    console.log("[INDEXER] 🔍 ========== SPELL DIAGNOSTIC END ==========");
+    
+    // =========================================================================
+    // Now try to extract appId from wherever it might be
+    // =========================================================================
+    let appId = spell.appId || spell.app_id;
+    
+    // If appId not found, try to find it in tx.coins or other locations
+    if (!appId && spell.tx?.coins && Array.isArray(spell.tx.coins)) {
+      for (const coin of spell.tx.coins) {
+        if (coin.appId) appId = coin.appId;
+        if (coin.app_id) appId = coin.app_id;
+        if (coin.id) appId = coin.id;
+      }
     }
-    if (Array.isArray(obj)) {
-      return obj.map(mapToObj);
+    
+    // If still not found, try to extract from app_public_inputs Map
+    if (!appId && spell.app_public_inputs instanceof Map) {
+      for (const [key, value] of spell.app_public_inputs.entries()) {
+        if (typeof key === 'string' && (key.startsWith('n/') || key.startsWith('t/'))) {
+          const parts = key.split('/');
+          if (parts.length >= 2) {
+            appId = parts[1];
+            console.log(`[INDEXER]   📝 Extracted appId from app_public_inputs key: ${appId}`);
+            break;
+          }
+        }
+      }
     }
-    const result: any = {};
-    for (const key of Object.keys(obj)) {
-      result[key] = mapToObj(obj[key]);
+    
+    if (!appId) {
+      console.log('[INDEXER]   ⚠️ No appId found in spell');
+      console.log('[INDEXER]   💡 This spell may not be a payroll spell, or the WASM needs updating');
+      return false;
     }
-    return result;
-  };
-  
-  console.log("[INDEXER] 🔍 Full spell as object:", JSON.stringify(mapToObj(spell), null, 2).substring(0, 2000));
-  console.log("[INDEXER] 🔍 ========== SPELL DIAGNOSTIC END ==========");
-  
-  // =========================================================================
-  // Now try to extract appId from wherever it might be
-  // =========================================================================
-  let appId = spell.appId || spell.app_id;
-  
-  // If appId not found, try to find it in tx.coins or other locations
-  if (!appId && spell.tx?.coins && Array.isArray(spell.tx.coins)) {
-    for (const coin of spell.tx.coins) {
-      if (coin.appId) appId = coin.appId;
-      if (coin.app_id) appId = coin.app_id;
-      if (coin.id) appId = coin.id;
+    
+    console.log(`[INDEXER]   ✅ Found appId: ${appId.substring(0, 16)}...`);
+    
+    let nftMetadata = null;
+    let nftUtxoId = null;
+    
+    // =========================================================================
+    // EXTRACT ANCHOR UTXO FROM spell.tx.ins (FIRST INPUT)
+    // This is the UTXO that was consumed to create the appId
+    // FIX: Resolves the "NOT NULL constraint failed: plans.anchorUtxo" error
+    // =========================================================================
+    let anchorUtxo: string | null = null;
+    if (spell.tx && spell.tx.ins && Array.isArray(spell.tx.ins) && spell.tx.ins.length > 0) {
+      anchorUtxo = spell.tx.ins[0];
+      console.log(`[INDEXER]   ⚓ Anchor UTXO extracted: ${anchorUtxo}`);
+    } else {
+      console.log(`[INDEXER]   ⚠️ No anchor UTXO found in spell.tx.ins`);
     }
-  }
-  
-  // If still not found, try to extract from app_public_inputs Map
-  if (!appId && spell.app_public_inputs instanceof Map) {
-    for (const [key, value] of spell.app_public_inputs.entries()) {
-      if (typeof key === 'string' && (key.startsWith('n/') || key.startsWith('t/'))) {
-        const parts = key.split('/');
-        if (parts.length >= 2) {
-          appId = parts[1];
-          console.log(`[INDEXER]   📝 Extracted appId from app_public_inputs key: ${appId}`);
+    
+    // =========================================================================
+    // EXTRACT NFT DESTINATION HEX FOR EMPLOYER ADDRESS RESOLUTION
+    // This is the treasuryHexDest that was saved during company registration
+    // =========================================================================
+    let nftDestHex: string | null = null;
+    if (spell.tx && spell.tx.coins && Array.isArray(spell.tx.coins) && spell.tx.coins.length > 0) {
+      const firstCoin = spell.tx.coins[0];
+      if (firstCoin && firstCoin.dest) {
+        nftDestHex = firstCoin.dest;
+        console.log(`[INDEXER]   📍 NFT destination hex: ${nftDestHex ? nftDestHex.substring(0, 50) : 'null'}...`);
+      }
+    }
+    
+    // =========================================================================
+    // RESOLVE EMPLOYER ADDRESS FROM DATABASE
+    // Check two places:
+    // A) The existing pending plan record (preferred - for re-indexing)
+    // B) The companies table using treasuryHexDest (fallback for fresh discovery)
+    // =========================================================================
+    let employerAddress: string | null = null;
+    
+    console.log(`[INDEXER]   🔍 Resolving employerAddress for appId: ${appId.substring(0, 16)}...`);
+    
+    // Check if plan already exists (for re-indexing scenario)
+    const existingPlan = await this.dbGet('SELECT employerAddress FROM plans WHERE appId = ?', [appId]);
+    if (existingPlan && existingPlan.employerAddress) {
+      employerAddress = existingPlan.employerAddress;
+      console.log(`[INDEXER]   ✅ Found employerAddress from existing plan: ${employerAddress ? employerAddress.substring(0, 20) : 'null'}...`);
+    }
+    
+    // If not found in plans, try to resolve from companies table using NFT destination hex
+    if (!employerAddress && nftDestHex) {
+      console.log(`[INDEXER]   🔍 Looking up company by treasuryHexDest: ${nftDestHex.substring(0, 30)}...`);
+      const company = await this.dbGet('SELECT employerAddress FROM companies WHERE treasuryHexDest = ?', [nftDestHex]);
+      if (company && company.employerAddress) {
+        employerAddress = company.employerAddress;
+        console.log(`[INDEXER]   ✅ Found employerAddress from companies table: ${employerAddress ? employerAddress.substring(0, 20) : 'null'}...`);
+      } else {
+        console.log(`[INDEXER]   ⚠️ No company found with treasuryHexDest: ${nftDestHex.substring(0, 30)}...`);
+      }
+    }
+    
+    // If still not found, log warning and return false
+    if (!employerAddress) {
+      console.log(`[INDEXER]   ❌ Could not resolve employerAddress for appId ${appId.substring(0, 16)}...`);
+      console.log(`[INDEXER]   💡 This plan will be skipped. Ensure company registration completed before minting.`);
+      return false;
+    }
+    
+    // =========================================================================
+    // CORRECT MAP ACCESS FOR WASM VERSION 14+
+    // Structure: spell.tx.outs[outputIndex] is a Map with app indices as keys
+    // Each app index maps to:
+    //   - For NFT outputs: Another Map containing metadata
+    //   - For Token outputs: A Number (the token amount)
+    // =========================================================================
+    if (spell.tx && spell.tx.outs && Array.isArray(spell.tx.outs)) {
+      for (let outputIndex = 0; outputIndex < spell.tx.outs.length; outputIndex++) {
+        const outputMap = spell.tx.outs[outputIndex];
+        
+        if (outputMap instanceof Map) {
+          console.log(`[INDEXER]   📝 Output ${outputIndex} is a Map with ${outputMap.size} entries`);
+          console.log(`[INDEXER]   📝 Map keys at output ${outputIndex}:`, Array.from(outputMap.keys()));
+          
+          // Iterate through app indices (keys like 0, 1, 2, etc.)
+          for (const [appIndex, appData] of outputMap.entries()) {
+
+            console.log(`[INDEXER]   🔍 App Index ${appIndex}: appData type = ${typeof appData}, is Map = ${appData instanceof Map}, value = ${appData}`);
+            
+            // ============================================================
+            // CASE A: NFT Output (Plan NFT) - appData is a Map
+            // ============================================================
+            if (appData instanceof Map) {
+              // Extract metadata using .get() method
+              const ticker = appData.get('ticker');
+              const remaining = appData.get('remaining');
+              const metadataHash = appData.get('metadataHash');
+              const scrollPolicy = appData.get('scrollPolicy');
+              const payPeriodSeconds = appData.get('payPeriodSeconds');
+              const compensationSats = appData.get('compensationSats');
+              
+              console.log(`[INDEXER]   📝 App Index ${appIndex}: ticker=${ticker}, remaining=${remaining}, metadataHash=${metadataHash?.substring(0, 16)}...`);
+              
+              // Check if this is a Plan NFT (ticker ends with -PAY)
+              if (ticker && typeof ticker === 'string' && ticker.endsWith('-PAY')) {
+                nftMetadata = {
+                  ticker,
+                  remaining,
+                  metadataHash,
+                  scrollPolicy,
+                  payPeriodSeconds,
+                  compensationSats
+                };
+                nftUtxoId = `${txid}:${outputIndex}`;
+                console.log(`[INDEXER]   ✅ Found Plan NFT at output ${outputIndex}, app ${appIndex} | ticker: ${ticker} | remaining: ${remaining}`);
+                break;
+              }
+              
+              // Also check by metadataHash as fallback (Plan NFTs always have metadataHash)
+              if (metadataHash && remaining !== undefined && !nftMetadata) {
+                nftMetadata = {
+                  ticker: ticker || 'UNKNOWN-PAY',
+                  remaining,
+                  metadataHash,
+                  scrollPolicy,
+                  payPeriodSeconds,
+                  compensationSats
+                };
+                nftUtxoId = `${txid}:${outputIndex}`;
+                console.log(`[INDEXER]   ✅ Found Plan NFT by metadataHash at output ${outputIndex}, app ${appIndex}`);
+                break;
+              }
+            }
+            
+            // ============================================================
+            // CASE B: Token Output (Worker Token) - appData is a Number
+            // ============================================================
+            else if (typeof appData === 'number') {
+              console.log(`[INDEXER]   💎 Found Worker Token at output ${outputIndex}, app ${appIndex} | Amount: ${appData}`);
+              
+              // Get the worker's address from the coin output
+              const coin = spell.tx.coins?.[outputIndex];
+              if (coin && coin.dest) {
+                // coin.dest is a Uint8Array, convert to hex string
+                let destHex = '';
+                if (coin.dest instanceof Uint8Array) {
+                  destHex = Buffer.from(coin.dest).toString('hex');
+                } else if (typeof coin.dest === 'string') {
+                  destHex = coin.dest;
+                } else {
+                  console.warn(`[INDEXER]   ⚠️ Unknown dest type at output ${outputIndex}: ${typeof coin.dest}`);
+                  continue;
+                }
+                
+                console.log(`[INDEXER]   👤 Worker dest hex: ${destHex.substring(0, 30)}...`);
+                
+                // Find the worker by dest hex or address
+                // Try to find worker in database by dest hex or address
+                let workerAddress = '';
+                
+                // First try to find worker by dest hex in plans table (treasuryHexDest)
+                const companyByDest = await this.dbGet(
+                  'SELECT employerAddress FROM companies WHERE treasuryHexDest = ?',
+                  [destHex]
+                );
+                
+                if (companyByDest && companyByDest.employerAddress) {
+                  // This is the employer's return NFT, not a worker
+                  console.log(`[INDEXER]   ℹ️ Output ${outputIndex} is employer's return NFT (not a worker token)`);
+                  continue;
+                }
+                
+                // Try to find worker by dest hex in workers table (metadata might contain address)
+                // Since we don't have direct mapping, we need to look up by the fact that
+                // this output is a token mint for a worker we have in 'minting_pending' state
+                const pendingWorker = await this.dbGet(
+                  `SELECT walletAddress, planId FROM workers 
+                  WHERE planId = ? AND status = 'minting_pending' 
+                  LIMIT 1`,
+                  [appId]
+                );
+                
+                if (pendingWorker) {
+                  workerAddress = pendingWorker.walletAddress;
+                  console.log(`[INDEXER]   👤 Found pending worker: ${workerAddress.substring(0, 16)}...`);
+                  
+                  const tokenUtxoId = `${txid}:${outputIndex}`;
+                  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 days
+                  const lastMintedPeriod = new Date().toISOString();
+                  
+                  console.log(`[INDEXER]   📝 Activating worker ${workerAddress.substring(0, 16)}... with token UTXO: ${tokenUtxoId}`);
+                  
+                  await this.updateWorkerPostMint(
+                    workerAddress,
+                    appId,
+                    tokenUtxoId,
+                    expiresAt,
+                    lastMintedPeriod
+                  );
+                } else {
+                  console.log(`[INDEXER]   ⚠️ No pending worker found for token output at index ${outputIndex}`);
+                }
+              } else {
+                console.warn(`[INDEXER]   ⚠️ No coin dest found for output ${outputIndex}`);
+              }
+            } else {
+              console.log(`[INDEXER]   ⚠️ App metadata at index ${appIndex} is not a Map or Number, type: ${appData?.constructor?.name}`);
+            }
+          }
+          
+          if (nftMetadata) break;
+        } else {
+          console.log(`[INDEXER]   ⚠️ Output ${outputIndex} is not a Map, type: ${outputMap?.constructor?.name}`);
+        }
+      }
+    }
+    
+    // =========================================================================
+    // FALLBACK: Handle spell.outputs format (alternative structure)
+    // =========================================================================
+    if (!nftMetadata && spell.outputs) {
+      console.log('[INDEXER]   🔍 Checking spell.outputs fallback...');
+      for (let i = 0; i < spell.outputs.length; i++) {
+        const output = spell.outputs[i];
+        if (!output) continue;
+        
+        let ticker = null;
+        let remaining = null;
+        let metadataHash = null;
+        let scrollPolicy = null;
+        let payPeriodSeconds = null;
+        let compensationSats = null;
+        
+        // Handle Map or plain object
+        if (output && typeof output.get === 'function') {
+          ticker = output.get('ticker');
+          remaining = output.get('remaining');
+          metadataHash = output.get('metadataHash');
+          scrollPolicy = output.get('scrollPolicy');
+          payPeriodSeconds = output.get('payPeriodSeconds');
+          compensationSats = output.get('compensationSats');
+        } else {
+          ticker = output.ticker;
+          remaining = output.remaining;
+          metadataHash = output.metadataHash;
+          scrollPolicy = output.scrollPolicy;
+          payPeriodSeconds = output.payPeriodSeconds;
+          compensationSats = output.compensationSats;
+        }
+        
+        // Check for nftMetadata wrapper
+        if (output.nftMetadata) {
+          if (typeof output.nftMetadata.get === 'function') {
+            ticker = output.nftMetadata.get('ticker') || ticker;
+            remaining = output.nftMetadata.get('remaining') || remaining;
+            metadataHash = output.nftMetadata.get('metadataHash') || metadataHash;
+          } else {
+            ticker = output.nftMetadata.ticker || ticker;
+            remaining = output.nftMetadata.remaining || remaining;
+            metadataHash = output.nftMetadata.metadataHash || metadataHash;
+          }
+        }
+        
+        if (ticker && typeof ticker === 'string' && ticker.endsWith('-PAY')) {
+          nftMetadata = {
+            ticker,
+            remaining,
+            metadataHash,
+            scrollPolicy,
+            payPeriodSeconds,
+            compensationSats
+          };
+          nftUtxoId = `${txid}:${i}`;
+          console.log(`[INDEXER]   📝 Found NFT metadata in spell.outputs at index ${i} | ticker: ${ticker}`);
           break;
         }
       }
     }
-  }
-  
-  if (!appId) {
-    console.log('[INDEXER]   ⚠️ No appId found in spell');
-    console.log('[INDEXER]   💡 This spell may not be a payroll spell, or the WASM needs updating');
-    return false;
-  }
-  
-  console.log(`[INDEXER]   ✅ Found appId: ${appId.substring(0, 16)}...`);
-  
-  let nftMetadata = null;
-  let nftUtxoId = null;
-  
-  // =========================================================================
-  // EXTRACT ANCHOR UTXO FROM spell.tx.ins (FIRST INPUT)
-  // This is the UTXO that was consumed to create the appId
-  // FIX: Resolves the "NOT NULL constraint failed: plans.anchorUtxo" error
-  // =========================================================================
-  let anchorUtxo: string | null = null;
-  if (spell.tx && spell.tx.ins && Array.isArray(spell.tx.ins) && spell.tx.ins.length > 0) {
-    anchorUtxo = spell.tx.ins[0];
-    console.log(`[INDEXER]   ⚓ Anchor UTXO extracted: ${anchorUtxo}`);
-  } else {
-    console.log(`[INDEXER]   ⚠️ No anchor UTXO found in spell.tx.ins`);
-  }
-  
-  // =========================================================================
-  // EXTRACT NFT DESTINATION HEX FOR EMPLOYER ADDRESS RESOLUTION
-  // This is the treasuryHexDest that was saved during company registration
-  // =========================================================================
-  let nftDestHex: string | null = null;
-  if (spell.tx && spell.tx.coins && Array.isArray(spell.tx.coins) && spell.tx.coins.length > 0) {
-    const firstCoin = spell.tx.coins[0];
-    if (firstCoin && firstCoin.dest) {
-      nftDestHex = firstCoin.dest;
-      console.log(`[INDEXER]   📍 NFT destination hex: ${nftDestHex ? nftDestHex.substring(0, 50) : 'null'}...`);
+    
+    if (!nftMetadata) {
+      console.log('[INDEXER]   ⚠️ No NFT metadata found in spell');
+      return false;
     }
-  }
-  
-  // =========================================================================
-  // RESOLVE EMPLOYER ADDRESS FROM DATABASE
-  // Check two places:
-  // A) The existing pending plan record (preferred - for re-indexing)
-  // B) The companies table using treasuryHexDest (fallback for fresh discovery)
-  // =========================================================================
-  let employerAddress: string | null = null;
-  
-  console.log(`[INDEXER]   🔍 Resolving employerAddress for appId: ${appId.substring(0, 16)}...`);
-  
-  // Check if plan already exists (for re-indexing scenario)
-  const existingPlan = await this.dbGet('SELECT employerAddress FROM plans WHERE appId = ?', [appId]);
-  if (existingPlan && existingPlan.employerAddress) {
-    employerAddress = existingPlan.employerAddress;
-    console.log(`[INDEXER]   ✅ Found employerAddress from existing plan: ${employerAddress ? employerAddress.substring(0, 20) : 'null'}...`);
-  }
-  
-  // If not found in plans, try to resolve from companies table using NFT destination hex
-  if (!employerAddress && nftDestHex) {
-    console.log(`[INDEXER]   🔍 Looking up company by treasuryHexDest: ${nftDestHex.substring(0, 30)}...`);
-    const company = await this.dbGet('SELECT employerAddress FROM companies WHERE treasuryHexDest = ?', [nftDestHex]);
-    if (company && company.employerAddress) {
-      employerAddress = company.employerAddress;
-      console.log(`[INDEXER]   ✅ Found employerAddress from companies table: ${employerAddress ? employerAddress.substring(0, 20) : 'null'}...`);
-    } else {
-      console.log(`[INDEXER]   ⚠️ No company found with treasuryHexDest: ${nftDestHex.substring(0, 30)}...`);
+    
+    const ticker = nftMetadata.ticker;
+    const remaining = nftMetadata.remaining;
+    const metadataHash = nftMetadata.metadataHash;
+    const scrollPolicy = nftMetadata.scrollPolicy;
+    const payPeriodSeconds = nftMetadata.payPeriodSeconds;
+    const compensationSats = nftMetadata.compensationSats;
+    
+    if (!ticker || !ticker.endsWith('-PAY')) {
+      console.log(`[INDEXER]   ⚠️ Ticker ${ticker} is not a payroll ticker`);
+      return false;
     }
-  }
-  
-  // If still not found, log warning and return false
-  if (!employerAddress) {
-    console.log(`[INDEXER]   ❌ Could not resolve employerAddress for appId ${appId.substring(0, 16)}...`);
-    console.log(`[INDEXER]   💡 This plan will be skipped. Ensure company registration completed before minting.`);
-    return false;
-  }
-  
-  // =========================================================================
-  // CORRECT MAP ACCESS FOR WASM VERSION 14+
-  // Structure: spell.tx.outs[outputIndex] is a Map with app indices as keys
-  // Each app index maps to another Map containing the actual metadata
-  // =========================================================================
-  if (spell.tx && spell.tx.outs && Array.isArray(spell.tx.outs)) {
-    for (let outputIndex = 0; outputIndex < spell.tx.outs.length; outputIndex++) {
-      const outputMap = spell.tx.outs[outputIndex];
-      
-      if (outputMap instanceof Map) {
-        console.log(`[INDEXER]   📝 Output ${outputIndex} is a Map with ${outputMap.size} entries`);
-        console.log(`[INDEXER]   📝 Map keys at output ${outputIndex}:`, Array.from(outputMap.keys()));
+    
+    console.log(`[INDEXER]   ✅ Plan NFT: ${ticker} | appId=${appId.substring(0, 16)}... | remaining=${remaining} | period=${payPeriodSeconds}s | compensation=${compensationSats}sats`);
+    console.log(`[INDEXER]   📍 UTXO: ${nftUtxoId}`);
+    if (anchorUtxo) {
+      console.log(`[INDEXER]   ⚓ Anchor UTXO: ${anchorUtxo}`);
+    }
+    console.log(`[INDEXER]   🏢 Employer Address: ${employerAddress.substring(0, 20)}...`);
+    
+    // =========================================================================
+    // FIX: Updated INSERT to include employerAddress and status
+    // This resolves the "NOT NULL constraint failed: plans.employerAddress" error
+    // =========================================================================
+    await this.dbRun(`
+      INSERT OR REPLACE INTO plans (
+        appId, nftUtxoId, anchorUtxo, employerAddress, ticker, compensationSats, 
+        payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
+        status, lastIndexedBlock, createdAt, updatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      appId,
+      nftUtxoId,
+      anchorUtxo || '',
+      employerAddress,
+      ticker,
+      compensationSats || 0,
+      payPeriodSeconds || 0,
+      metadataHash || '',
+      scrollPolicy || 0,
+      remaining || 0,
+      'active',  // Explicitly mark as active (confirmed on-chain)
+      blockHeight,
+      new Date().toISOString(),
+      new Date().toISOString()
+    ]);
+    
+    console.log(`[INDEXER]   ✅ Plan record saved to database with status 'active'`);
+    
+    await this.createAuditLog(
+      crypto.randomUUID(),
+      'PLAN_CREATED',
+      `Plan NFT created: ${ticker}`,
+      txid,
+      'confirmed'
+    );
+    console.log(`[INDEXER]   ✅ Audit log created for Plan NFT: ${ticker}`);
+    
+    // =========================================================================
+    // NON-CUSTODIAL MODE: Save encrypted metadata hash only
+    // The frontend will handle decryption using the user's wallet
+    // This ensures security: even if database is hacked, only encrypted data is exposed
+    // =========================================================================
+    if (metadataHash) {
+      try {
+        console.log(`[INDEXER]   📦 Saving encrypted metadata hash: ${metadataHash.substring(0, 32)}...`);
         
-        // Iterate through app indices (keys like 0, 1, 2, etc.)
-        for (const [appIndex, appMetadata] of outputMap.entries()) {
-          if (appMetadata instanceof Map) {
-            // Extract metadata using .get() method
-            const ticker = appMetadata.get('ticker');
-            const remaining = appMetadata.get('remaining');
-            const metadataHash = appMetadata.get('metadataHash');
-            const scrollPolicy = appMetadata.get('scrollPolicy');
-            const payPeriodSeconds = appMetadata.get('payPeriodSeconds');
-            const compensationSats = appMetadata.get('compensationSats');
-            
-            console.log(`[INDEXER]   📝 App Index ${appIndex}: ticker=${ticker}, remaining=${remaining}, metadataHash=${metadataHash?.substring(0, 16)}...`);
-            
-            // Check if this is a Plan NFT (ticker ends with -PAY)
-            if (ticker && typeof ticker === 'string' && ticker.endsWith('-PAY')) {
-              nftMetadata = {
-                ticker,
-                remaining,
-                metadataHash,
-                scrollPolicy,
-                payPeriodSeconds,
-                compensationSats
-              };
-              nftUtxoId = `${txid}:${outputIndex}`;
-              console.log(`[INDEXER]   ✅ Found Plan NFT at output ${outputIndex}, app ${appIndex} | ticker: ${ticker} | remaining: ${remaining}`);
-              break;
-            }
-            
-            // Also check by metadataHash as fallback (Plan NFTs always have metadataHash)
-            if (metadataHash && remaining !== undefined && !nftMetadata) {
-              nftMetadata = {
-                ticker: ticker || 'UNKNOWN-PAY',
-                remaining,
-                metadataHash,
-                scrollPolicy,
-                payPeriodSeconds,
-                compensationSats
-              };
-              nftUtxoId = `${txid}:${outputIndex}`;
-              console.log(`[INDEXER]   ✅ Found Plan NFT by metadataHash at output ${outputIndex}, app ${appIndex}`);
-              break;
-            }
-          } else {
-            console.log(`[INDEXER]   ⚠️ App metadata at index ${appIndex} is not a Map, type: ${appMetadata?.constructor?.name}`);
-          }
-        }
+        // Instead of decrypting, we just update the database with the IPFS hash.
+        // The Frontend will handle the actual decryption later.
+        await this.dbRun(
+          'UPDATE plans SET metadataHash = ? WHERE appId = ?',
+          [metadataHash, appId]
+        );
         
-        if (nftMetadata) break;
-      } else {
-        console.log(`[INDEXER]   ⚠️ Output ${outputIndex} is not a Map, type: ${outputMap?.constructor?.name}`);
+        console.log(`[INDEXER]   ✅ Metadata hash cached for appId: ${appId.substring(0, 8)}...`);
+        console.log(`[INDEXER]   ℹ️ Non-Custodial Mode: Decryption will happen in the browser when user logs in.`);
+      } catch (error) {
+        // Non-Custodial Mode: This block no longer needs to crash if entropy is missing
+        console.log(`[INDEXER]   ℹ️ Skipping backend decryption (Non-Custodial Mode Active)`);
+        console.log(`[INDEXER]   📦 Metadata hash will be decrypted by frontend wallet.`);
       }
     }
+    
+    return true;
   }
-  
-  // =========================================================================
-  // FALLBACK: Handle spell.outputs format (alternative structure)
-  // =========================================================================
-  if (!nftMetadata && spell.outputs) {
-    console.log('[INDEXER]   🔍 Checking spell.outputs fallback...');
-    for (let i = 0; i < spell.outputs.length; i++) {
-      const output = spell.outputs[i];
-      if (!output) continue;
-      
-      let ticker = null;
-      let remaining = null;
-      let metadataHash = null;
-      let scrollPolicy = null;
-      let payPeriodSeconds = null;
-      let compensationSats = null;
-      
-      // Handle Map or plain object
-      if (output && typeof output.get === 'function') {
-        ticker = output.get('ticker');
-        remaining = output.get('remaining');
-        metadataHash = output.get('metadataHash');
-        scrollPolicy = output.get('scrollPolicy');
-        payPeriodSeconds = output.get('payPeriodSeconds');
-        compensationSats = output.get('compensationSats');
-      } else {
-        ticker = output.ticker;
-        remaining = output.remaining;
-        metadataHash = output.metadataHash;
-        scrollPolicy = output.scrollPolicy;
-        payPeriodSeconds = output.payPeriodSeconds;
-        compensationSats = output.compensationSats;
-      }
-      
-      // Check for nftMetadata wrapper
-      if (output.nftMetadata) {
-        if (typeof output.nftMetadata.get === 'function') {
-          ticker = output.nftMetadata.get('ticker') || ticker;
-          remaining = output.nftMetadata.get('remaining') || remaining;
-          metadataHash = output.nftMetadata.get('metadataHash') || metadataHash;
-        } else {
-          ticker = output.nftMetadata.ticker || ticker;
-          remaining = output.nftMetadata.remaining || remaining;
-          metadataHash = output.nftMetadata.metadataHash || metadataHash;
-        }
-      }
-      
-      if (ticker && typeof ticker === 'string' && ticker.endsWith('-PAY')) {
-        nftMetadata = {
-          ticker,
-          remaining,
-          metadataHash,
-          scrollPolicy,
-          payPeriodSeconds,
-          compensationSats
-        };
-        nftUtxoId = `${txid}:${i}`;
-        console.log(`[INDEXER]   📝 Found NFT metadata in spell.outputs at index ${i} | ticker: ${ticker}`);
-        break;
-      }
-    }
-  }
-  
-  if (!nftMetadata) {
-    console.log('[INDEXER]   ⚠️ No NFT metadata found in spell');
-    return false;
-  }
-  
-  const ticker = nftMetadata.ticker;
-  const remaining = nftMetadata.remaining;
-  const metadataHash = nftMetadata.metadataHash;
-  const scrollPolicy = nftMetadata.scrollPolicy;
-  const payPeriodSeconds = nftMetadata.payPeriodSeconds;
-  const compensationSats = nftMetadata.compensationSats;
-  
-  if (!ticker || !ticker.endsWith('-PAY')) {
-    console.log(`[INDEXER]   ⚠️ Ticker ${ticker} is not a payroll ticker`);
-    return false;
-  }
-  
-  console.log(`[INDEXER]   ✅ Plan NFT: ${ticker} | appId=${appId.substring(0, 16)}... | remaining=${remaining} | period=${payPeriodSeconds}s | compensation=${compensationSats}sats`);
-  console.log(`[INDEXER]   📍 UTXO: ${nftUtxoId}`);
-  if (anchorUtxo) {
-    console.log(`[INDEXER]   ⚓ Anchor UTXO: ${anchorUtxo}`);
-  }
-  console.log(`[INDEXER]   🏢 Employer Address: ${employerAddress.substring(0, 20)}...`);
-  
-  // =========================================================================
-  // FIX: Updated INSERT to include employerAddress and status
-  // This resolves the "NOT NULL constraint failed: plans.employerAddress" error
-  // =========================================================================
-  await this.dbRun(`
-    INSERT OR REPLACE INTO plans (
-      appId, nftUtxoId, anchorUtxo, employerAddress, ticker, compensationSats, 
-      payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
-      status, lastIndexedBlock, createdAt, updatedAt
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `, [
-    appId,
-    nftUtxoId,
-    anchorUtxo || '',
-    employerAddress,
-    ticker,
-    compensationSats || 0,
-    payPeriodSeconds || 0,
-    metadataHash || '',
-    scrollPolicy || 0,
-    remaining || 0,
-    'active',  // Explicitly mark as active (confirmed on-chain)
-    blockHeight,
-    new Date().toISOString(),
-    new Date().toISOString()
-  ]);
-  
-  console.log(`[INDEXER]   ✅ Plan record saved to database with status 'active'`);
-  
-  await this.createAuditLog(
-    crypto.randomUUID(),
-    'PLAN_CREATED',
-    `Plan NFT created: ${ticker}`,
-    txid,
-    'confirmed'
-  );
-  console.log(`[INDEXER]   ✅ Audit log created for Plan NFT: ${ticker}`);
-  
-  // =========================================================================
-  // NON-CUSTODIAL MODE: Save encrypted metadata hash only
-  // The frontend will handle decryption using the user's wallet
-  // This ensures security: even if database is hacked, only encrypted data is exposed
-  // =========================================================================
-  if (metadataHash) {
-    try {
-      console.log(`[INDEXER]   📦 Saving encrypted metadata hash: ${metadataHash.substring(0, 32)}...`);
-      
-      // Instead of decrypting, we just update the database with the IPFS hash.
-      // The Frontend will handle the actual decryption later.
-      await this.dbRun(
-        'UPDATE plans SET metadataHash = ? WHERE appId = ?',
-        [metadataHash, appId]
-      );
-      
-      console.log(`[INDEXER]   ✅ Metadata hash cached for appId: ${appId.substring(0, 8)}...`);
-      console.log(`[INDEXER]   ℹ️ Non-Custodial Mode: Decryption will happen in the browser when user logs in.`);
-    } catch (error) {
-      // Non-Custodial Mode: This block no longer needs to crash if entropy is missing
-      console.log(`[INDEXER]   ℹ️ Skipping backend decryption (Non-Custodial Mode Active)`);
-      console.log(`[INDEXER]   📦 Metadata hash will be decrypted by frontend wallet.`);
-    }
-  }
-  
-  return true;
-}
 
   private async enrichPlanWithMetadata(appId: string, metadataHash: string): Promise<void> {
     // =========================================================================
@@ -1217,6 +1485,7 @@ private async processPayrollSpell(spell: any, blockHeight: number, txid: string)
   // =========================================================================
   // PRODUCTION RECONCILIATION: Scans for spent worker tokens 
   // to move them to 'historicalTokens' and confirm audit logs.
+  // FIX: Now stores STRUCTURED payment records with complete details
   // =========================================================================
   private async reconcileSettlements(tx: any, blockHeight: number): Promise<void> {
     if (!tx.vin || !Array.isArray(tx.vin)) return;
@@ -1224,44 +1493,93 @@ private async processPayrollSpell(spell: any, blockHeight: number, txid: string)
     for (const vin of tx.vin) {
       const spentUtxoId = `${vin.txid}:${vin.vout}`;
       
-      const workerResult = await this.dbGet(
-        'SELECT walletAddress, planId FROM workers WHERE currentTokenUtxo = ? AND status = ?',
-        [spentUtxoId, 'active']
-      );
-      const worker = workerResult as { walletAddress: string; planId: string } | undefined;
+      // Fetch worker record with all needed details for structured history
+      const workerResult = await this.dbGet(`
+        SELECT w.walletAddress, w.planId, w.salarySats, w.role, w.lastMintedPeriod, w.status,
+               p.department, p.ticker
+        FROM workers w
+        LEFT JOIN plans p ON w.planId = p.appId
+        WHERE w.currentTokenUtxo = ? AND w.status = ?
+      `, [spentUtxoId, 'active']);
+      
+      const worker = workerResult as {
+        walletAddress: string;
+        planId: string;
+        salarySats: number;
+        role: string;
+        lastMintedPeriod: string;
+        status: string;
+        department: string;
+        ticker: string;
+      } | undefined;
       
       if (worker) {
         console.log(`[INDEXER]   🔄 Worker token spent: ${spentUtxoId} | worker: ${worker.walletAddress.substring(0, 16)}...`);
+        console.log(`[INDEXER]   Salary: ${worker.salarySats} sats/period, Role: ${worker.role}`);
         
         const timestamp = Math.floor(Date.now() / 1000);
         
-        const existingWorkerResult = await this.dbGet(
-          'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
-          [worker.walletAddress, worker.planId]
-        );
-        const existingWorker = existingWorkerResult as { historicalTokens: string } | undefined;
+        // Get department name
+        const departmentName = worker.department || (worker.ticker ? worker.ticker.replace('-PAY', '') : 'Unknown');
         
-        let history: any[] = [];
-        if (existingWorker && existingWorker.historicalTokens) {
-          try {
-            history = JSON.parse(existingWorker.historicalTokens);
-          } catch (e) {
-            history = [];
-          }
+        // Get worker role (use stored role or fallback)
+        const workerRole = worker.role || 'Team Member';
+        
+        // Determine periods paid from lastMintedPeriod or default to 1
+        let periodsPaid = 1;
+        if (worker.lastMintedPeriod) {
+          // Calculate periods based on payPeriodSeconds from plan
+          // For now, default to 1
+          periodsPaid = 1;
         }
         
-        history.push({
+        // Calculate payment amount
+        const amountPaid = worker.salarySats * periodsPaid;
+        
+        // =========================================================================
+        // FIX: Create STRUCTURED payment record with complete details
+        // This enables tax/accounting exports with meaningful data
+        // =========================================================================
+        const structuredRecord: StructuredPaymentRecord = {
           utxoId: spentUtxoId,
           timestamp: timestamp,
+          blockHeight: blockHeight,
+          amountSats: amountPaid,
+          salarySats: worker.salarySats,
+          periodsPaid: periodsPaid,
+          paymentType: 'regular',
+          txid: tx.txid,
           spentAt: new Date().toISOString(),
-          blockHeight: blockHeight
-        });
+          departmentId: worker.planId,
+          departmentName: departmentName,
+          workerRole: workerRole,
+          status: 'spent'
+        };
         
-        await this.dbRun(
-          'UPDATE workers SET currentTokenUtxo = NULL, historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
-          [JSON.stringify(history), new Date().toISOString(), worker.walletAddress, worker.planId]
+        console.log(`[INDEXER]   📝 Creating structured payment record:`);
+        console.log(`[INDEXER]     Amount: ${structuredRecord.amountSats} sats`);
+        console.log(`[INDEXER]     Department: ${structuredRecord.departmentName}`);
+        console.log(`[INDEXER]     Role: ${structuredRecord.workerRole}`);
+        console.log(`[INDEXER]     Periods: ${structuredRecord.periodsPaid}`);
+        console.log(`[INDEXER]     Block: ${structuredRecord.blockHeight}`);
+        
+        // Add structured record to worker's historicalTokens
+        await addStructuredPaymentRecord(
+          this.db,
+          worker.walletAddress,
+          worker.planId,
+          structuredRecord
         );
         
+        // Clear currentTokenUtxo (token is now spent)
+        await this.dbRun(
+          'UPDATE workers SET currentTokenUtxo = NULL, status = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
+          ['pending', new Date().toISOString(), worker.walletAddress, worker.planId]
+        );
+        
+        console.log(`[INDEXER]   ✅ Worker token cleared, status set to 'pending'`);
+        
+        // Update or create audit log for Scroll release
         const auditLogResult = await this.dbGet(
           'SELECT id FROM audit_logs WHERE txid = ? AND type = ?',
           [tx.txid, 'SCROLL_RELEASE']
@@ -1278,7 +1596,7 @@ private async processPayrollSpell(spell: any, blockHeight: number, txid: string)
           await this.createAuditLog(
             crypto.randomUUID(),
             'SCROLL_RELEASE',
-            `Salary payment released for worker ${worker.walletAddress.substring(0, 16)}...`,
+            `Salary payment released for worker ${worker.walletAddress.substring(0, 16)}... (${structuredRecord.amountSats} sats, ${structuredRecord.periodsPaid} period(s))`,
             tx.txid,
             'confirmed'
           );

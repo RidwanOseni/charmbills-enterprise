@@ -86,10 +86,22 @@ export async function decryptPayrollData(
     encrypted: EncryptedData,
     encryptionKey: string
 ): Promise<Record<string, any>> {
+    console.log('[ENCRYPT] decryptPayrollData called');
+    console.log('[ENCRYPT] encrypted.iv length:', encrypted.iv.length);
+    console.log('[ENCRYPT] encrypted.tag length:', encrypted.tag.length);
+    console.log('[ENCRYPT] encrypted.content length:', encrypted.content.length);
+    console.log('[ENCRYPT] encryptionKey length:', encryptionKey.length);
+
     const key = await deriveKey(encryptionKey);  // CRITICAL: Added await
+    console.log('[ENCRYPT] Derived key length:', key.length);
+
     const iv = Buffer.from(encrypted.iv, 'hex');
     const tag = Buffer.from(encrypted.tag, 'hex');
     const ciphertext = Buffer.from(encrypted.content, 'hex');
+
+    console.log('[ENCRYPT] iv buffer length:', iv.length);
+    console.log('[ENCRYPT] tag buffer length:', tag.length);
+    console.log('[ENCRYPT] ciphertext length:', ciphertext.length);
     
     // Convert to standard Uint8Array for Web Crypto API
     const standardKey = new Uint8Array(key);

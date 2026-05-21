@@ -170,7 +170,7 @@ async function updateWorkerPostMint(
 function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest {
   const required = [
     'authorityUtxo',
-    'authorityTxHex',
+    // 'authorityTxHex', // REMOVED - will be fetched automatically if needed
     'utxoAddress',
     'workers',
     'employerAddress',
@@ -197,9 +197,11 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
     throw new Error('utxoAddress must be a valid Bech32 address (tb1... or bc1...)');
   }
   
-  // Validate authorityTxHex is a valid hex string
-  if (!/^[0-9a-f]+$/i.test(body.authorityTxHex.replace(/\s/g, ''))) {
-    throw new Error('authorityTxHex must be a valid hex string');
+  // Only validate hex format if authorityTxHex is provided and not empty
+  if (body.authorityTxHex && body.authorityTxHex.trim() !== '') {
+    if (!/^[0-9a-f]+$/i.test(body.authorityTxHex.replace(/\s/g, ''))) {
+      throw new Error('authorityTxHex must be a valid hex string');
+    }
   }
   
   // Validate workers array
@@ -279,6 +281,12 @@ function validateMintRequest(body: any): asserts body is MintPayrollTokenRequest
  * DERIVABLE MODEL IMPLEMENTATION:
  * - Workers are set to 'minting_pending' status after transaction generation
  * - The Indexer updates workers to 'active' with actual token UTXOs when confirmed
+ * 
+ * FIX: Returns fundingTxHex in response to ensure frontend uses the exact UTXO
+ *       selected by the backend, preventing UTXO mismatch that causes high fees.
+ * 
+ * FIX: DYNAMIC TREASURY LOOKUP - Removed hardcoded PAYROLL_TREASURY_ADDRESS env var.
+ *       Now uses company.treasuryAddress from database for fee sponsorship.
  */
 export async function mintPayrollToken(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -324,8 +332,15 @@ export async function mintPayrollToken(req: Request, res: Response) {
       encryptionEntropy
     } = req.body;
     
-    // Clean hex
-    const cleanAuthorityTxHex = authorityTxHex.replace(/\s/g, '');
+    // Fetch authority transaction hex if not provided by frontend
+    let cleanAuthorityTxHex = authorityTxHex ? authorityTxHex.replace(/\s/g, '') : '';
+    
+    if (!cleanAuthorityTxHex || cleanAuthorityTxHex === '') {
+      console.log(`[HIRING API:${requestId}] 🔍 authorityTxHex empty, fetching from blockchain...`);
+      const authorityTxid = authorityUtxo.split(':')[0];
+      cleanAuthorityTxHex = await fetchTransactionHex(authorityTxid);
+      console.log(`[HIRING API:${requestId}] ✅ Fetched authority tx hex (length: ${cleanAuthorityTxHex.length})`);
+    }
     
     console.log(`[HIRING API:${requestId}] ✅ Validation passed`);
     console.log(`[HIRING API:${requestId}] planMetadata.anchorUtxo: ${planMetadata.anchorUtxo.substring(0, 30)}...`);
@@ -342,7 +357,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`[HIRING API:${requestId}] 🔐 Encryption entropy available (length: ${entropy.length})`);
     
     // ----------------------------------------------------------------------------
-    // Step 3: Look up company to get treasuryHexDest
+    // Step 3: Look up company to get treasury configuration (DYNAMIC - NO ENV HARDCODING)
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] 🔍 Looking up company for employer: ${employerAddress.substring(0, 20)}...`);
     
@@ -356,8 +371,13 @@ export async function mintPayrollToken(req: Request, res: Response) {
       });
     }
     
+    // CRITICAL FIX: Use treasuryAddress from database, NOT hardcoded env var
+    const treasuryAddress = company.treasuryAddress;
+    const treasuryHexDest = company.treasuryHexDest;
+    
     console.log(`[HIRING API:${requestId}] ✅ Company found`);
-    console.log(`[HIRING API:${requestId}] Company treasuryHexDest: ${company.treasuryHexDest.substring(0, 30)}...`);
+    console.log(`[HIRING API:${requestId}] Company treasuryAddress: ${treasuryAddress.substring(0, 30)}...`);
+    console.log(`[HIRING API:${requestId}] Company treasuryHexDest: ${treasuryHexDest.substring(0, 30)}...`);
     
     // ----------------------------------------------------------------------------
     // Step 4: Verify Plan NFT is still unspent
@@ -454,28 +474,20 @@ export async function mintPayrollToken(req: Request, res: Response) {
     }
     
     // ----------------------------------------------------------------------------
-    // Step 7: Get treasury address from environment
-    // ----------------------------------------------------------------------------
-    const treasuryAddress = process.env.PAYROLL_TREASURY_ADDRESS;
-    if (!treasuryAddress) {
-      throw new Error('PAYROLL_TREASURY_ADDRESS not set in environment');
-    }
-    
-    // ----------------------------------------------------------------------------
-    // Step 8: Calculate required satoshis for fee sponsorship
+    // Step 7: Calculate required satoshis for fee sponsorship
     // CRITICAL FIX: Increased buffer from 30000 to 50000 to cover higher fees
     // ----------------------------------------------------------------------------
     const requiredSats = estimateRequiredSats(workers.length, 50);  // 50% buffer
     console.log(`[HIRING API:${requestId}] Estimated required: ${requiredSats} sats (with 50000 buffer)`);
     
     // ----------------------------------------------------------------------------
-    // Step 9: Dynamically select funding UTXO from treasury
+    // Step 8: Dynamically select funding UTXO from company treasury (DYNAMIC ADDRESS)
     // ----------------------------------------------------------------------------
-    console.log(`[HIRING API:${requestId}] Selecting funding UTXO...`);
+    console.log(`[HIRING API:${requestId}] Selecting funding UTXO from treasury: ${treasuryAddress.substring(0, 30)}...`);
     
     const funding = await getDynamicFundingUtxo(
       db,
-      treasuryAddress, 
+      treasuryAddress,  // ✅ DYNAMIC: Uses company.treasuryAddress from database
       requiredSats,
       employerAddress
     );
@@ -486,7 +498,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 10: Fetch funding UTXO hex from the blockchain
+    // Step 9: Fetch funding UTXO hex from the blockchain
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] 🔍 Fetching funding UTXO hex...`);
     
@@ -505,13 +517,13 @@ export async function mintPayrollToken(req: Request, res: Response) {
     }
     
     // ----------------------------------------------------------------------------
-    // Step 11: Calculate Scroll service fee
+    // Step 10: Calculate Scroll service fee
     // ----------------------------------------------------------------------------
     const scrollFee = calculateScrollFee(2, funding.value);
     console.log(`[HIRING API:${requestId}] 💳 Scroll Service Fee: ${scrollFee} sats`);
     
     // ----------------------------------------------------------------------------
-    // Step 12: Prepare worker allocations for batchPayroll
+    // Step 11: Prepare worker allocations for batchPayroll
     // ----------------------------------------------------------------------------
     const workerAllocations = workers.map(w => ({
       address: w.address,
@@ -524,7 +536,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 13: Create return metadata with placeholder compensationSats
+    // Step 12: Create return metadata with placeholder compensationSats
     // ----------------------------------------------------------------------------
     const returnMetadata = {
       ...planMetadata,
@@ -541,7 +553,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
     });
     
     // ----------------------------------------------------------------------------
-    // Step 14: Generate batch hiring transactions
+    // Step 13: Generate batch hiring transactions
     // ----------------------------------------------------------------------------
     console.log(`[HIRING API:${requestId}] Calling batchPayroll...`);
     console.log(`[HIRING API:${requestId}] batchPayroll parameters:`, {
@@ -553,7 +565,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       employerAddress: employerAddress.substring(0, 20) + '...',
       returnMetadataCompensation: returnMetadata.compensationSats,
       returnMetadataHasAnchorUtxo: !!returnMetadata.anchorUtxo,
-      treasuryHexDest: company.treasuryHexDest.substring(0, 30) + '...',
+      treasuryHexDest: treasuryHexDest.substring(0, 30) + '...',  // ✅ DYNAMIC: Uses company.treasuryHexDest from database
       utxoAddress: utxoAddress.substring(0, 20) + '...'
     });
     
@@ -565,7 +577,7 @@ export async function mintPayrollToken(req: Request, res: Response) {
       planMetadata.appId,
       employerAddress,
       returnMetadata,
-      company.treasuryHexDest,
+      treasuryHexDest,  // ✅ DYNAMIC: Uses company.treasuryHexDest from database
       utxoAddress,
       undefined
     );
@@ -589,12 +601,14 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`[HIRING API:${requestId}] ✅ Workers remain in 'minting_pending' state. Awaiting block confirmation.`);
     
     // ----------------------------------------------------------------------------
-    // Step 15: Return success response
+    // Step 14: Return success response
+    // FIX: Added fundingTxHex to response so frontend uses exact UTXO selected by backend
     // ----------------------------------------------------------------------------
     const response = {
       ...result,
       fundingUsed: funding.utxoId,
       fundingValue: funding.value,
+      fundingTxHex: fundingTxHex,  // CRITICAL FIX: Return hex for frontend signing
       workerCount: workers.length,
       totalTokens,
       supplyRemaining: newRemainingSupply,
@@ -604,7 +618,9 @@ export async function mintPayrollToken(req: Request, res: Response) {
       utxoVerification: { verified: true, unspent: true },
       workerMetadataHashes,
       requestId,
-      returnMetadataCompensation: returnMetadata.compensationSats
+      returnMetadataCompensation: returnMetadata.compensationSats,
+      treasuryAddressUsed: treasuryAddress.substring(0, 30) + '...',  // Log which treasury was used
+      treasuryHexDestUsed: treasuryHexDest.substring(0, 30) + '...'   // Log which hex dest was used
     };
     
     console.log(`[HIRING API:${requestId}] ===== SUCCESS =====`);
@@ -613,6 +629,10 @@ export async function mintPayrollToken(req: Request, res: Response) {
     console.log(`  Remaining: ${newRemainingSupply}`);
     console.log(`  Return NFT compensationSats: ${returnMetadata.compensationSats}`);
     console.log(`  Return NFT anchorUtxo: ${returnMetadata.anchorUtxo ? returnMetadata.anchorUtxo.substring(0, 30) + '...' : 'missing'}`);
+    console.log(`  Funding UTXO used: ${funding.utxoId} (${funding.value} sats)`);
+    console.log(`  Funding TX hex returned: ${fundingTxHex ? fundingTxHex.substring(0, 30) + '...' : 'missing'}`);
+    console.log(`  Treasury Address Used: ${treasuryAddress.substring(0, 30)}...`);
+    console.log(`  Treasury Hex Dest Used: ${treasuryHexDest.substring(0, 30)}...`);
     console.log(`  Workers status: minting_pending (awaiting confirmation)`);
     console.log(`[HIRING API:${requestId}] ===== END =====\n`);
     
