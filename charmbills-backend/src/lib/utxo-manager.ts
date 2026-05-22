@@ -58,6 +58,17 @@ export interface UtxoStatus {
 }
 
 // --------------------------------------------------------------------------------
+// Fee Rate Interface
+// --------------------------------------------------------------------------------
+
+export interface FeeRecommendation {
+  fastestFee: number;   // For immediate confirmation (next block)
+  halfHourFee: number;  // For confirmation within 30 minutes
+  hourFee: number;      // For confirmation within 1 hour
+  minimumFee: number;   // Minimum fee rate
+}
+
+// --------------------------------------------------------------------------------
 // Error Classes
 // --------------------------------------------------------------------------------
 
@@ -214,6 +225,114 @@ export async function cleanupExpiredLocks(db: any): Promise<number> {
     console.log(`[UTXO Manager] 🧹 Cleaned up ${changes} expired UTXO locks`);
   }
   return changes;
+}
+
+// --------------------------------------------------------------------------------
+// Dynamic Fee Rate Functions
+// --------------------------------------------------------------------------------
+
+/**
+ * Fetches current fee recommendations from Mempool.space API
+ * Used for dynamic network fee calculation in production
+ * 
+ * @returns FeeRecommendation object with rates in sats per virtual byte
+ */
+export async function getCurrentFeeRate(): Promise<FeeRecommendation> {
+  try {
+    console.log(`[UTXO Manager] Fetching current fee rates from Mempool API...`);
+    
+    const response = await axios.get(`${MEMPOOL_API}/v1/fees/recommended`, {
+      timeout: 5000
+    });
+    
+    if (!response.data) {
+      throw new UtxoError('Invalid response from fee API');
+    }
+    
+    const feeRate: FeeRecommendation = {
+      fastestFee: response.data.fastestFee || 10,
+      halfHourFee: response.data.halfHourFee || 8,
+      hourFee: response.data.hourFee || 5,
+      minimumFee: response.data.minimumFee || 2
+    };
+    
+    console.log(`[UTXO Manager] Current fee rates - fastest: ${feeRate.fastestFee}, halfHour: ${feeRate.halfHourFee}, hour: ${feeRate.hourFee}, min: ${feeRate.minimumFee} sats/vB`);
+    
+    return feeRate;
+    
+  } catch (error: any) {
+    console.warn(`[UTXO Manager] Failed to fetch fee rates: ${error.message}`);
+    console.warn(`[UTXO Manager] Using fallback fee rates (fastest: 10, halfHour: 8, hour: 5, min: 2)`);
+    
+    // Return fallback values if API fails
+    return {
+      fastestFee: 10,
+      halfHourFee: 8,
+      hourFee: 5,
+      minimumFee: 2
+    };
+  }
+}
+
+/**
+ * Calculates estimated network fee for a transaction
+ * Based on current fee rates from Mempool API
+ * 
+ * @param estimatedVSize - Estimated virtual size of transaction in vBytes
+ * @param feePriority - Priority level: 'fastest', 'halfHour', 'hour', 'minimum'
+ * @returns Estimated network fee in satoshis
+ */
+export async function calculateNetworkFee(
+  estimatedVSize: number,
+  feePriority: 'fastest' | 'halfHour' | 'hour' | 'minimum' = 'halfHour'
+): Promise<number> {
+  const feeRates = await getCurrentFeeRate();
+  
+  let feeRate: number;
+  switch (feePriority) {
+    case 'fastest':
+      feeRate = feeRates.fastestFee;
+      break;
+    case 'halfHour':
+      feeRate = feeRates.halfHourFee;
+      break;
+    case 'hour':
+      feeRate = feeRates.hourFee;
+      break;
+    case 'minimum':
+      feeRate = feeRates.minimumFee;
+      break;
+    default:
+      feeRate = feeRates.halfHourFee;
+  }
+  
+  const estimatedFee = feeRate * estimatedVSize;
+  console.log(`[UTXO Manager] Network fee calculation: ${feeRate} sats/vB × ${estimatedVSize} vB = ${estimatedFee} sats (priority: ${feePriority})`);
+  
+  return estimatedFee;
+}
+
+/**
+ * Estimates transaction virtual size based on number of inputs and outputs
+ * 
+ * @param inputCount - Number of transaction inputs
+ * @param outputCount - Number of transaction outputs
+ * @returns Estimated virtual size in vBytes
+ */
+export function estimateTransactionVSize(inputCount: number, outputCount: number): number {
+  // Base sizes: 
+  // - Each input: ~68 vBytes (for Taproot)
+  // - Each output: ~43 vBytes (for Taproot)
+  // - Fixed overhead: ~10 vBytes
+  const INPUT_VBYTES = 68;
+  const OUTPUT_VBYTES = 43;
+  const OVERHEAD_VBYTES = 10;
+  
+  const estimatedSize = OVERHEAD_VBYTES + (inputCount * INPUT_VBYTES) + (outputCount * OUTPUT_VBYTES);
+  
+  console.log(`[UTXO Manager] Transaction size estimate: ${estimatedSize} vB (${inputCount} inputs, ${outputCount} outputs)`);
+  
+  return estimatedSize;
 }
 
 // --------------------------------------------------------------------------------
@@ -487,7 +606,7 @@ export async function getDynamicFundingUtxo(
  * Estimates required satoshis for a batch transaction
  * 
  * @param workerCount - Number of workers being paid
- * @param extraBuffer - Optional buffer for fee spikes
+ * @param extraBufferPercent - Optional buffer for fee spikes (default: 50)
  * @returns Minimum satoshis needed
  */
 export function estimateRequiredSats(
