@@ -5,51 +5,39 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
-// Conditional imports for WASM bridge - only included when building with 'wasm-bridge' feature
 #[cfg(feature = "wasm-bridge")]
 use wasm_bindgen::prelude::*;
-#[cfg(feature = "wasm-bridge")]
-use std::collections::HashMap;
-
-// --------------------------------------------------------------------------------
-// WASM Bridge Panic Hook and Initialization
-// This ensures Rust panics show up in Node.js console logs
-// --------------------------------------------------------------------------------
 
 #[cfg(feature = "wasm-bridge")]
 #[wasm_bindgen(start)]
 pub fn start() {
-    // This ensures Rust panics show up in your 'npm run dev' logs
     console_error_panic_hook::set_once();
 }
-
-// --------------------------------------------------------------------------------
-// Strict Type-Marshalling Bridge Variables Structure
-// This replaces the find-and-replace logic with typed marshalling
-// --------------------------------------------------------------------------------
 
 #[cfg(feature = "wasm-bridge")]
 #[derive(Deserialize)]
 pub struct BridgeVariables {
-    pub type_name: String,           // "mint-nft" or "mint-token"
-    pub anchor_utxo: String,
+    pub type_name: String,
+    pub anchor_utxo: Option<String>,
     pub funding_utxo: String,
-    pub ticker: String,
-    pub remaining: String,
-    pub metadata_hash: String,
-    pub scroll_policy: String,
-    pub pay_period_seconds: String,
-    pub compensation_sats: String,
+    pub salary_utxo: Option<String>,
+    pub ticker: Option<String>,
+    pub remaining: Option<String>,
+    pub metadata_hash: Option<String>,
+    pub scroll_policy: Option<String>,
+    pub pay_period_seconds: Option<String>,
+    pub compensation_sats: Option<String>,
     pub treasury_dest: String,
     pub app_id: String,
     pub app_vk: String,
-    pub worker_dests: Option<Vec<String>>,   // For batch hiring
-    pub token_amounts: Option<Vec<String>>,  // For batch hiring
+    pub authority_utxo: Option<String>,
+    pub authority_utxos: Option<Vec<String>>,
+    pub worker_dests: Option<Vec<String>>,
+    pub token_amounts: Option<Vec<String>>,
+    pub has_treasury_change: Option<bool>,
+    pub treasury_change_sats: Option<u64>,
 }
 
-// --------------------------------------------------------------------------------
-// NFT Content Structure for Payroll
-// --------------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NftContent {
@@ -80,21 +68,16 @@ impl NftContent {
         }
         true
     }
-    
+
     pub fn is_time_based(&self) -> bool {
         self.scroll_policy == 0
     }
-    
+
     pub fn is_proof_based(&self) -> bool {
         self.scroll_policy == 1
     }
 }
 
-// --------------------------------------------------------------------------------
-// Main App Contract Entry Point
-// --------------------------------------------------------------------------------
-// This function is for the Charms ZK-VM, not for JavaScript.
-// wasm-bindgen cannot handle the complex Charms SDK types (App, Transaction, Data).
 pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
     let _ = _x.bytes();
     match app.tag {
@@ -104,32 +87,24 @@ pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
     }
 }
 
-// --------------------------------------------------------------------------------
-// NFT Contract Logic
-// --------------------------------------------------------------------------------
 fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
-    // =========================================================================
-    // DEBUG: Log the witness and expected identity to identify mismatch
-    // This helps debug the "app_contract assertion failed" error
-    // =========================================================================
     let w_str = match w.value::<String>() {
         Ok(val) => {
             eprintln!("\n--- [ZK-DEBUG] NFT Contract Debug ---");
             eprintln!("Witness (w_str): {:?}", val);
             eprintln!("Expected App Identity: {:?}", app.identity.to_string());
             val
-        },
+        }
         Err(e) => {
             eprintln!("❌ Error: Failed to decode witness as String: {:?}", e);
             return false;
-        },
+        }
     };
-    
-    // Compare the witness with the app identity (SHA256 hash of the anchor UTXO)
+
     let witness_hash = hash(&w_str);
     eprintln!("Witness Hash: {:?}", witness_hash.to_string());
     eprintln!("App Identity:  {:?}", app.identity.to_string());
-    
+
     if witness_hash != app.identity {
         eprintln!("❌ Error: Witness hash does not match App Identity!");
         eprintln!("   Expected: {}", app.identity.to_string());
@@ -137,66 +112,59 @@ fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
         return false;
     }
     eprintln!("✅ Witness hash matches App Identity");
-    
-    // Try to parse witness as UTXO ID for minting detection
+
     let w_utxo_id = match UtxoId::from_str(&w_str) {
         Ok(id) => {
             eprintln!("✅ Parsed witness as UTXO ID: {:?}", id);
             id
-        },
+        }
         Err(e) => {
             eprintln!("⚠️  Witness is not a valid UTXO ID (this may be fine): {:?}", e);
-            // Return false because for NFT minting, witness must be a UTXO ID
             return false;
-        },
+        }
     };
-    
-    // Check if this is an NFT minting transaction (witness UTXO appears in inputs)
+
     let is_nft_minting = tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id);
     eprintln!("Is NFT Minting Transaction: {}", is_nft_minting);
-    
+
     if is_nft_minting {
-        // Verify witness UTXO is actually in inputs (redundant check but safe)
         if !tx.ins.iter().any(|(utxo_id, _)| utxo_id == &w_utxo_id) {
             eprintln!("❌ Error: Witness UTXO not found in transaction inputs");
             return false;
         }
         eprintln!("✅ Witness UTXO found in transaction inputs");
     }
-    
-    // Collect NFT outputs from the transaction
+
     let nft_outputs: Vec<&Data> = charm_values(app, tx.outs.iter()).collect();
     eprintln!("NFT Outputs found: {}", nft_outputs.len());
-    
+
     if nft_outputs.is_empty() {
         eprintln!("❌ Error: No NFT outputs found");
         return false;
     }
-    
-    // For NFT minting, there should be exactly one NFT output
+
     if is_nft_minting && nft_outputs.len() != 1 {
         eprintln!("❌ Error: NFT minting requires exactly 1 NFT output, got {}", nft_outputs.len());
         return false;
     }
-    
-    // Validate each NFT output's content
+
     for (i, data) in nft_outputs.iter().enumerate() {
         let content: NftContent = match data.value() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("❌ Error: Failed to decode NFT content at index {}: {:?}", i, e);
                 return false;
-            },
+            }
         };
-        
-        eprintln!("NFT Output {}: ticker={}, remaining={}, scrollPolicy={}", 
+
+        eprintln!("NFT Output {}: ticker={}, remaining={}, scrollPolicy={}",
                   i, content.ticker, content.remaining, content.scroll_policy);
-        
+
         if !content.validate() {
             eprintln!("❌ Error: NFT content validation failed at index {}", i);
             return false;
         }
-        
+
         if is_nft_minting && i == 0 {
             if content.ticker.is_empty() {
                 eprintln!("❌ Error: NFT ticker is empty");
@@ -205,24 +173,46 @@ fn nft_contract_satisfied(app: &App, tx: &Transaction, w: &Data) -> bool {
             eprintln!("✅ NFT content validated successfully");
         }
     }
-    
+
     eprintln!("✅ NFT Contract Satisfied!\n");
     true
 }
 
-// --------------------------------------------------------------------------------
-// Token Contract Logic
-// --------------------------------------------------------------------------------
 fn token_contract_satisfied(token_app: &App, tx: &Transaction) -> bool {
-    can_mint_token(token_app, tx)
+    eprintln!("\n--- [ZK-DEBUG] Token Contract Debug ---");
+
+    let has_nft_input = tx.ins.iter().any(|(_, v)| {
+        charm_values(&App { tag: NFT, identity: token_app.identity.clone(), vk: token_app.vk.clone() }, std::iter::once(v))
+            .next()
+            .is_some()
+    });
+
+    let has_token_input = tx.ins.iter().any(|(_, v)| {
+        charm_values(token_app, std::iter::once(v))
+            .next()
+            .is_some()
+    });
+
+    eprintln!("Has NFT input: {}", has_nft_input);
+    eprintln!("Has Token input: {}", has_token_input);
+
+    if has_nft_input {
+        eprintln!("✅ Detected NFT minting transaction");
+        return can_mint_token(token_app, tx);
+    }
+
+    if has_token_input {
+        eprintln!("✅ Detected Scroll settlement transaction");
+        return validate_scroll_release(token_app, tx);
+    }
+
+    eprintln!("❌ Error: Transaction has no valid NFT or Token inputs");
+    false
 }
 
-// --------------------------------------------------------------------------------
-// Token Minting Validation
-// --------------------------------------------------------------------------------
 fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
     eprintln!("\n--- [ZK-DEBUG] Token Mint Start ---");
-    
+
     let nft_app = App {
         tag: NFT,
         identity: token_app.identity.clone(),
@@ -235,9 +225,9 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
 
     if nft_inputs.is_empty() {
         eprintln!("❌ Error: No NFT found in inputs for ID: {}", nft_app.identity);
-        return false; 
+        return false;
     }
-    
+
     let nft_in = &nft_inputs[0];
     let incoming_supply = nft_in.remaining;
     eprintln!("✅ Incoming Supply: {}", incoming_supply);
@@ -250,7 +240,7 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
         eprintln!("❌ Error: No NFT found in outputs");
         return false;
     }
-    
+
     let nft_out = &nft_outputs[0];
     let outgoing_supply = nft_out.remaining;
     eprintln!("✅ Outgoing Supply: {}", outgoing_supply);
@@ -259,14 +249,14 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
         eprintln!("❌ Error: Supply increased ({} < {})", incoming_supply, outgoing_supply);
         return false;
     }
-    
+
     let tokens_to_mint = incoming_supply - outgoing_supply;
 
     let input_tokens = match sum_token_amount(token_app, tx.ins.iter().map(|(_, v)| v)) {
         Ok(amount) => amount,
         Err(_) => 0,
     };
-    
+
     let output_tokens = match sum_token_amount(token_app, tx.outs.iter()) {
         Ok(amount) => amount,
         Err(_) => {
@@ -274,13 +264,13 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
             return false;
         }
     };
-    
+
     let tokens_created = output_tokens - input_tokens;
 
     eprintln!("📊 Created: {}, Expected: {}", tokens_created, tokens_to_mint);
 
     if tokens_created != tokens_to_mint {
-        eprintln!("❌ Error: Supply math mismatch (created={}, expected={})", 
+        eprintln!("❌ Error: Supply math mismatch (created={}, expected={})",
                   tokens_created, tokens_to_mint);
         return false;
     }
@@ -289,118 +279,381 @@ fn can_mint_token(token_app: &App, tx: &Transaction) -> bool {
     true
 }
 
-// --------------------------------------------------------------------------------
-// Hash Function (SHA256)
-// --------------------------------------------------------------------------------
+fn validate_scroll_release(token_app: &App, tx: &Transaction) -> bool {
+    eprintln!("\n--- [ZK-DEBUG] Scroll Release Validation Start ---");
+
+    eprintln!("[RUST-DEBUG] RAW TRANSACTION DATA:");
+    eprintln!("  tx.ins count: {}", tx.ins.len());
+    eprintln!("  tx.outs count: {}", tx.outs.len());
+    eprintln!("  tx.coin_outs count: {}", tx.coin_outs.as_ref().map(|c: &Vec<_>| c.len()).unwrap_or(0));
+
+    eprintln!("[RUST-DEBUG] CHECKING COIN_OUTS AMOUNTS:");
+    if let Some(coin_outs) = &tx.coin_outs {
+        for (i, coin) in coin_outs.iter().enumerate() {
+            eprintln!("  coin_outs[{}].amount: {}", i, coin.amount);
+        }
+    }
+
+    for (i, out) in tx.outs.iter().enumerate() {
+        eprintln!("  tx.outs[{}] debug: {:?}", i, out);
+    }
+
+    let token_inputs: Vec<Data> = charm_values(token_app, tx.ins.iter().map(|(_, v)| v))
+        .cloned()
+        .collect();
+
+    if token_inputs.is_empty() {
+        eprintln!("❌ Error: No Token inputs found for Scroll release");
+        return false;
+    }
+
+    eprintln!("✅ Found {} Token input(s) being spent", token_inputs.len());
+
+    eprintln!("[RUST-DEBUG] CHECKING TOKEN INPUTS:");
+    for (i, data) in token_inputs.iter().enumerate() {
+        if let Ok(val) = data.value::<u64>() {
+            eprintln!("  token_input[{}].value: {}", i, val);
+        }
+    }
+
+    let total_input_value: u64 = token_inputs.iter()
+        .filter_map(|data| data.value::<u64>().ok())
+        .sum();
+
+    eprintln!("💰 Total Token input value: {}", total_input_value);
+
+    let token_outputs: Vec<Data> = charm_values(token_app, tx.outs.iter())
+        .cloned()
+        .collect();
+
+    if token_outputs.is_empty() {
+        eprintln!("✅ No Token outputs - tokens are burned for salary payment");
+    } else {
+        eprintln!("✅ Found {} Token output(s)", token_outputs.len());
+
+        let total_output_value: u64 = token_outputs.iter()
+            .filter_map(|data| data.value::<u64>().ok())
+            .sum();
+
+        eprintln!("💰 Total Token output value: {}", total_output_value);
+
+        if total_output_value > 0 {
+            eprintln!("❌ Error: Settlement transaction cannot create new tokens (output={})", total_output_value);
+            return false;
+        }
+    }
+
+    let tokens_spent = total_input_value;
+    eprintln!("📊 Tokens spent in settlement: {}", tokens_spent);
+
+    let btc_outputs = tx.coin_outs.as_ref().map_or(0, |v| v.len());
+
+    eprintln!("💰 BTC outputs in settlement: {}", btc_outputs);
+
+    if btc_outputs == 0 {
+        eprintln!("❌ Error: Scroll release must include BTC outputs (salary, fees)");
+        return false;
+    }
+
+    eprintln!("✅ Scroll release validation passed!");
+    true
+}
+
 pub(crate) fn hash(data: &str) -> B32 {
     let hash = Sha256::digest(data);
     B32(hash.into())
 }
 
-// --------------------------------------------------------------------------------
-// WASM Bridge Functions for Strict Type-Marshalling
-// This replaces the find-and-replace logic with typed marshalling
-// Handles both NFT creation and Batch Hiring by converting JS strings into SDK binary types
-// --------------------------------------------------------------------------------
-
 #[cfg(feature = "wasm-bridge")]
 #[wasm_bindgen]
 pub fn process_spell_template(_template_yaml: &str, variables_json: &str) -> Result<String, JsValue> {
-    // 1. Parse the typed variables from Node.js
     let vars: BridgeVariables = serde_json::from_str(variables_json)
         .map_err(|e| JsValue::from_str(&format!("Input Parse Error: {}", e)))?;
 
-    // 2. Marshall Binary Types (Solves "expected bytes" error)
-    // Convert string UTXOs to UtxoId (binary type)
-    let anchor_id = UtxoId::from_str(&vars.anchor_utxo)
-        .map_err(|_| JsValue::from_str("Invalid anchor UTXO format. Expected 'txid:vout'"))?;
-    
-    let funding_id = UtxoId::from_str(&vars.funding_utxo)
-        .map_err(|_| JsValue::from_str("Invalid funding UTXO format. Expected 'txid:vout'"))?;
-    
-    // Convert hex destination string to bytes
+    eprintln!("[RUST-DEBUG] process_spell_template called with type_name: {}", vars.type_name);
+
     let treasury_dest = hex::decode(&vars.treasury_dest)
         .map_err(|_| JsValue::from_str("Invalid treasury dest hex string"))?;
 
-    // 3. Parse numeric values from strings
-    let remaining = vars.remaining.parse::<u64>()
-        .map_err(|_| JsValue::from_str("Invalid remaining: must be a number"))?;
-    
-    let scroll_policy = vars.scroll_policy.parse::<u8>()
-        .map_err(|_| JsValue::from_str("Invalid scrollPolicy: must be 0 or 1"))?;
-    
-    let pay_period_seconds = vars.pay_period_seconds.parse::<u64>()
-        .map_err(|_| JsValue::from_str("Invalid payPeriodSeconds: must be a number"))?;
-    
-    let compensation_sats = vars.compensation_sats.parse::<u64>()
-        .map_err(|_| JsValue::from_str("Invalid compensationSats: must be a number"))?;
-
-    // 4. Build Typed Outputs (Solves "expected integer" error)
     let mut outs = Vec::new();
-    
+    let mut coins = Vec::new();
+    let mut ins = Vec::new();
+
     if vars.type_name == "mint-nft" {
-        // Single NFT output
+        let anchor_utxo = vars.anchor_utxo.as_ref()
+            .ok_or_else(|| JsValue::from_str("anchor_utxo required for mint-nft"))?;
+        let anchor_id = UtxoId::from_str(anchor_utxo)
+            .map_err(|_| JsValue::from_str("Invalid anchor UTXO format"))?;
+
+        let funding_id = UtxoId::from_str(&vars.funding_utxo)
+            .map_err(|_| JsValue::from_str("Invalid funding UTXO format"))?;
+
+        ins = vec![anchor_id, funding_id];
+
+        let remaining = vars.remaining.as_ref()
+            .ok_or_else(|| JsValue::from_str("remaining required for mint-nft"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid remaining"))?;
+
+        let scroll_policy = vars.scroll_policy.as_ref()
+            .ok_or_else(|| JsValue::from_str("scroll_policy required for mint-nft"))?
+            .parse::<u8>()
+            .map_err(|_| JsValue::from_str("Invalid scrollPolicy"))?;
+
+        let pay_period_seconds = vars.pay_period_seconds.as_ref()
+            .ok_or_else(|| JsValue::from_str("pay_period_seconds required for mint-nft"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid payPeriodSeconds"))?;
+
+        let compensation_sats = vars.compensation_sats.as_ref()
+            .ok_or_else(|| JsValue::from_str("compensation_sats required for mint-nft"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid compensationSats"))?;
+
+        let ticker = vars.ticker.as_ref()
+            .ok_or_else(|| JsValue::from_str("ticker required for mint-nft"))?;
+
+        let metadata_hash = vars.metadata_hash.as_ref()
+            .ok_or_else(|| JsValue::from_str("metadata_hash required for mint-nft"))?;
+
         outs.push(serde_json::json!({
             "0": {
-                "ticker": vars.ticker,
+                "ticker": ticker,
                 "remaining": remaining,
-                "metadataHash": vars.metadata_hash,
+                "metadataHash": metadata_hash,
                 "scrollPolicy": scroll_policy,
                 "payPeriodSeconds": pay_period_seconds,
                 "compensationSats": compensation_sats
             }
         }));
-    } else {
-        // Handle Batch Hiring: M workers + 1 NFT return
-        // Worker outputs use key "1" (fungible token output)
-        if let (Some(dests), Some(amounts)) = (vars.worker_dests, vars.token_amounts) {
+
+        coins.push(serde_json::json!({
+            "amount": 1000,
+            "dest": treasury_dest
+        }));
+
+    } else if vars.type_name == "mint-token" {
+        let anchor_utxo = vars.anchor_utxo.as_ref()
+            .ok_or_else(|| JsValue::from_str("anchor_utxo required for mint-token"))?;
+        let anchor_id = UtxoId::from_str(anchor_utxo)
+            .map_err(|_| JsValue::from_str("Invalid anchor UTXO format"))?;
+
+        let funding_id = UtxoId::from_str(&vars.funding_utxo)
+            .map_err(|_| JsValue::from_str("Invalid funding UTXO format"))?;
+
+        ins = vec![anchor_id, funding_id];
+
+        let remaining = vars.remaining.as_ref()
+            .ok_or_else(|| JsValue::from_str("remaining required for mint-token"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid remaining"))?;
+
+        let scroll_policy = vars.scroll_policy.as_ref()
+            .ok_or_else(|| JsValue::from_str("scroll_policy required for mint-token"))?
+            .parse::<u8>()
+            .map_err(|_| JsValue::from_str("Invalid scrollPolicy"))?;
+
+        let pay_period_seconds = vars.pay_period_seconds.as_ref()
+            .ok_or_else(|| JsValue::from_str("pay_period_seconds required for mint-token"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid payPeriodSeconds"))?;
+
+        let compensation_sats = vars.compensation_sats.as_ref()
+            .ok_or_else(|| JsValue::from_str("compensation_sats required for mint-token"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid compensationSats"))?;
+
+        let ticker = vars.ticker.as_ref()
+            .ok_or_else(|| JsValue::from_str("ticker required for mint-token"))?;
+
+        let metadata_hash = vars.metadata_hash.as_ref()
+            .ok_or_else(|| JsValue::from_str("metadata_hash required for mint-token"))?;
+
+        if let (Some(dests_json), Some(amounts_json)) = (vars.worker_dests, vars.token_amounts) {
+            let dests: Vec<String> = dests_json;
+            let amounts: Vec<String> = amounts_json;
+
             if dests.len() != amounts.len() {
                 return Err(JsValue::from_str("worker_dests and token_amounts length mismatch"));
             }
+
             for (i, amount_str) in amounts.iter().enumerate() {
                 let amount = amount_str.parse::<u64>()
-                    .map_err(|_| JsValue::from_str(&format!("Invalid token amount at index {}: must be a number", i)))?;
+                    .map_err(|_| JsValue::from_str(&format!("Invalid token amount at index {}", i)))?;
                 outs.push(serde_json::json!({ "1": amount }));
+
+                let dest_bytes = hex::decode(&dests[i])
+                    .unwrap_or_else(|_| dests[i].as_bytes().to_vec());
+                coins.push(serde_json::json!({
+                    "amount": 1000,
+                    "dest": dest_bytes
+                }));
             }
         }
-        
-        // NFT return output uses key "0" (authority NFT output)
+
         outs.push(serde_json::json!({
             "0": {
-                "ticker": vars.ticker,
+                "ticker": ticker,
                 "remaining": remaining,
-                "metadataHash": vars.metadata_hash,
+                "metadataHash": metadata_hash,
                 "scrollPolicy": scroll_policy,
                 "payPeriodSeconds": pay_period_seconds,
                 "compensationSats": compensation_sats
             }
         }));
+
+    } else if vars.type_name == "scroll-release" {
+        let authority_utxos = if let Some(utxos) = &vars.authority_utxos {
+            utxos.clone()
+        } else if let Some(utxo) = &vars.authority_utxo {
+            vec![utxo.clone()]
+        } else {
+            return Err(JsValue::from_str("authority_utxos or authority_utxo required for scroll-release"));
+        };
+
+        let mut ins = Vec::new();
+        for utxo_str in &authority_utxos {
+            let utxo_id = UtxoId::from_str(utxo_str)
+                .map_err(|_| JsValue::from_str("Invalid authority UTXO format"))?;
+            ins.push(utxo_id);
+        }
+
+        let funding_id = UtxoId::from_str(&vars.funding_utxo)
+            .map_err(|_| JsValue::from_str("Invalid funding UTXO format"))?;
+        ins.push(funding_id);
+
+        let salary_utxo = vars.salary_utxo.as_ref()
+            .ok_or_else(|| JsValue::from_str("salary_utxo required for scroll-release"))?;
+        let salary_id = UtxoId::from_str(salary_utxo)
+            .map_err(|_| JsValue::from_str("Invalid salary UTXO format"))?;
+        ins.push(salary_id);
+
+        eprintln!("[RUST-DEBUG] scroll-release with {} authority UTXOs", authority_utxos.len());
+
+        let worker_dests = vars.worker_dests.unwrap_or_default();
+        let token_amounts = vars.token_amounts.unwrap_or_default();
+
+        eprintln!("[RUST-DEBUG] scroll-release branch executing with {} workers", worker_dests.len());
+
+        if worker_dests.len() != token_amounts.len() {
+            return Err(JsValue::from_str("worker_dests and token_amounts length mismatch"));
+        }
+
+        let platform_fee_address = "tb1psthmf4f2hk29er4gfx94qn4dd25y2xa0gg6tm".to_string();
+        let platform_fee_bytes = hex::decode(&platform_fee_address)
+            .unwrap_or_else(|_| platform_fee_address.as_bytes().to_vec());
+
+        let scroll_fee_address = "tb1psthmf4f2hk29er4gfx94qn4dd25y2xa0gg6tm".to_string();
+        let scroll_fee_bytes = hex::decode(&scroll_fee_address)
+            .unwrap_or_else(|_| scroll_fee_address.as_bytes().to_vec());
+
+        let scroll_fee_amount = 895u64;
+
+        let mut total_salary = 0u64;
+
+        for i in 0..authority_utxos.len() {
+            outs.push(serde_json::json!({}));
+
+            let amount = token_amounts[i].parse::<u64>()
+                .map_err(|_| JsValue::from_str(&format!("Invalid salary amount at index {}", i)))?;
+            total_salary += amount;
+
+            let dest_bytes = hex::decode(&worker_dests[i])
+                .unwrap_or_else(|_| worker_dests[i].as_bytes().to_vec());
+            coins.push(serde_json::json!({
+                "amount": amount,
+                "dest": dest_bytes
+            }));
+        }
+
+        let platform_fee = total_salary / 100;
+        outs.push(serde_json::json!({}));
+        if platform_fee > 0 {
+            coins.push(serde_json::json!({
+                "amount": platform_fee,
+                "dest": platform_fee_bytes
+            }));
+        }
+
+        outs.push(serde_json::json!({}));
+        coins.push(serde_json::json!({
+            "amount": scroll_fee_amount,
+            "dest": scroll_fee_bytes
+        }));
+
+        let remaining = vars.remaining.as_ref()
+            .ok_or_else(|| JsValue::from_str("remaining required for scroll-release"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid remaining"))?;
+
+        let scroll_policy = vars.scroll_policy.as_ref()
+            .ok_or_else(|| JsValue::from_str("scroll_policy required for scroll-release"))?
+            .parse::<u8>()
+            .map_err(|_| JsValue::from_str("Invalid scrollPolicy"))?;
+
+        let pay_period_seconds = vars.pay_period_seconds.as_ref()
+            .ok_or_else(|| JsValue::from_str("pay_period_seconds required for scroll-release"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid payPeriodSeconds"))?;
+
+        let compensation_sats = vars.compensation_sats.as_ref()
+            .ok_or_else(|| JsValue::from_str("compensation_sats required for scroll-release"))?
+            .parse::<u64>()
+            .map_err(|_| JsValue::from_str("Invalid compensationSats"))?;
+
+        let ticker = vars.ticker.as_ref()
+            .ok_or_else(|| JsValue::from_str("ticker required for scroll-release"))?;
+
+        let metadata_hash = vars.metadata_hash.as_ref()
+            .ok_or_else(|| JsValue::from_str("metadata_hash required for scroll-release"))?;
+
+        outs.push(serde_json::json!({
+            "0": {
+                "ticker": ticker,
+                "remaining": remaining,
+                "metadataHash": metadata_hash,
+                "scrollPolicy": scroll_policy,
+                "payPeriodSeconds": pay_period_seconds,
+                "compensationSats": compensation_sats
+            }
+        }));
+
+        let nft_dest = hex::decode(&vars.treasury_dest)
+            .map_err(|_| JsValue::from_str("Invalid NFT destination"))?;
+        coins.push(serde_json::json!({
+            "amount": 1000,
+            "dest": nft_dest
+        }));
+
+        let has_treasury_change = vars.has_treasury_change.unwrap_or(false);
+        if has_treasury_change {
+            outs.push(serde_json::json!({}));
+            let change_dest = hex::decode(&vars.treasury_dest)
+                .map_err(|_| JsValue::from_str("Invalid change destination"))?;
+            coins.push(serde_json::json!({
+                "amount": 0,
+                "dest": change_dest
+            }));
+        }
     }
 
-    // 5. Generate Final Marshall Object
     let spell = serde_json::json!({
         "version": 11,
         "tx": {
-            "ins": [anchor_id, funding_id],
+            "ins": ins,
             "outs": outs,
-            "coins": [{
-                "amount": 1000,
-                "dest": treasury_dest
-            }]
+            "coins": coins
         },
         "app_public_inputs": {
-            format!("n/{}/{}", vars.app_id, vars.app_vk): serde_json::Value::Null
+            format!("n/{}/{}", vars.app_id, vars.app_vk): serde_json::Value::Null,
+            format!("t/{}/{}", vars.app_id, vars.app_vk): serde_json::Value::Null
         }
     });
 
-    // 6. Serialize to JSON string for return to Node.js
     serde_json::to_string(&spell)
         .map_err(|e| JsValue::from_str(&format!("Serialization Error: {}", e)))
 }
 
-// --------------------------------------------------------------------------------
-// Tests
-// --------------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,7 +672,7 @@ mod tests {
     #[test]
     fn test_nft_content_validation() {
         let test_hash = "f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa";
-        
+
         let valid = NftContent {
             ticker: "CHARMS-PAY".to_string(),
             remaining: 1,
@@ -474,7 +727,7 @@ mod tests {
     #[test]
     fn test_nft_content_serialization() {
         let test_hash = "f54f6d40bd4ba808b188963ae5d72769ad5212dd1d29517ecc4063dd9f033faa";
-        
+
         let content = NftContent {
             ticker: "CHARMS-PAY".to_string(),
             remaining: 1,
@@ -487,7 +740,7 @@ mod tests {
         let serialized = serde_json::to_string(&content).unwrap();
         let deserialized: NftContent = serde_json::from_str(&serialized).unwrap();
         assert_eq!(content, deserialized);
-        
+
         assert!(serialized.contains("\"metadataHash\""));
         assert!(serialized.contains("\"scrollPolicy\""));
         assert!(serialized.contains("\"payPeriodSeconds\""));
@@ -516,37 +769,33 @@ mod tests {
             "app_id": "app123",
             "app_vk": "vk456"
         }"#;
-        
+
         let vars: BridgeVariables = serde_json::from_str(json).unwrap();
         assert_eq!(vars.type_name, "mint-nft");
-        assert_eq!(vars.anchor_utxo, "abc123:0");
-        assert_eq!(vars.ticker, "TEST-PAY");
-        assert_eq!(vars.remaining, "100");
+        assert_eq!(vars.anchor_utxo, Some("abc123:0".to_string()));
+        assert_eq!(vars.ticker, Some("TEST-PAY".to_string()));
     }
 
     #[cfg(feature = "wasm-bridge")]
     #[test]
-    fn test_bridge_variables_with_workers() {
+    fn test_scroll_release_variables() {
         let json = r#"{
-            "type_name": "mint-token",
-            "anchor_utxo": "abc123:0",
+            "type_name": "scroll-release",
+            "authority_utxo": "abc123:0",
             "funding_utxo": "def456:1",
-            "ticker": "TEST-PAY",
-            "remaining": "97",
-            "metadata_hash": "hash123",
-            "scroll_policy": "0",
-            "pay_period_seconds": "1209600",
-            "compensation_sats": "1000",
+            "salary_utxo": "ghi789:2",
             "treasury_dest": "5120abc",
             "app_id": "app123",
             "app_vk": "vk456",
-            "worker_dests": ["addr1", "addr2", "addr3"],
-            "token_amounts": ["1", "1", "1"]
+            "worker_dests": ["tb1addr1", "tb1addr2"],
+            "token_amounts": ["1000", "2000"]
         }"#;
-        
+
         let vars: BridgeVariables = serde_json::from_str(json).unwrap();
-        assert_eq!(vars.type_name, "mint-token");
-        assert_eq!(vars.worker_dests.as_ref().unwrap().len(), 3);
-        assert_eq!(vars.token_amounts.as_ref().unwrap().len(), 3);
+        assert_eq!(vars.type_name, "scroll-release");
+        assert_eq!(vars.authority_utxo, Some("abc123:0".to_string()));
+        assert_eq!(vars.salary_utxo, Some("ghi789:2".to_string()));
+        assert_eq!(vars.worker_dests, Some(vec!["tb1addr1".to_string(), "tb1addr2".to_string()]));
+        assert_eq!(vars.token_amounts, Some(vec!["1000".to_string(), "2000".to_string()]));
     }
 }

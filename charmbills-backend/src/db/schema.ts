@@ -13,9 +13,9 @@ export interface PlanCache {
   metadataHash: string;
   scrollPolicy: ScrollPolicyType | number;
   remaining: number;
-  vaultAddress?: string;  // ADDED: Isolated vault address for this plan (for indexer tracking)
+  vaultAddress?: string;
   lastIndexedBlock?: number;
-  status: 'pending' | 'active' | 'failed';  // 👈 ADDED: State tracking for on-chain confirmation
+  status: 'pending' | 'active' | 'failed';
   createdAt: string;
   updatedAt: string;
 }
@@ -25,7 +25,7 @@ export interface WorkerCache {
   name?: string;
   planId: string;
   engagementType: EngagementType;
-  status: 'active' | 'terminated' | 'pending' | 'minting_pending';  // 👈 ADDED 'minting_pending' for in-flight minting
+  status: 'active' | 'terminated' | 'pending' | 'minting_pending';
   lastMintedPeriod: string;
   currentTokenUtxo?: string;
   expiresAt?: string;
@@ -33,15 +33,14 @@ export interface WorkerCache {
   role: string;
   metadataHash: string;
   updatedAt: string;
-  // ADDED: For Payment History Audit Trail [16]
-  historicalTokens: string; // JSON stringified array of spent UTXO IDs
+  historicalTokens: string;
 }
 
 export interface CompanyRecord {
   employerAddress: string;
   treasuryAddress: string;
   treasuryHexDest: string;
-  vaultAddress: string;  // ADDED: Unified company Scroll vault
+  vaultAddress: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -53,7 +52,6 @@ export interface LockedUtxo {
   expiresAt: string;
 }
 
-// Database setup for Turso
 export async function initDatabase(db: any): Promise<void> {
   console.log('[DB INIT] Creating database tables...');
   
@@ -144,7 +142,6 @@ export async function initDatabase(db: any): Promise<void> {
         updatedAt TEXT NOT NULL
     )`,
     
-    // Indexes
     `CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status)`,
     `CREATE INDEX IF NOT EXISTS idx_workers_plan ON workers(planId)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_ticker ON plans(ticker)`,
@@ -152,7 +149,7 @@ export async function initDatabase(db: any): Promise<void> {
     `CREATE INDEX IF NOT EXISTS idx_plans_nftUtxo ON plans(nftUtxoId)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_remaining ON plans(remaining)`,
     `CREATE INDEX IF NOT EXISTS idx_plans_vaultAddress ON plans(vaultAddress)`,
-    `CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status)`,  // 👈 ADDED: Index for status queries
+    `CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status)`,
     `CREATE INDEX IF NOT EXISTS idx_locked_utxos_employer ON locked_utxos(employerAddress)`,
     `CREATE INDEX IF NOT EXISTS idx_locked_utxos_expires ON locked_utxos(expiresAt)`,
     `CREATE INDEX IF NOT EXISTS idx_ipfs_hash ON ipfs_mappings(metadataHash)`,
@@ -177,10 +174,6 @@ export async function initDatabase(db: any): Promise<void> {
   
   console.log('[DB INIT] Database initialization complete');
 }
-
-// ============================================================
-// COMPANY HELPERS
-// ============================================================
 
 export async function saveCompanyConfig(
   db: any,
@@ -235,10 +228,6 @@ export async function deleteCompany(
   });
   console.log(`[SCHEMA] ✅ Company deleted`);
 }
-
-// ============================================================
-// UTXO LOCK HELPERS
-// ============================================================
 
 export async function lockUtxo(
   db: any,
@@ -307,10 +296,6 @@ export async function getLockedUtxosForEmployer(
   return result.rows || [];
 }
 
-// ============================================================
-// PLAN HELPERS
-// ============================================================
-
 export async function savePlanRecord(
   db: any,
   plan: PlanCache
@@ -320,9 +305,9 @@ export async function savePlanRecord(
   await db.execute({
     sql: `INSERT OR REPLACE INTO plans 
           (appId, nftUtxoId, ticker, employerAddress, department, 
-           payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
+           payPeriodSeconds, compensationSats, metadataHash, scrollPolicy, remaining, 
            vaultAddress, lastIndexedBlock, status, createdAt, updatedAt)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       plan.appId,
       plan.nftUtxoId,
@@ -330,6 +315,7 @@ export async function savePlanRecord(
       plan.employerAddress,
       plan.department || null,
       plan.payPeriodSeconds,
+      plan.compensationSats,
       plan.metadataHash,
       plan.scrollPolicy,
       plan.remaining,
@@ -412,14 +398,6 @@ export async function updatePlanLastIndexedBlock(
   });
 }
 
-/**
- * ADDED: Update Plan Status for on-chain confirmation tracking
- * This allows distinguishing between "intended" (pending) and "confirmed" (active) assets
- * 
- * @param db - Database connection
- * @param appId - Plan appId
- * @param status - New status ('active' for confirmed, 'failed' for failed)
- */
 export async function updatePlanStatus(
   db: any,
   appId: string,
@@ -432,10 +410,6 @@ export async function updatePlanStatus(
   });
   console.log(`[SCHEMA] ✅ Plan status updated`);
 }
-
-// ============================================================
-// WORKER HELPERS
-// ============================================================
 
 export async function saveWorkerRecord(
   db: any,
@@ -529,11 +503,6 @@ export async function updateWorkerMetadata(
   });
 }
 
-/**
- * ADDED: Targeted update for post-mint worker record
- * This preserves the worker's name and role from the registry
- * Only updates status, token UTXO, expiry, and last minted period
- */
 export async function updateWorkerPostMint(
   db: any,
   walletAddress: string,
@@ -565,10 +534,6 @@ export async function updateWorkerPostMint(
   console.log(`[SCHEMA] ✅ Worker post-mint update complete`);
 }
 
-/**
- * Add a spent token UTXO to worker's historicalTokens audit trail
- * Used for Payment History feature
- */
 export async function addHistoricalToken(
   db: any,
   walletAddress: string,
@@ -576,7 +541,6 @@ export async function addHistoricalToken(
   spentUtxo: string,
   timestamp: number
 ): Promise<void> {
-  // First get current historicalTokens
   const result = await db.execute({
     sql: 'SELECT historicalTokens FROM workers WHERE walletAddress = ? AND planId = ?',
     args: [walletAddress, planId]
@@ -592,28 +556,18 @@ export async function addHistoricalToken(
     }
   }
   
-  // Add new entry
   history.push({
     utxoId: spentUtxo,
     timestamp: timestamp,
     spentAt: new Date().toISOString()
   });
   
-  // Update the record
   await db.execute({
     sql: 'UPDATE workers SET historicalTokens = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
     args: [JSON.stringify(history), new Date().toISOString(), walletAddress, planId]
   });
 }
 
-// ============================================================
-// AUDIT LOG HELPERS
-// ============================================================
-
-/**
- * Save an audit log entry for on-chain transaction tracking
- * Used to maintain a derivable audit trail from the blockchain
- */
 export async function saveAuditLog(
   db: any,
   id: string,
@@ -630,9 +584,6 @@ export async function saveAuditLog(
   });
 }
 
-/**
- * Update audit log status when transaction is confirmed
- */
 export async function updateAuditLogStatus(
   db: any,
   id: string,
@@ -644,9 +595,6 @@ export async function updateAuditLogStatus(
   });
 }
 
-/**
- * Get audit logs for a specific type or time range
- */
 export async function getAuditLogs(
   db: any,
   type?: string,
@@ -667,10 +615,6 @@ export async function getAuditLogs(
   const result = await db.execute({ sql, args });
   return result.rows || [];
 }
-
-// ============================================================
-// IPFS MAPPING HELPERS
-// ============================================================
 
 export async function saveIpfsMapping(
   db: any,

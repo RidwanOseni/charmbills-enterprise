@@ -1,6 +1,6 @@
 // Core Protocol Constants
-export const HARDCODED_APP_VK = "496d1661bb0fe62eb9fc49ae1956e9b45b01dfb5a8e4201333b1562c2fad5296";
-export const PROVER_API_URL = "https://v12.charms.dev/spells/prove";
+export const HARDCODED_APP_VK = "cf9522ef0acf81c12488b45dd127ff5c93b3b2acb7d547311870c8b46ae92d4c";
+export const PROVER_API_URL = "https://v14.charms.dev/spells/prove";
 export const DEFAULT_FEE_RATE = 2;
 export const MIN_OUTPUT_SATS = 1000;
 
@@ -26,7 +26,7 @@ export const SECONDS_PER_BIWEEK = 1209600;      // 2 weeks
 export const SECONDS_PER_MONTH = 2592000;        // 30 days
 
 // Demo Mode Constants (for investor presentation)
-export const DEMO_SECONDS_PER_PERIOD = 14400;       // 1 minute = 1 pay period for demo
+export const DEMO_SECONDS_PER_PERIOD = 240;       // 4 minute = 1 pay period for demo
 
 // Multi-signature Defaults
 export const DEFAULT_MULTISIG_THRESHOLD = 2;     // 2-of-3 default
@@ -40,7 +40,7 @@ export const PINATA_API_URL = "https://api.pinata.cloud/pinning/pinJSONToIPFS";
 export const ENCRYPTION_VERSION = "1.0";
 export const AES_256_GCM_IV_LENGTH = 12; // bytes
 
-export const PAYROLL_AUTH_MESSAGE = "CharmsPay Payroll Authorization";
+// export const PAYROLL_AUTH_MESSAGE = "CharmsPay Payroll Authorization";
 
 // For indexer
 export const DEFAULT_RPC_URL = "http://localhost:8332";

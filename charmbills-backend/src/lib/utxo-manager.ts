@@ -19,7 +19,7 @@ const MIN_CONFIRMATIONS = process.env.UTXO_MIN_CONFIRMATIONS
 
 // Retry configuration for API calls
 const MAX_RETRIES = 3;
-const BASE_TIMEOUT = 30000; // Increased to 30 seconds for production
+const BASE_TIMEOUT = 100000; // Increased to 30 seconds for production
 
 // --------------------------------------------------------------------------------
 // Types
@@ -395,7 +395,7 @@ export async function fetchTransactionHex(txid: string): Promise<string> {
     console.log(`[UTXO Manager] Fetching hex for tx ${txid.substring(0, 8)}...`);
     
     const response = await axios.get(`${MEMPOOL_API}/tx/${txid}/hex`, {
-      timeout: 10000,
+      timeout: 100000,
       responseType: 'text'
     });
     
@@ -443,13 +443,16 @@ export async function verifyUtxoStatus(utxoId: string): Promise<UtxoStatus> {
     
     // Check if UTXO is spent using outspend endpoint
     const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`, {
-      timeout: 10000
+      timeout: 100000
     });
     
     // Fetch transaction details to check confirmation status
     const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`, {
-      timeout: 10000
+      timeout: 100000
     });
+
+    console.log(`[UTXO Manager] DEBUG - outspend response:`, outspendResponse.data);
+    console.log(`[UTXO Manager] DEBUG - tx response:`, txResponse.data);
     
     const isSpent = outspendResponse.data.spent === true;
     const isConfirmed = txResponse.data.status?.confirmed === true;

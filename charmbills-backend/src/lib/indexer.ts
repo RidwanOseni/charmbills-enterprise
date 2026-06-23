@@ -211,6 +211,13 @@ interface MatureWorker {
   vaultAddress: string;
   treasuryHexDest: string;
   treasuryAddress: string;
+  anchorUtxo: string;
+  ticker: string;
+  remaining: number;
+  metadataHash: string;
+  scrollPolicy: number;
+  payPeriodSeconds: number;
+  compensationSats: number;
 }
 
 // =========================================================================
@@ -955,6 +962,8 @@ export class DerivableIndexer {
     
     let nftMetadata = null;
     let nftUtxoId = null;
+    let hasWorkerTokens = false;
+    let activatedWorkerCount = 0;
     
     let anchorUtxo: string | null = null;
     if (spell.tx && spell.tx.ins && Array.isArray(spell.tx.ins) && spell.tx.ins.length > 0) {
@@ -1009,7 +1018,6 @@ export class DerivableIndexer {
           console.log(`[INDEXER]   📝 Map keys at output ${outputIndex}:`, Array.from(outputMap.keys()));
           
           for (const [appIndex, appData] of outputMap.entries()) {
-
             console.log(`[INDEXER]   🔍 App Index ${appIndex}: appData type = ${typeof appData}, is Map = ${appData instanceof Map}, value = ${appData}`);
             
             if (appData instanceof Map) {
@@ -1051,6 +1059,60 @@ export class DerivableIndexer {
               }
             } else if (typeof appData === 'number') {
               console.log(`[INDEXER]   💎 Found Worker Token at output ${outputIndex}, app ${appIndex} | Amount: ${appData}`);
+              hasWorkerTokens = true;
+              
+              const coin = spell.tx?.coins?.[outputIndex];
+              if (coin && coin.dest) {
+                let walletAddress = '';
+                if (coin.dest instanceof Uint8Array) {
+                  walletAddress = Buffer.from(coin.dest).toString('hex');
+                } else if (typeof coin.dest === 'string') {
+                  walletAddress = coin.dest;
+                }
+                
+                console.log(`[INDEXER]   👤 Worker dest hex: ${walletAddress.substring(0, 30)}...`);
+                
+                const pendingWorker = await this.dbGet(
+                  `SELECT walletAddress FROM workers 
+                   WHERE planId = ? AND status = 'minting_pending' 
+                   LIMIT 1`,
+                  [appId]
+                );
+                
+                if (pendingWorker && pendingWorker.walletAddress) {
+                  const tokenUtxo = `${txid}:${outputIndex}`;
+                  const lastMintedPeriod = new Date().toISOString();
+                  
+                  let payPeriodSeconds = 14400;
+                  try {
+                    const planResult = await this.dbGet('SELECT payPeriodSeconds FROM plans WHERE appId = ?', [appId]);
+                    if (planResult && planResult.payPeriodSeconds) {
+                      payPeriodSeconds = planResult.payPeriodSeconds;
+                    }
+                  } catch (err) {
+                    console.warn(`[INDEXER]   ⚠️ Could not fetch payPeriodSeconds, using default 14400`);
+                  }
+                  
+                  const blocksPerPeriod = Math.floor(payPeriodSeconds / 600);
+                  const expiresAtBlock = blockHeight + blocksPerPeriod;
+                  
+                  console.log(`[INDEXER]   📝 Activating worker ${pendingWorker.walletAddress.substring(0, 16)}... with token UTXO: ${tokenUtxo}`);
+                  console.log(`[INDEXER]   📅 Token expires at block: ${expiresAtBlock}`);
+                  
+                  await this.updateWorkerPostMint(
+                    pendingWorker.walletAddress,
+                    appId,
+                    tokenUtxo,
+                    expiresAtBlock,
+                    lastMintedPeriod
+                  );
+                  activatedWorkerCount++;
+                } else {
+                  console.log(`[INDEXER]   ⚠️ No pending worker found for token output at index ${outputIndex}`);
+                }
+              } else {
+                console.warn(`[INDEXER]   ⚠️ No coin dest found for output ${outputIndex}`);
+              }
             } else {
               console.log(`[INDEXER]   ⚠️ App metadata at index ${appIndex} is not a Map or Number, type: ${appData?.constructor?.name}`);
             }
@@ -1144,39 +1206,76 @@ export class DerivableIndexer {
     }
     console.log(`[INDEXER]   🏢 Employer Address: ${employerAddress.substring(0, 20)}...`);
     
-    await this.dbRun(`
-      INSERT OR REPLACE INTO plans (
-        appId, nftUtxoId, anchorUtxo, employerAddress, ticker, compensationSats, 
-        payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
-        status, lastIndexedBlock, createdAt, updatedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      appId,
-      nftUtxoId,
-      anchorUtxo || '',
-      employerAddress,
-      ticker,
-      compensationSats || 0,
-      payPeriodSeconds || 0,
-      metadataHash || '',
-      scrollPolicy || 0,
-      remaining || 0,
-      'active',
-      blockHeight,
-      new Date().toISOString(),
-      new Date().toISOString()
-    ]);
+        // Check if plan already exists to preserve anchorUtxo
+        const existingPlanRecord = await this.dbGet('SELECT anchorUtxo FROM plans WHERE appId = ?', [appId]);
+    
+        if (existingPlan) {
+          // Update only mutable fields, preserve anchorUtxo
+          await this.dbRun(`
+            UPDATE plans SET 
+              nftUtxoId = ?,
+              remaining = ?,
+              status = 'active',
+              lastIndexedBlock = ?,
+              updatedAt = ?
+            WHERE appId = ?
+          `, [nftUtxoId, remaining, blockHeight, new Date().toISOString(), appId]);
+          console.log(`[INDEXER]   ✅ Plan record updated (preserved anchorUtxo: ${existingPlan.anchorUtxo})`);
+        } else {
+          // First time seeing this plan - INSERT all fields including anchorUtxo
+          await this.dbRun(`
+            INSERT INTO plans (
+              appId, nftUtxoId, anchorUtxo, employerAddress, ticker, compensationSats, 
+              payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
+              status, lastIndexedBlock, createdAt, updatedAt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
+            appId,
+            nftUtxoId,
+            anchorUtxo || '',
+            employerAddress,
+            ticker,
+            compensationSats || 0,
+            payPeriodSeconds || 0,
+            metadataHash || '',
+            scrollPolicy || 0,
+            remaining || 0,
+            'active',
+            blockHeight,
+            new Date().toISOString(),
+            new Date().toISOString()
+          ]);
+          console.log(`[INDEXER]   ✅ New plan record inserted with anchorUtxo: ${anchorUtxo}`);
+        }
     
     console.log(`[INDEXER]   ✅ Plan record saved to database with status 'active'`);
     
-    await this.createAuditLog(
-      crypto.randomUUID(),
-      'PLAN_CREATED',
-      `Plan NFT created: ${ticker}`,
-      txid,
-      'confirmed'
-    );
-    console.log(`[INDEXER]   ✅ Audit log created for Plan NFT: ${ticker}`);
+    // Create BATCH_MINT audit log if workers were activated
+    if (hasWorkerTokens && activatedWorkerCount > 0) {
+      const auditId = crypto.randomUUID();
+      await this.createAuditLog(
+        auditId,
+        'BATCH_MINT',
+        `Batch mint confirmed at block ${blockHeight} for ${activatedWorkerCount} workers`,
+        txid,
+        'confirmed'
+      );
+      console.log(`[INDEXER]   ✅ BATCH_MINT audit log created for ${activatedWorkerCount} workers`);
+    }
+    
+    // Only create PLAN_CREATED audit log if this is NOT a token mint transaction
+    if (!hasWorkerTokens) {
+      await this.createAuditLog(
+        crypto.randomUUID(),
+        'PLAN_CREATED',
+        `Plan NFT created: ${ticker}`,
+        txid,
+        'confirmed'
+      );
+      console.log(`[INDEXER]   ✅ Audit log created for Plan NFT: ${ticker}`);
+    } else {
+      console.log(`[INDEXER]   ℹ️ Skipping PLAN_CREATED audit log (token mint transaction - plan updated only)`);
+    }
     
     if (metadataHash) {
       try {
@@ -1196,12 +1295,6 @@ export class DerivableIndexer {
     }
     
     return true;
-  }
-
-  private async enrichPlanWithMetadata(appId: string, metadataHash: string): Promise<void> {
-    console.log(`[INDEXER]   ℹ️ enrichPlanWithMetadata called but Non-Custodial Mode is active.`);
-    console.log(`[INDEXER]   📦 Metadata hash ${metadataHash.substring(0, 32)}... will be decrypted by frontend.`);
-    return;
   }
 
   private async reconcileSettlements(tx: any, blockHeight: number): Promise<void> {
@@ -1342,20 +1435,29 @@ export class DerivableIndexer {
     // =========================================================================
     // FEE CALCULATION (Treasury pays all fees)
     // =========================================================================
+
+    const NFT_CARRYING_COST = 1000;
     const platformFeeSats = Math.floor(totalSalarySats * (PLATFORM_FEE_BASIS_POINTS / 10000));
     const platformFeeAddress = process.env.PLATFORM_FEE_ADDRESS || PLATFORM_FEE_ADDRESS;
     
     // Dynamic network fee calculation
     const inputCount = 3;
     const outputCount = workers.length + 2;
-    const estimatedVSize = estimateTransactionVSize(inputCount, outputCount);
-    const networkFee = await calculateNetworkFee(estimatedVSize, 'halfHour');
+    // Inside triggerBatchScrollRelease, replace the network fee calculation:
+    const baseVSize = estimateTransactionVSize(inputCount, outputCount);
+    const proofFloor = 1500;
+    const perWorkerWeight = 100;
+    const PROOF_OVERHEAD_BYTES = proofFloor + (workers.length * perWorkerWeight);
+    const totalVSize = baseVSize + PROOF_OVERHEAD_BYTES;
+    const networkFee = await calculateNetworkFee(totalVSize, 'halfHour');
+
+    console.log(`[INDEXER] Network fee: ${networkFee} sats (base=${baseVSize}, proof overhead=${PROOF_OVERHEAD_BYTES}, total=${totalVSize} vB)`);
     
-    const totalFeesRequired = SCROLL_FIXED_COST + networkFee + platformFeeSats;
+    const totalFeesRequired = SCROLL_FIXED_COST + networkFee + platformFeeSats + NFT_CARRYING_COST;
     
     console.log(`[INDEXER]   Platform fee: ${platformFeeSats} sats (${PLATFORM_FEE_BASIS_POINTS / 100}%) -> ${platformFeeAddress.substring(0, 20)}...`);
     console.log(`[INDEXER]   Scroll fixed fee: ${SCROLL_FIXED_COST} sats`);
-    console.log(`[INDEXER]   Network fee: ${networkFee} sats (${estimatedVSize} vB @ dynamic rate)`);
+    console.log(`[INDEXER]   Network fee: ${networkFee} sats (${totalVSize} vB @ dynamic rate)`);
     console.log(`[INDEXER]   Total fees from treasury: ${totalFeesRequired} sats`);
     
     // =========================================================================
@@ -1401,27 +1503,68 @@ export class DerivableIndexer {
     }
     
     // =========================================================================
+    // CALCULATE TREASURY CHANGE
+    // =========================================================================
+    const totalTreasuryInput = treasuryUtxo.value;
+    const totalTreasuryOutput = platformFeeSats + SCROLL_FIXED_COST + networkFee;
+    const treasuryChangeSats = totalTreasuryInput - totalTreasuryOutput;
+
+    // Only add change output if amount meets dust limit (>= 1000 sats)
+    const hasTreasuryChange = treasuryChangeSats >= 1000;
+
+    if (treasuryChangeSats > 0 && treasuryChangeSats < 1000) {
+        console.log(`[INDEXER] Change (${treasuryChangeSats} sats) is below dust limit. Adding to fee instead.`);
+    }
+
+    // =========================================================================
+    // BUILD OUTPUTS ARRAY DYNAMICALLY
+    // =========================================================================
+      const outputs: any[] = [
+      ...workers.map(w => ({ address: w.walletAddress, sats: w.salarySats })),
+      { address: platformFeeAddress, sats: platformFeeSats },
+      { address: SCROLL_FEE_ADDRESS_TESTNET4, sats: SCROLL_FIXED_COST },
+      { address: vaultAddress, sats: NFT_CARRYING_COST, nftMetadata: {
+          appId: workers[0].appId,
+          ticker: workers[0].ticker,
+          remaining: workers[0].remaining,
+          metadataHash: workers[0].metadataHash,
+          scrollPolicy: workers[0].scrollPolicy,
+          payPeriodSeconds: workers[0].payPeriodSeconds,
+          compensationSats: workers[0].compensationSats,
+          anchorUtxo: workers[0].anchorUtxo
+      }}
+  ];
+
+    // Only add treasury change if it has value
+    if (hasTreasuryChange) {
+        outputs.push({ address: treasuryAddress, sats: treasuryChangeSats });
+    }
+
+    // =========================================================================
     // BUILD BATCH SPELL REQUEST
     // =========================================================================
     const releaseRequest: any = {
-      type: 'scroll-release',
-      authorityUtxo: workers[0].currentTokenUtxo,
-      fundingUtxo: treasuryUtxo.utxoId,
-      fundingUtxoValue: treasuryUtxo.value,
-      salaryUtxo: vaultUtxo.utxoId,
-      salaryUtxoValue: vaultUtxo.value,
-      changeAddress: treasuryAddress,
-      vaultChangeAddress: vaultAddress,
-      feeRate: 2,
-      outputs: [
-        ...workers.map(w => ({ address: w.walletAddress, sats: w.salarySats })),
-        { address: platformFeeAddress, sats: platformFeeSats },
-        { address: SCROLL_FEE_ADDRESS_TESTNET4, sats: SCROLL_FIXED_COST }
-      ],
-      planMetadata: {
-        appId: workers[0].appId,
-        anchorUtxo: workers[0].currentTokenUtxo
-      }
+        type: 'scroll-release',
+        authorityUtxos: workers.map(w => w.currentTokenUtxo),
+        fundingUtxo: treasuryUtxo.utxoId,
+        fundingUtxoValue: treasuryUtxo.value,
+        salaryUtxo: vaultUtxo.utxoId,
+        salaryUtxoValue: vaultUtxo.value,
+        changeAddress: treasuryAddress,
+        vaultChangeAddress: vaultAddress,
+        feeRate: 2,
+        outputs: outputs,
+        hasTreasuryChange: hasTreasuryChange,
+        planMetadata: {
+            appId: workers[0].appId,
+            anchorUtxo: workers[0].anchorUtxo,
+            ticker: workers[0].ticker,
+            remaining: workers[0].remaining,
+            metadataHash: workers[0].metadataHash,
+            scrollPolicy: workers[0].scrollPolicy,
+            payPeriodSeconds: workers[0].payPeriodSeconds,
+            compensationSats: workers[0].compensationSats
+        }
     };
     
     console.log(`[INDEXER]   Spell request prepared with ${releaseRequest.outputs.length} outputs`);
@@ -1547,16 +1690,18 @@ export class DerivableIndexer {
       console.log(`[INDEXER] 🔍 Querying workers with expiresAt <= ${currentBlockHeight}`);
       
       const query = `
-        SELECT w.*, p.appId, p.employerAddress, c.vaultAddress, c.treasuryHexDest, c.treasuryAddress
-        FROM workers w
-        JOIN plans p ON w.planId = p.appId
-        JOIN companies c ON p.employerAddress = c.employerAddress
-        WHERE w.status = 'active' 
-        AND w.currentTokenUtxo IS NOT NULL
-        AND w.expiresAt IS NOT NULL
-        AND w.expiresAt != ''
-        AND CAST(w.expiresAt AS INTEGER) <= ?
-      `;
+      SELECT w.*, p.appId, p.anchorUtxo, p.ticker, p.remaining, p.metadataHash,
+            p.scrollPolicy, p.payPeriodSeconds, p.compensationSats,
+            p.employerAddress, c.vaultAddress, c.treasuryHexDest, c.treasuryAddress
+      FROM workers w
+      JOIN plans p ON w.planId = p.appId
+      JOIN companies c ON p.employerAddress = c.employerAddress
+      WHERE w.status = 'active' 
+      AND w.currentTokenUtxo IS NOT NULL
+      AND w.expiresAt IS NOT NULL
+      AND w.expiresAt != ''
+      AND CAST(w.expiresAt AS INTEGER) <= ?
+    `;
       
       const result = await this.db.execute({ sql: query, args: [currentBlockHeight] });
       const matureWorkersRaw = result.rows || [];
@@ -1600,7 +1745,14 @@ export class DerivableIndexer {
           appId: worker.appId,
           vaultAddress: worker.vaultAddress,
           treasuryHexDest: worker.treasuryHexDest,
-          treasuryAddress: worker.treasuryAddress
+          treasuryAddress: worker.treasuryAddress,
+          anchorUtxo: worker.anchorUtxo,
+          ticker: worker.ticker,
+          remaining: worker.remaining,
+          metadataHash: worker.metadataHash,
+          scrollPolicy: worker.scrollPolicy,
+          payPeriodSeconds: worker.payPeriodSeconds,
+          compensationSats: worker.compensationSats
         });
       }
       

@@ -97,14 +97,19 @@ export interface SubscriptionToken {
 export interface SpellRequest {
   type: 'mint-nft' | 'mint-token' | 'send' | 'scroll-create' | 'scroll-release' | 'scroll-freeze';
   authorityUtxo?: string;
+  authorityUtxos?: string[];
   anchorUtxo?: string;
   anchorValue?: number;
   fundingUtxo: string;
   fundingUtxoValue: number;
+  salaryUtxo?: string;
+  salaryUtxoValue?: number;
+  vaultChangeAddress?: string;
   changeAddress: string;
   feeRate: number;
   utxoAddress?: string;
   fundingScript?: string;
+  hasTreasuryChange?: boolean;
 
   planMetadata?: {
     anchorUtxo?: string;
@@ -112,7 +117,7 @@ export interface SpellRequest {
   };
   
   // Multi-signature support
-  multiSigSigners?: string[];                    // For 2-of-3 treasury
+  multiSigSigners?: string[];
   multiSigThreshold?: number;
   
   // Outputs

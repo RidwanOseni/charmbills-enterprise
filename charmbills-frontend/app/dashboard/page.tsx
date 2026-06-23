@@ -409,7 +409,8 @@ export default function EmployerDashboard() {
       baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002'
     });
     
-    const proverResult: ProverResult = response.data;
+    const { appId, ...proverData } = response.data;
+    const proverResult: ProverResult = proverData;
     
     // Create a context with the same UTXO for both anchor and fee
     const signingContext = {
@@ -424,7 +425,7 @@ export default function EmployerDashboard() {
     if (txids && txids.length > 0) {
       // Add newly created department to local state with human-readable name
       const newDept = {
-        appId: proverResult.appId || crypto.randomUUID(),
+        appId: appId || crypto.randomUUID(),
         department: payload.setupDeptName.toLowerCase(),
         ticker: `${payload.setupDeptName.substring(0, 3).toUpperCase()}-PAY`,
         remaining: payload.budgetValue,
@@ -432,7 +433,7 @@ export default function EmployerDashboard() {
       };
       
       setRegisteredDepts(prev => [...prev, newDept]);
-      setSelectedDeptId(proverResult.appId);
+      setSelectedDeptId(appId);
       
       setToast(`✅ ${payload.setupDeptName} Department created with ${payload.budgetValue} pay periods budget!`);
       await fetchPlans();
@@ -1348,7 +1349,7 @@ export default function EmployerDashboard() {
                     <SelectItem value="weekly">Weekly</SelectItem>
                     <SelectItem value="biweekly">Bi-weekly (Standard)</SelectItem>
                     <SelectItem value="monthly">Monthly</SelectItem>
-                    <SelectItem value="demo">Investor Demo (4 Hours)</SelectItem>
+                    <SelectItem value="demo">Investor Demo (4 Minutes)</SelectItem>
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground mt-1">Sets the on-chain pay period for all workers in this department.</p>
