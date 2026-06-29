@@ -25,24 +25,21 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Wallet, Users, CheckCircle, Building2, PlusCircle, CreditCard, Clock, Download, Lock } from 'lucide-react'
 import { useWallet } from '@/lib/WalletContext';
-import { getWalletStatus } from '@/lib/charms-utils';
+import { getWalletStatus, scanAddressForCharms } from '@/lib/charms-utils';
 import { WorkerStatus, ProverResult } from '../../shared/types';
 import * as constants from '../../shared/constants';
 import { decryptPayrollData, EncryptedData } from '../../shared/encryption';
 import { getFromIPFS } from '@/lib/ipfs-pinner';
 import { ExportPayrollButton } from '@/components/ExportPayrollButton';
 
-// Import for company onboarding hex derivation
 import * as btc from '@scure/btc-signer';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 
-// Create API client with absolute URL and increased timeout for ZK-proof generation
 const api = axios.create({
   baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002',
-  timeout: 600000 // 3 minutes timeout for ZK-proof generation (matches backend PROVER_TIMEOUT_MS)
+  timeout: 600000
 });
 
-// Map frontend selection to deterministic seconds
 const frequencyToSeconds = (freq: string) => {
   const map: Record<string, number> = {
     'weekly': constants.SECONDS_PER_WEEK,
@@ -53,11 +50,6 @@ const frequencyToSeconds = (freq: string) => {
   return map[freq] || constants.SECONDS_PER_BIWEEK;
 };
 
-// =========================================================================
-// Helper function to get status badge based on worker status
-// Supports: 'active' (on-chain confirmed), 'minting_pending' (in mempool),
-//           'pending' (needs tokens), and other states
-// =========================================================================
 const getStatusBadge = (status: string) => {
   switch(status) {
     case 'active': 
@@ -71,15 +63,10 @@ const getStatusBadge = (status: string) => {
   }
 };
 
-// =========================================================================
-// Helper function to decrypt department metadata using deterministic entropy
-// Fetches CID from backend, retrieves encrypted blob from IPFS, and decrypts
-// =========================================================================
 const decryptDepartmentMetadata = async (metadataHash: string, entropy: string): Promise<any> => {
   try {
     console.log(`[DECRYPT] Decrypting metadata for hash: ${metadataHash.substring(0, 16)}...`);
     
-    // 1. Fetch CID from backend
     const cidResponse = await api.get(`/api/ipfs/cid/${metadataHash}`);
     const cid = cidResponse.data.cid;
     
@@ -90,10 +77,8 @@ const decryptDepartmentMetadata = async (metadataHash: string, entropy: string):
     
     console.log(`[DECRYPT] Retrieved CID: ${cid}`);
     
-    // 2. Fetch encrypted blob from IPFS
     const encryptedBlob = await getFromIPFS(cid);
     
-    // 3. CRITICAL: Convert hex strings to Uint8Arrays
     const preparedBlob = {
       content: hexToBytes(encryptedBlob.content),
       iv: hexToBytes(encryptedBlob.iv),
@@ -102,7 +87,6 @@ const decryptDepartmentMetadata = async (metadataHash: string, entropy: string):
     
     console.log(`[DECRYPT] Converted hex to bytes - content: ${preparedBlob.content.length} bytes, iv: ${preparedBlob.iv.length} bytes`);
     
-    // 4. Decrypt using deterministic entropy
     const decrypted = await decryptPayrollData(preparedBlob as any, entropy);
     
     console.log(`[DECRYPT] Successfully decrypted metadata`);
@@ -113,28 +97,20 @@ const decryptDepartmentMetadata = async (metadataHash: string, entropy: string):
   }
 };
 
-// =========================================================================
-// Dynamic fee estimation based on current network conditions
-// Fetches recommended fees from Mempool.space API and calculates total requirement
-// =========================================================================
 const estimateDynamicFee = async (workerCount: number): Promise<number> => {
   try {
-    // Fetch recommended fees from Mempool.space API
-    const response = await axios.get('https://mempool.space/testnet4/api/v1/fees/recommended');
-    const { fastestFee, halfHourFee, hourFee } = response.data;
+    const response = await api.get('/api/fees/recommended');
+    const { fastestFee } = response.data;
     
-    // Use fastestFee + 20% buffer for safety during congestion
     const feeRate = fastestFee + Math.ceil(fastestFee * 0.2);
-    
-    // Estimate transaction size: base 200 vbytes + ~50 vbytes per worker output
     const estimatedTxSize = 200 + (workerCount * 50);
     const estimatedFee = feeRate * estimatedTxSize;
     
     console.log(`[FEE ESTIMATE] Rate: ${feeRate} sats/vb, Size: ${estimatedTxSize} vb, Fee: ${estimatedFee} sats`);
     return estimatedFee;
   } catch (error) {
-    console.warn('[FEE ESTIMATE] Failed to fetch, using fallback of 5000 sats');
-    return 5000; // Fallback
+    console.warn('[FEE ESTIMATE] Failed to fetch from backend, using fallback');
+    return 2000 + (workerCount * 100);
   }
 };
 
@@ -148,9 +124,6 @@ export default function EmployerDashboard() {
     taprootPublicKey
   } = useWallet();
 
-  // ============================================================
-  // Infrastructure State (Departments - One NFT per Department)
-  // ============================================================
   const [registeredDepts, setRegisteredDepts] = useState<any[]>([]);
   const [setupDeptName, setSetupDeptName] = useState('');
   const [setupBudget, setSetupBudget] = useState('100');
@@ -158,26 +131,17 @@ export default function EmployerDashboard() {
   const [setupType, setSetupType] = useState('employee');
   const [isSettingUpDept, setIsSettingUpDept] = useState(false);
   
-  // ============================================================
-  // Master Access Key State (for deterministic encryption)
-  // ============================================================
   const [masterAccessKey, setMasterAccessKey] = useState<string>('');
   const [showKeyModal, setShowKeyModal] = useState<boolean>(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [pendingSetupData, setPendingSetupData] = useState<any>(null);
   
-  // ============================================================
-  // Hiring State (Workers assigned to Departments)
-  // ============================================================
   const [selectedDeptId, setSelectedDeptId] = useState('');
   const [fullName, setFullName] = useState('');
   const [role, setRole] = useState('');
   const [salary, setSalary] = useState('');
   const [bitcoinAddress, setBitcoinAddress] = useState('');
   
-  // ============================================================
-  // Operational State
-  // ============================================================
   const [workers, setWorkers] = useState<any[]>([]);
   const [vaultBalance, setVaultBalance] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -188,9 +152,6 @@ export default function EmployerDashboard() {
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
   const [onboardingAttempted, setOnboardingAttempted] = useState<boolean>(false);
   
-  // ============================================================
-  // Batch Minting State
-  // ============================================================
   const [selectedWorkers, setSelectedWorkers] = useState<Set<string>>(new Set());
   const [selectedDept, setSelectedDept] = useState('');
   const [selectedPeriods, setSelectedPeriods] = useState('1');
@@ -200,16 +161,9 @@ export default function EmployerDashboard() {
   const [currentPlanNftUtxo, setCurrentPlanNftUtxo] = useState('');
   const [currentPlanMetadata, setCurrentPlanMetadata] = useState<any>(null);
 
-  // ============================================================
-  // Helper: Get deterministic entropy for encryption/decryption
-  // Uses: Public Key (stable) + Master Access Key (user-provided)
-  // This solves the non-deterministic signature problem
-  // ============================================================
   const getDeterministicEntropy = async (): Promise<string | null> => {
-    // First, check if we have a master access key
     let accessKey = masterAccessKey;
     
-    // If not in state, check sessionStorage
     if (!accessKey) {
       const savedKey = sessionStorage.getItem('charm_master_key');
       if (savedKey) {
@@ -218,17 +172,14 @@ export default function EmployerDashboard() {
       }
     }
     
-    // If still no key, return null - caller will show modal
     if (!accessKey) {
       console.log('[ENTROPY] No master access key found');
       return null;
     }
     
     try {
-      // Use taprootPublicKey from WalletContext if available
       let pubKey = taprootPublicKey;
       
-      // If not in context, fetch from wallet
       if (!pubKey && (window as any).LeatherProvider) {
         const response = await (window as any).LeatherProvider.request("getAddresses");
         if (response?.result?.addresses) {
@@ -244,7 +195,6 @@ export default function EmployerDashboard() {
         return null;
       }
       
-      // Combine Public Key + Master Access Key to create deterministic entropy
       const encoder = new TextEncoder();
       const data = encoder.encode(pubKey + accessKey);
       const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -259,9 +209,6 @@ export default function EmployerDashboard() {
     }
   };
 
-  // ============================================================
-  // Helper: Show modal and wait for key
-  // ============================================================
   const requireMasterKey = async (action: string): Promise<boolean> => {
     const existingKey = sessionStorage.getItem('charm_master_key');
     if (existingKey) {
@@ -274,9 +221,6 @@ export default function EmployerDashboard() {
     return false;
   };
 
-  // ============================================================
-  // Master Access Key Modal Component
-  // ============================================================
   const KeyEntryModal = () => {
     const [tempKey, setTempKey] = useState('');
     const [error, setError] = useState('');
@@ -287,12 +231,10 @@ export default function EmployerDashboard() {
         return;
       }
       
-      // Store in sessionStorage (clears when tab closes)
       sessionStorage.setItem('charm_master_key', tempKey);
       setMasterAccessKey(tempKey);
       setShowKeyModal(false);
       
-      // Retry the pending action
       if (pendingAction === 'fetchPlans') {
         await fetchPlans();
       } else if (pendingAction === 'refreshWorkers') {
@@ -356,34 +298,51 @@ export default function EmployerDashboard() {
     );
   };
 
-  // ============================================================
-  // Helper: Scan wallet for UTXO context with script extraction
-  // CRITICAL FIX: Extract the actual on-chain script for both anchor and fee UTXOs
-  // This resolves the -26 scriptpubkey error
-  // ============================================================
   const getBtcContext = async () => {
     if (!address) throw new Error("Wallet not connected");
     
     console.log("[DEPARTMENT SETUP] Scanning wallet for UTXOs...");
     
-    const response = await axios.get(`https://mempool.space/testnet4/api/address/${address}/utxo`);
+    // Get all UTXOs
+    const response = await axios.get(`${api.defaults.baseURL}/api/utxos/${address}`);
     const utxos = response.data;
     
     console.log(`[DEPARTMENT SETUP] Found ${utxos.length} UTXOs`);
     
-    // For each UTXO, fetch its hex and script
+    // Scan for charmed UTXOs using the scanner
+    console.log("[DEPARTMENT SETUP] Scanning for charmed UTXOs...");
+    const charmedTokens = await scanAddressForCharms(address);
+    const charmedUtxoIds = new Set(charmedTokens.map((t: any) => t.utxoId));
+    console.log(`[DEPARTMENT SETUP] Found ${charmedUtxoIds.size} charmed UTXOs`);
+    
+    // Fetch hex and script for each UTXO, filtering out charmed ones
     const utxosWithDetails = await Promise.all(
       utxos.map(async (utxo: any) => {
-        const hexResponse = await axios.get(`https://mempool.space/testnet4/api/tx/${utxo.txid}/hex`);
-        const tx = btc.RawTx.decode(hexToBytes(hexResponse.data));
-        const script = tx.outputs[utxo.vout].script;
-        return {
-          utxoId: `${utxo.txid}:${utxo.vout}`,
-          value: utxo.value,
-          hex: hexResponse.data,
-          script: bytesToHex(script),
-          confirmed: utxo.status?.confirmed
-        };
+        const utxoId = `${utxo.txid}:${utxo.vout}`;
+        const isCharmed = charmedUtxoIds.has(utxoId);
+        
+        try {
+          const hexResponse = await axios.get(`${api.defaults.baseURL}/api/tx/${utxo.txid}/hex`);
+          const tx = btc.RawTx.decode(hexToBytes(hexResponse.data));
+          const script = tx.outputs[utxo.vout].script;
+          return {
+            utxoId,
+            value: utxo.value,
+            hex: hexResponse.data,
+            script: bytesToHex(script),
+            confirmed: utxo.status?.confirmed,
+            isCharmed
+          };
+        } catch (error) {
+          return {
+            utxoId,
+            value: utxo.value,
+            hex: '',
+            script: '',
+            confirmed: false,
+            isCharmed
+          };
+        }
       })
     );
     
@@ -391,16 +350,30 @@ export default function EmployerDashboard() {
     const confirmedUtxos = utxosWithDetails.filter(u => u.confirmed);
     console.log(`[DEPARTMENT SETUP] Confirmed UTXOs: ${confirmedUtxos.length}`);
     
+    // Find fresh UTXOs (not charmed) with sufficient value
+    const freshUtxos = confirmedUtxos.filter(u => !u.isCharmed && u.value >= 10000);
+    console.log(`[DEPARTMENT SETUP] Fresh UTXOs with >= 10,000 sats: ${freshUtxos.length}`);
+    
+    if (freshUtxos.length === 0) {
+      console.error("[DEPARTMENT SETUP] No fresh UTXOs found with >= 10,000 sats");
+      console.log("[DEPARTMENT SETUP] Available UTXOs:");
+      confirmedUtxos.forEach((u: any) => {
+        console.log(`  ${u.utxoId}: ${u.value} sats, charmed: ${u.isCharmed}`);
+      });
+      throw new Error("No fresh UTXO found with sufficient balance. Please send new funds to your wallet.");
+    }
+    
+    // Select the largest fresh UTXO
+    const selectedUtxo = freshUtxos.reduce((a: any, b: any) => a.value > b.value ? a : b);
+    console.log(`[DEPARTMENT SETUP] Selected fresh UTXO: ${selectedUtxo.utxoId} (${selectedUtxo.value} sats)`);
+    
     return {
       utxos: confirmedUtxos,
-      anchor: confirmedUtxos[0] || null,
-      fee: confirmedUtxos[1] || confirmedUtxos[0] || null
+      anchor: selectedUtxo,
+      fee: selectedUtxo
     };
   };
 
-  // ============================================================
-  // Helper: Execute department setup (separate function for retry)
-  // ============================================================
   const executeDepartmentSetup = async (payload: any) => {
     console.log("[DEPARTMENT SETUP] Executing with payload");
     
@@ -412,18 +385,15 @@ export default function EmployerDashboard() {
     const { appId, ...proverData } = response.data;
     const proverResult: ProverResult = proverData;
     
-    // Create a context with the same UTXO for both anchor and fee
     const signingContext = {
       anchor: payload.consolidatedUtxo,
       fee: payload.consolidatedUtxo
     };
     
-    // Pass the signingContext which now has the same UTXO for both
     const signingResult = await signAndBroadcastPackage(proverResult, signingContext);
     const txids = signingResult?.txids;
     
     if (txids && txids.length > 0) {
-      // Add newly created department to local state with human-readable name
       const newDept = {
         appId: appId || crypto.randomUUID(),
         department: payload.setupDeptName.toLowerCase(),
@@ -447,9 +417,6 @@ export default function EmployerDashboard() {
     }
   };
 
-  // ============================================================
-  // COMPANY ONBOARDING: Auto-register when wallet connects
-  // ============================================================
   useEffect(() => {
     const checkAndRegisterCompany = async () => {
       if (!walletConnected || !address || companyRegistered || isOnboarding || onboardingError || onboardingAttempted) {
@@ -539,11 +506,6 @@ export default function EmployerDashboard() {
     checkAndRegisterCompany();
   }, [walletConnected, address, companyRegistered, isOnboarding, onboardingError, onboardingAttempted]);
 
-  // ============================================================
-  // STAGE 1: Setup Department (Mint Plan NFT - One per Department)
-  // CRITICAL FIX: Use a single consolidated UTXO for both anchor and fee
-  // This ensures the prover generates a single-input transaction (v14 NFT Scanner requirement)
-  // ============================================================
   const handleSetupDepartment = async () => {
     if (!setupDeptName) {
       setToast("❌ Please enter a department name.");
@@ -561,10 +523,8 @@ export default function EmployerDashboard() {
       return;
     }
     
-    // Check for master access key before proceeding
     const hasKey = await requireMasterKey('setupDepartment');
     if (!hasKey) {
-      // Save the data for retry after key entry
       setPendingSetupData({
         setupDeptName,
         budgetValue,
@@ -587,8 +547,7 @@ export default function EmployerDashboard() {
         console.log(`  UTXO ${i}: ${utxo.utxoId}, value=${utxo.value}`);
       });
       
-      // CRITICAL: Find a single UTXO >= 15,000 sats to satisfy the "Expected 1" scanner rule
-      const consolidatedUtxo = btcContext.utxos.find((u: any) => u.value >= 15000);
+      const consolidatedUtxo = btcContext.anchor;
       
       if (!consolidatedUtxo) {
         throw new Error("No UTXO found with >= 15,000 sats. Please fund your wallet with a larger UTXO for the Plan NFT.");
@@ -605,7 +564,6 @@ export default function EmployerDashboard() {
         throw new Error("Leather wallet not detected");
       }
       
-      // Get deterministic entropy using master access key (no signature needed!)
       const encryptionEntropy = await getDeterministicEntropy();
       
       if (!encryptionEntropy) {
@@ -614,8 +572,6 @@ export default function EmployerDashboard() {
       
       console.log("[DEPARTMENT SETUP] Using deterministic entropy for encryption (not signature)");
       
-      // CRITICAL: Pass the SAME consolidated UTXO for both anchor and fee
-      // This forces the prover to generate a transaction with exactly 1 input
       const payload = {
         anchorUtxo: consolidatedUtxo.utxoId,
         anchorTxHex: consolidatedUtxo.hex,
@@ -633,9 +589,9 @@ export default function EmployerDashboard() {
         payPeriodSeconds: frequencyToSeconds(setupFrequency),
         scrollPolicy: setupType === 'employee' ? 0 : 1,
         remaining: budgetValue,
-        encryptionEntropy: encryptionEntropy,  // Use deterministic entropy!
+        encryptionEntropy: encryptionEntropy,
         multiSigRequired: false,
-        consolidatedUtxo: consolidatedUtxo,  // Store for retry
+        consolidatedUtxo: consolidatedUtxo,
         setupDeptName: setupDeptName,
         budgetValue: budgetValue
       };
@@ -653,11 +609,6 @@ export default function EmployerDashboard() {
     }
   };
   
-  // ============================================================
-  // STAGE 2: Add Worker to Registry (Administrative Action)
-  // CRITICAL FIX: Align payload keys with backend schema
-  // Uses planId (appId) instead of department/departmentId
-  // ============================================================
   const handleHire = async () => {
     if (!fullName || !selectedDeptId || !bitcoinAddress) {
       setToast("❌ Please fill in all worker details.");
@@ -674,20 +625,13 @@ export default function EmployerDashboard() {
       
       console.log("[HIRE ADMIN] Adding worker:", fullName, "to department:", dept.department);
       
-      // =========================================================================
-      // CRITICAL FIX: Align payload keys with backend schema
-      // - planId: Use appId to map to the department (not departmentId)
-      // - engagementType: Map UI 'setupType' to 'engagementType'
-      // - salarySats: Map UI 'salary' to 'salarySats' (as number)
-      // - role: Send the role value from input (will be saved to database)
-      // =========================================================================
       const payload = {
         name: fullName,
         walletAddress: bitcoinAddress,
-        planId: dept.appId,           // Use appId to map to the department
-        role: role || "Team Member",   // FIX: Send the role value to database
-        engagementType: setupType === 'employee' ? 'employee' : 'freelancer', // Map UI type to engagementType
-        salarySats: parseInt(salary) || 5000000, // Map UI 'salary' to 'salarySats' as number
+        planId: dept.appId,
+        role: role || "Team Member",
+        engagementType: setupType === 'employee' ? 'employee' : 'freelancer',
+        salarySats: parseInt(salary) || 5000000,
         status: 'pending'
       };
       
@@ -698,12 +642,10 @@ export default function EmployerDashboard() {
       setToast(`✅ Worker added to registry. They'll receive tokens in the next run.`);
       await refreshWorkers();
       
-      // Clear worker details but KEEP the selected department for adding another worker
       setFullName('');
       setRole('');
       setSalary('');
       setBitcoinAddress('');
-      // Do NOT clear selectedDeptId - allows adding multiple workers to same department
       
     } catch (err: any) {
       console.error("[HIRE ADMIN] Failed:", err.message);
@@ -714,14 +656,6 @@ export default function EmployerDashboard() {
     }
   };
   
-  // ============================================================
-  // Batch Token Issuance (Pay Your Team - All at Once)
-  // CRITICAL FIX: Use the EXACT UTXO selected by the backend
-  // Stage 2 requires two distinct inputs: Authority (Plan NFT) + Funding (Treasury UTXO)
-  // 
-  // FIX: Removed getBtcContext() call - now uses funding UTXO returned by backend
-  // This prevents UTXO mismatch that causes artificially high fees
-  // ============================================================
   const handleIssueTokens = async () => {
     console.log('[BATCH MINT] ===== START =====');
     console.log('[BATCH MINT] selectedWorkers.size:', selectedWorkers.size);
@@ -755,35 +689,22 @@ export default function EmployerDashboard() {
       console.log('[BATCH MINT] workerList length:', workerList.length);
       const periods = parseInt(selectedPeriods);
       
-      // =========================================================================
-      // CRITICAL FIX FOR STAGE 2: Do NOT use getBtcContext() for UTXO selection
-      // The backend selects the optimal UTXO. We must use that exact UTXO.
-      // =========================================================================
       const authorityUtxoId = currentPlanNftUtxo;
       console.log(`[BATCH MINT] Authority (Plan NFT) UTXO: ${authorityUtxoId}`);
       
-      // =========================================================================
-      // DYNAMIC FEE ESTIMATION: Calculate required satoshis based on current network fees
-      // This prevents "Insufficient Fuel" errors during network congestion
-      // =========================================================================
       const estimatedFee = await estimateDynamicFee(workerList.length);
       
-      // Calculate total requirement: outputs cost (workers + NFT return + change) + estimated fee + 50% buffer
       const outputsCost = (workerList.length + 3) * constants.MIN_OUTPUT_SATS;
-      const totalNeeded = outputsCost + estimatedFee + Math.ceil(estimatedFee * 0.5); // 50% buffer on fees
+      const totalNeeded = outputsCost + estimatedFee + Math.ceil(estimatedFee * 0.5);
       
       console.log(`[BATCH MINT] Dynamic requirement calculation:`);
       console.log(`  Outputs cost (${workerList.length + 3} outputs): ${outputsCost} sats`);
       console.log(`  Estimated fee: ${estimatedFee} sats`);
       console.log(`  Total needed: ${totalNeeded} sats`);
 
-      // =========================================================================
-      // Construct payload - Let backend select the optimal Treasury UTXO
-      // Do NOT pass fundingUtxo or fundingValue - backend will select
-      // =========================================================================
       const payload = {
         authorityUtxo: authorityUtxoId,
-        authorityTxHex: '',  // Backend will fetch this
+        authorityTxHex: '',
         employerAddress: address,
         utxoAddress: address,
         workers: workerList.map(w => ({ 
@@ -793,7 +714,7 @@ export default function EmployerDashboard() {
           role: w.role || "Team Member"
         })),
         planMetadata: currentPlanMetadata,
-        encryptionEntropy: "placeholder"  // Will be replaced by backend with stored entropy
+        encryptionEntropy: "placeholder"
       };
 
       console.log("[BATCH MINT] Payload prepared (backend will select funding UTXO):", {
@@ -813,15 +734,11 @@ export default function EmployerDashboard() {
         hasHex: !!response.data.fundingTxHex
       });
       
-      // =========================================================================
-      // CRITICAL FIX: Use the EXACT UTXO and hex returned by the backend
-      // This ensures the frontend signs the same UTXO the backend proved
-      // =========================================================================
       const backendFundingUtxo = {
         utxoId: response.data.fundingUsed,
         value: response.data.fundingValue,
         hex: response.data.fundingTxHex,
-        script: ''  // Will be extracted from hex in WalletContext
+        script: ''
       };
       
       console.log('[BATCH MINT] Using backend-selected funding UTXO:', {
@@ -830,18 +747,16 @@ export default function EmployerDashboard() {
         hexLength: backendFundingUtxo.hex?.length || 0
       });
       
-      // Fetch the anchor (Plan NFT) hex for context
       const [anchorTxid] = authorityUtxoId.split(':');
-      const anchorHexResponse = await axios.get(`https://mempool.space/testnet4/api/tx/${anchorTxid}/hex`, { responseType: 'text' });
+      const anchorHexResponse = await axios.get(`${api.defaults.baseURL}/api/tx/${anchorTxid}/hex`, { responseType: 'text' });
       const anchorHex = anchorHexResponse.data;
       
-      // Create signing context with TWO distinct UTXOs using backend-selected values
       const signingContext = {
         anchor: {
           utxoId: authorityUtxoId,
-          value: 1000, // Plan NFT is 1000 sats
+          value: 1000,
           hex: anchorHex,
-          script: ''  // Will be extracted in WalletContext
+          script: ''
         },
         fee: backendFundingUtxo,
         isSingle: true
@@ -867,9 +782,6 @@ export default function EmployerDashboard() {
     console.log('[BATCH MINT] ===== END =====');
   };
   
-  // ============================================================
-  // Data Fetching Helpers with Lazy Decryption Loop
-  // ============================================================
   const fetchPlans = async () => {
     if (!address) return;
     try {
@@ -879,24 +791,17 @@ export default function EmployerDashboard() {
       
       console.log(`[FETCH PLANS] Received ${plans.length} plans from backend`);
       
-      // =========================================================================
-      // LAZY DECRYPTION LOOP: Unlock missing department names if wallet is connected
-      // This is the core of Non-Custodial Mode - decryption happens in the browser
-      // =========================================================================
       if (walletConnected && plans.length > 0) {
         console.log('[FETCH PLANS] Wallet connected, attempting to decrypt missing department names...');
         
-        // Get deterministic entropy for decryption
         const entropy = await getDeterministicEntropy();
         
         if (entropy) {
-          // Collect decryption results first, then update state once
           const updatedPlans = [...plans];
           let hasUpdates = false;
           
           for (let i = 0; i < updatedPlans.length; i++) {
             const plan = updatedPlans[i];
-            // Check if department name is missing but metadataHash exists
             if (!plan.department && plan.metadataHash) {
               console.log(`[FETCH PLANS] 🔓 Attempting to decrypt plan ${plan.appId.substring(0, 8)}... with hash ${plan.metadataHash.substring(0, 16)}...`);
               
@@ -920,7 +825,7 @@ export default function EmployerDashboard() {
         } else {
           console.log('[FETCH PLANS] ⚠️ No entropy available, showing key modal');
           await requireMasterKey('fetchPlans');
-          return; // Modal will retry
+          return;
         }
       } else {
         console.log('[FETCH PLANS] Wallet not connected or no plans, skipping decryption');
@@ -937,15 +842,10 @@ export default function EmployerDashboard() {
     }
   };
   
-  // =========================================================================
-  // FIX: refreshWorkers - Fetches workers and enriches with department names from registeredDepts
-  // This eliminates the separate cache state and uses the plan objects directly
-  // =========================================================================
   const refreshWorkers = async () => {
     try {
       console.log('[REFRESH WORKERS] Starting refresh...');
       
-      // Create a map of appId -> department name from registeredDepts
       const deptMap: Record<string, string> = {};
       registeredDepts.forEach((dept: any) => {
         if (dept.appId && dept.department) {
@@ -964,7 +864,6 @@ export default function EmployerDashboard() {
         department: w.department 
       })));
       
-      // Enrich workers with department names from the map
       const enrichedWorkers = workersData.map((worker: any) => {
         if (worker.planId && deptMap[worker.planId]) {
           console.log(`[DEBUG] Enriching worker ${worker.name} (planId: ${worker.planId}) with department: ${deptMap[worker.planId]}`);
@@ -985,10 +884,6 @@ export default function EmployerDashboard() {
     }
   };
   
-  // =========================================================================
-  // FIX: When registeredDepts updates, refresh workers to get department names
-  // This ensures workers are enriched AFTER department names are decrypted
-  // =========================================================================
   useEffect(() => {
     if (registeredDepts.length > 0) {
       console.log('[USE EFFECT] registeredDepts changed, refreshing workers...');
@@ -996,7 +891,6 @@ export default function EmployerDashboard() {
     }
   }, [registeredDepts]);
   
-  // Fetch dashboard stats
   useEffect(() => {
     const fetchStats = async () => {
       try {
@@ -1017,9 +911,6 @@ export default function EmployerDashboard() {
     fetchStats();
   }, [workers]);
 
-  // ============================================================
-  // FIX A: Update Company Vault Balance - Use connected wallet address
-  // ============================================================
   useEffect(() => {
     const fetchVaultBalance = async () => {
       const treasuryAddr = process.env.NEXT_PUBLIC_TREASURY_ADDRESS || address;
@@ -1037,7 +928,6 @@ export default function EmployerDashboard() {
     fetchVaultBalance();
   }, [walletConnected, address]);
   
-  // Fetch initial data when wallet connects - fetch plans only (workers will be refreshed via useEffect)
   useEffect(() => {
     if (walletConnected && address) {
       console.log('[DASHBOARD] Wallet connected, fetching plans...');
@@ -1045,8 +935,6 @@ export default function EmployerDashboard() {
     }
   }, [walletConnected, address]);
   
-  // Fetch plan metadata when department selection changes
-  // This populates currentPlanNftUtxo and currentPlanMetadata for the Issue Tokens button
   useEffect(() => {
     const fetchPlanForDepartment = async () => {
       console.log('[FETCH PLAN FOR DEPT] selectedDept changed to:', selectedDept);
@@ -1055,7 +943,6 @@ export default function EmployerDashboard() {
         return;
       }
       try {
-        // First try to find the department in registeredDepts by department name
         const deptFromState = registeredDepts.find(d => d.department === selectedDept);
         if (deptFromState) {
           console.log('[FETCH PLAN FOR DEPT] Found department in state:', deptFromState);
@@ -1074,7 +961,6 @@ export default function EmployerDashboard() {
           return;
         }
         
-        // Fallback to API call
         console.log('[FETCH PLAN FOR DEPT] Department not in state, fetching from API...');
         const response = await api.get(`/api/plans?department=${selectedDept}&employerAddress=${address}`);
         if (response.data && response.data.length > 0) {
@@ -1102,17 +988,11 @@ export default function EmployerDashboard() {
     fetchPlanForDepartment();
   }, [selectedDept, address, registeredDepts]);
 
-  // Worker filtering and selection helpers
   const totalWorkers = workers.length;
-  // FIX: Filter workers by department using the 'department' field from API (p.ticker)
   const deptWorkers = selectedDept === 'all' 
     ? workers 
     : workers.filter((w: any) => w.department === selectedDept);
 
-  // ============================================================
-  // FIX B: Isolate Workers from Departments in the Registry
-  // Ensure we only show records with valid names (Department NFTs don't have names in worker table)
-  // ============================================================
   const filteredByStatus = workers.filter((worker) => {
     if (!worker.name) return false;
 
@@ -1158,22 +1038,17 @@ export default function EmployerDashboard() {
     }
   };
 
-  // Helper function to get display name for department dropdown
   const getDepartmentDisplayName = (dept: any): string => {
-    // Priority 1: Use department field from the plan object (decrypted and stored)
     if (dept.department) {
       return dept.department.charAt(0).toUpperCase() + dept.department.slice(1);
     }
-    // Priority 2: Extract from ticker (e.g., "SALES-PAY" -> "Sales")
     if (dept.ticker) {
       const tickerName = dept.ticker.replace('-PAY', '');
       return tickerName.charAt(0).toUpperCase() + tickerName.slice(1).toLowerCase();
     }
-    // Priority 3: Fallback
     return 'Department';
   };
 
-  // UI States
   if (!walletConnected) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -1239,7 +1114,6 @@ export default function EmployerDashboard() {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Company Status Banner */}
       {companyRegistered && (
         <div className="bg-secondary/10 border-b border-secondary/20 px-6 py-2">
           <div className="max-w-7xl mx-auto flex items-center justify-between">
@@ -1255,7 +1129,6 @@ export default function EmployerDashboard() {
       )}
 
       <main className="max-w-7xl mx-auto px-6 py-12">
-        {/* Toast Notification */}
         {toast && (
           <div className="mb-6 p-4 bg-secondary/20 text-secondary rounded-lg border border-secondary/30 flex items-start gap-3">
             <CheckCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
@@ -1263,7 +1136,6 @@ export default function EmployerDashboard() {
           </div>
         )}
 
-        {/* Overview Cards */}
         <div className="grid md:grid-cols-3 gap-6 mb-12">
           <Card className="p-6 bg-card border border-border rounded-xl">
             <p className="text-sm text-muted-foreground mb-2">Total Team</p>
@@ -1286,13 +1158,11 @@ export default function EmployerDashboard() {
           </Card>
         </div>
 
-        {/* Welcome Section with Export Button */}
         <div className="mb-8 flex justify-between items-center">
           <div>
             <h1 className="text-3xl font-bold text-primary mb-2">Employer Orchestration</h1>
             <p className="text-foreground">Create departments, hire workers, and manage payroll with one-click batch payments</p>
           </div>
-          {/* FIX 2: Export Payroll Button */}
           <ExportPayrollButton 
             workers={workers}
             registeredDepts={registeredDepts}
@@ -1300,9 +1170,7 @@ export default function EmployerDashboard() {
           />
         </div>
 
-        {/* Two-Column Layout: Setup Department + Add Worker */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12">
-          {/* Card 1: DEPARTMENT SETUP (STAGE 1) */}
           <Card className="p-8 bg-card border border-border rounded-xl">
             <div className="flex items-center gap-3 mb-6">
               <div className="p-2 bg-primary/10 rounded-lg">
@@ -1399,7 +1267,6 @@ export default function EmployerDashboard() {
             </div>
           </Card>
 
-          {/* Card 2: ADD WORKER TO REGISTRY (STAGE 2) - Administrative Action */}
           <Card className="p-8 bg-card border border-border rounded-xl">
             <div className="flex items-center gap-3 mb-6">
               <div className="p-2 bg-primary/10 rounded-lg">
@@ -1491,7 +1358,6 @@ export default function EmployerDashboard() {
           </Card>
         </div>
 
-        {/* Card 3: Batch Minting */}
         <div className="flex justify-center mb-12">
           <Card className="w-full max-w-4xl p-8 bg-card border border-border rounded-xl">
             <div className="flex items-center gap-3 mb-6">
@@ -1502,7 +1368,6 @@ export default function EmployerDashboard() {
             </div>
             <p className="text-foreground mb-6">Issue tokens in one transaction. Save 90% on fees.</p>
 
-            {/* Department Selector */}
             <div className="mb-6">
               <Label className="text-sm font-medium text-foreground block mb-2">Select Department</Label>
               <Select value={selectedDept} onValueChange={setSelectedDept} disabled={isProcessing || registeredDepts.length === 0}>
@@ -1521,7 +1386,6 @@ export default function EmployerDashboard() {
               </Select>
             </div>
 
-            {/* Worker Selection Table */}
             <div className="mb-6">
               <div className="flex items-center justify-between mb-3">
                 <p className="text-sm font-medium text-foreground">
@@ -1571,7 +1435,6 @@ export default function EmployerDashboard() {
               </div>
             </div>
 
-            {/* Periods Selector */}
             <div className="mb-6">
               <Label className="text-sm font-medium text-foreground block mb-3">Cover payroll for:</Label>
               <div className="flex gap-3">
@@ -1593,7 +1456,6 @@ export default function EmployerDashboard() {
               <p className="text-xs text-muted-foreground mt-2">Paying for multiple months now means automatic payments later—no extra work.</p>
             </div>
 
-            {/* Fee Summary */}
             <div className="bg-muted/30 rounded-lg p-4 border border-border mb-6">
               <p className="text-sm text-foreground">
                 <span className="font-medium">Estimated network fee:</span> {constants.SCROLL_FIXED_COST} sats (Sponsored by Treasury)
@@ -1601,7 +1463,6 @@ export default function EmployerDashboard() {
               <p className="text-xs text-muted-foreground mt-2">Company treasury pays this. Workers pay nothing.</p>
             </div>
 
-            {/* Issue Button */}
             <Button 
               onClick={handleIssueTokens}
               disabled={selectedWorkers.size === 0 || isProcessing || !currentPlanNftUtxo || registeredDepts.length === 0}
@@ -1610,7 +1471,6 @@ export default function EmployerDashboard() {
               {isProcessing ? 'Processing (60-105 sec)...' : `Issue Tokens for ${selectedWorkers.size} ${selectedWorkers.size === 1 ? 'Worker' : 'Workers'}`}
             </Button>
 
-            {/* Preview Section */}
             {selectedWorkers.size > 0 && (
               <div className="bg-primary/5 border border-primary/20 rounded-lg p-4">
                 <p className="text-sm text-foreground mb-2">
@@ -1625,7 +1485,6 @@ export default function EmployerDashboard() {
           </Card>
         </div>
 
-        {/* Table Filters */}
         <div className="flex gap-3 mb-6">
           {['all', 'Active', 'Needs Tokens'].map((status) => (
             <button
@@ -1642,7 +1501,6 @@ export default function EmployerDashboard() {
           ))}
         </div>
 
-        {/* Workforce Registry Table */}
         <Card className="bg-card border border-border rounded-xl overflow-hidden">
           <div className="px-8 py-6 border-b border-border flex items-center justify-between">
             <div>
@@ -1700,7 +1558,6 @@ export default function EmployerDashboard() {
           </div>
         </Card>
 
-        {/* Helper Text */}
         <div className="mt-8 p-4 bg-muted/30 rounded-lg border border-border">
           <p className="text-sm text-foreground">
             <span className="font-medium">✨ One NFT per department, unlimited workers.</span> Create a department NFT once, then add as many workers as you need with different salaries. All workers under the same department share the same pay frequency.
@@ -1711,7 +1568,6 @@ export default function EmployerDashboard() {
         </div>
       </main>
       
-      {/* Master Access Key Modal */}
       {showKeyModal && <KeyEntryModal />}
     </div>
   )

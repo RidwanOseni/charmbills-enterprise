@@ -382,7 +382,7 @@ export function buildMintTokenVarsLegacy(
   // ----------------------------------------------------------------------------
   // Step 6: Build the dynamic YAML template
   // ----------------------------------------------------------------------------
-  const templateYaml = `version: 14
+  const templateYaml = `version: 15
 tx:
   ins:
     - "{{anchor_utxo}}"
@@ -550,7 +550,7 @@ export function buildMintTokenJSON(
   // Step 7: Build the spell JSON object
   // ----------------------------------------------------------------------------
   const spell = {
-    version: 14,
+    version: 15,
     tx: {
       ins: [ request.anchorUtxo!, request.fundingUtxo! ],
       outs: outs,

@@ -21,8 +21,6 @@ class ValidationError extends Error {
 
 // --------------------------------------------------------------------------------
 // Helper: Converts "txid:vout" string to 36-byte Uint8Array (Byte String)
-// 32-byte Hash + 4-byte LE Index - matches working payload structure
-// Returns Uint8Array to ensure CBOR Byte String encoding, not Sequence
 // --------------------------------------------------------------------------------
 function utxoTo36Bytes(utxoId: string): Uint8Array {
   const [txid, vout] = utxoId.split(':');
@@ -34,7 +32,7 @@ function utxoTo36Bytes(utxoId: string): Uint8Array {
     throw new ValidationError(`Invalid txid length: expected 32 bytes, got ${txidBytes.length}`);
   }
   const voutBuf = Buffer.alloc(4);
-  voutBuf.writeUInt32LE(parseInt(vout, 10)); // Little-Endian is mandatory
+  voutBuf.writeUInt32LE(parseInt(vout, 10));
   return new Uint8Array(Buffer.concat([txidBytes, voutBuf]));
 }
 
@@ -51,7 +49,7 @@ function hexToBytes(hex: string): Uint8Array {
 
 /**
  * Derives the unique App ID for a department's payroll plan.
- * appId = SHA256(anchor_utxo_id) [3, 5]
+ * appId = SHA256(anchor_utxo_id)
  * 
  * @param utxoId - Anchor UTXO ID in format "txid:vout"
  * @returns 64-character hex string (SHA256 hash)
@@ -61,7 +59,6 @@ export function deriveAppId(utxoId: string): string {
     throw new ValidationError('Invalid utxoId: must be non-empty string');
   }
   
-  // Validate UTXO ID format (basic check)
   if (!/^[a-f0-9]+:\d+$/i.test(utxoId)) {
     throw new ValidationError(`Invalid UTXO ID format: ${utxoId} (expected "txid:vout")`);
   }
@@ -137,16 +134,15 @@ function validatePayrollRequest(request: SpellRequest): void {
 
 // --------------------------------------------------------------------------------
 // Strict Type-Marshalling Builder for Rust Bridge
-// Returns typed variables that the Rust bridge will process
-// The Rust bridge handles the YAML/Protocol structure
 // --------------------------------------------------------------------------------
 
 /**
  * Builds typed variables for the Rust bridge to process.
- * This replaces the YAML template approach with direct typed marshalling.
+ * The NFT is sent directly to the employer's Taproot wallet (treasuryHexDest),
+ * not to a Scroll vault.
  * 
  * @param request - Validated spell request with payroll metadata
- * @param treasuryHexDest - The treasury hex destination (from company config)
+ * @param treasuryHexDest - The treasury hex destination (Taproot script from company config)
  * @returns Object containing typed variables and derived appId
  */
 export function buildMintNFTVarsWithTemplate(
@@ -155,14 +151,8 @@ export function buildMintNFTVarsWithTemplate(
 ): { variables: Record<string, string>; appId: string } {
   console.log('🚀 [NEW CODE] buildMintNFTVarsWithTemplate IS RUNNING - Version 3.0');
   
-  // ----------------------------------------------------------------------------
-  // Step 1: Validate input
-  // ----------------------------------------------------------------------------
   validatePayrollRequest(request);
   
-  // ----------------------------------------------------------------------------
-  // Step 2: Validate treasuryHexDest parameter
-  // ----------------------------------------------------------------------------
   if (!treasuryHexDest || typeof treasuryHexDest !== 'string') {
     throw new ValidationError('treasuryHexDest is required for NFT minting');
   }
@@ -172,14 +162,7 @@ export function buildMintNFTVarsWithTemplate(
     throw new ValidationError('treasuryHexDest must be a valid hex string');
   }
   
-  // ----------------------------------------------------------------------------
-  // Step 3: Derive appId from anchor UTXO
-  // ----------------------------------------------------------------------------
   const appId = deriveAppId(request.anchorUtxo!);
-  
-  // ----------------------------------------------------------------------------
-  // Step 4: Extract validated data
-  // ----------------------------------------------------------------------------
   const output = request.outputs[0];
   const metadata = output.nftMetadata!;
   
@@ -187,10 +170,6 @@ export function buildMintNFTVarsWithTemplate(
   const remaining = metadata.remaining !== undefined ? metadata.remaining : 1;
   const compensationSats = Math.max(metadata.compensationSats || 0, 1000);
   
-  // ----------------------------------------------------------------------------
-  // Step 5: Build typed variables for Rust bridge
-  // The Rust bridge expects specific field names matching BridgeVariables struct
-  // ----------------------------------------------------------------------------
   const variables: Record<string, string> = {
     type_name: "mint-nft",
     app_id: String(appId),
@@ -203,12 +182,10 @@ export function buildMintNFTVarsWithTemplate(
     scroll_policy: String(metadata.scrollPolicy),
     pay_period_seconds: String(metadata.payPeriodSeconds),
     compensation_sats: String(compensationSats),
-    treasury_dest: String(treasuryHexDest)
+    treasury_dest: String(treasuryHexDest),
+    scrolls: ""
   };
   
-  // ----------------------------------------------------------------------------
-  // Step 6: Logging (debug only)
-  // ----------------------------------------------------------------------------
   if (process.env.NODE_ENV !== 'production') {
     console.log('[buildMintNFT.payroll] ✅ Typed variables built for Rust bridge:', {
       type_name: variables.type_name,
@@ -221,7 +198,8 @@ export function buildMintNFTVarsWithTemplate(
       metadataHash: metadata.metadataHash.substring(0, 16) + '...',
       anchorUtxo: request.anchorUtxo,
       fundingUtxo: request.fundingUtxo,
-      treasuryHexDest: treasuryHexDest.substring(0, 16) + '...',
+      treasury_dest: variables.treasury_dest.substring(0, 30) + '...',
+      scrolls: variables.scrolls,
       variableCount: Object.keys(variables).length
     });
   }
@@ -271,7 +249,7 @@ export function buildMintNFTJSON(
   appPublicInputs.set(["n", appIdBytes, appVkBytes], null);
   
   const spell = {
-    version: 14,
+    version: 15,
     tx: {
       ins: [anchorInputBytes, fundingInputBytes],
       outs: [

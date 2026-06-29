@@ -1,28 +1,22 @@
 import init, { extractAndVerifySpell } from "./wasm/charms_lib";
-import axios from 'axios';
 import * as constants from '../shared/constants';
 
-const MEMPOOL_API = "https://mempool.space/testnet4/api";
-const PROTOCOL_VERSION = 12; 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3002';
+const PROTOCOL_VERSION = 15; 
 const USED_UTXO_KEY = 'charm_used_utxos';
+const MAX_RETRIES = constants.API_MAX_RETRIES;
+const RETRY_DELAY_MS = constants.API_RETRY_DELAY_MS;
+const REQUEST_TIMEOUT_MS = constants.API_REQUEST_TIMEOUT_MS;
 
-/**
- * ADDITION: Calculates required fees for Scroll-enabled transactions.
- * Essential for providing "Transaction Fee Information" in the worker dashboard [3].
- */
 export function calculateScrollFee(numInputs: number, totalSats: number): number {
     const fixed = constants.SCROLL_FIXED_COST || 895;
     const perInput = constants.SCROLL_FEE_PER_INPUT || 64;
-    const basisPoints = constants.SCROLL_BASIS_POINTS || 10; // 0.1%
+    const basisPoints = constants.SCROLL_BASIS_POINTS || 10;
 
     const dynamicFee = Math.ceil((basisPoints / 10000) * totalSats);
     return fixed + (perInput * numInputs) + dynamicFee;
 }
 
-/**
- * KEPT FOR FRONTEND: Marks a UTXO as used in localStorage.
- * Enables Optimistic UI so worker tokens don't appear "spendable" during block latency [1, 2].
- */
 export function markUtxoAsUsed(utxoId: string): void {
     const used = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
     if (!used.includes(utxoId)) {
@@ -42,20 +36,140 @@ export function clearUsedUtxos(): void {
     console.log('🧹 Cleared local UTXO tracking');
 }
 
-/**
- * MODIFIED: Scans addresses for "Proof of Hire" tokens and includes on-chain timestamps.
- * Uses trustless verification to provide worker sovereignty [8, 9].
- * 
- * CRITICAL FIX: Browser-based WASM initialization using --target web generated bindings.
- * This avoids the 'fs' module by using a browser fetch instead of reading from disk.
- * 
- * CRITICAL FIX: Initialize the official Charms SDK Scanner module with no arguments.
- * The --target web bindings generate an init() function that takes 0 arguments.
- * 
- * MODIFIED: Added payroll ticker filtering to ensure only valid payroll tokens are returned.
- * MODIFIED: Removed OP_RETURN pattern check - let WASM handle spell detection.
- * MODIFIED: Added prev_txs context (Plan NFT hex) for proper proof verification.
- */
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<any> {
+    console.log(`[FETCH] Starting request to: ${url}`);
+    console.log(`[FETCH] Timeout: ${timeoutMs}ms`);
+    const startTime = Date.now();
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        console.log(`[FETCH] ⏰ TIMEOUT triggered after ${Date.now() - startTime}ms`);
+        controller.abort();
+    }, timeoutMs);
+    
+    try {
+        console.log(`[FETCH] Sending fetch request...`);
+        const response = await fetch(url, {
+            signal: controller.signal,
+            headers: { 'Accept': 'application/json' }
+        });
+        clearTimeout(timeoutId);
+        const elapsed = Date.now() - startTime;
+        console.log(`[FETCH] Response received in ${elapsed}ms, status: ${response.status}`);
+        console.log(`[FETCH] Response headers:`, Object.fromEntries(response.headers.entries()));
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        console.log(`[FETCH] Parsing JSON response...`);
+        const data = await response.json();
+        console.log(`[FETCH] JSON parsed successfully, items: ${Array.isArray(data) ? data.length : 'object'}`);
+        return data;
+    } catch (error: any) {
+        clearTimeout(timeoutId);
+        const elapsed = Date.now() - startTime;
+        console.error(`[FETCH] Error after ${elapsed}ms:`, error.message);
+        console.error(`[FETCH] Error type:`, error.name);
+        console.error(`[FETCH] Error cause:`, error.cause);
+        console.error(`[FETCH] Full error:`, error);
+        
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeoutMs}ms`);
+        }
+        throw error;
+    }
+}
+
+async function fetchWithRetry(url: string, timeoutMs: number = REQUEST_TIMEOUT_MS, retries: number = MAX_RETRIES): Promise<any> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            if (attempt > 0) {
+                const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+                console.log(`[FETCH] Retry ${attempt}/${retries} after ${delay}ms...`);
+                await sleep(delay);
+            }
+            return await fetchWithTimeout(url, timeoutMs);
+        } catch (error: any) {
+            lastError = error;
+            console.warn(`[FETCH] Attempt ${attempt + 1}/${retries + 1} failed: ${error.message}`);
+            if (attempt === retries) {
+                throw new Error(`Failed after ${retries + 1} attempts: ${error.message}`);
+            }
+        }
+    }
+    throw lastError || new Error('Fetch failed');
+}
+
+async function fetchTextWithTimeout(url: string, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<string> {
+    console.log(`[FETCH] Starting text request to: ${url}`);
+    console.log(`[FETCH] Timeout: ${timeoutMs}ms`);
+    const startTime = Date.now();
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        console.log(`[FETCH] ⏰ TIMEOUT triggered after ${Date.now() - startTime}ms`);
+        controller.abort();
+    }, timeoutMs);
+    
+    try {
+        console.log(`[FETCH] Sending fetch request...`);
+        const response = await fetch(url, {
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        const elapsed = Date.now() - startTime;
+        console.log(`[FETCH] Response received in ${elapsed}ms, status: ${response.status}`);
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        console.log(`[FETCH] Reading response text...`);
+        const text = await response.text();
+        console.log(`[FETCH] Text received, length: ${text.length} bytes`);
+        return text;
+    } catch (error: any) {
+        clearTimeout(timeoutId);
+        const elapsed = Date.now() - startTime;
+        console.error(`[FETCH] Error after ${elapsed}ms:`, error.message);
+        console.error(`[FETCH] Error type:`, error.name);
+        
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timeout after ${timeoutMs}ms`);
+        }
+        throw error;
+    }
+}
+
+async function fetchTextWithRetry(url: string, timeoutMs: number = REQUEST_TIMEOUT_MS, retries: number = MAX_RETRIES): Promise<string> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            if (attempt > 0) {
+                const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+                console.log(`[FETCH] Retry ${attempt}/${retries} after ${delay}ms...`);
+                await sleep(delay);
+            }
+            return await fetchTextWithTimeout(url, timeoutMs);
+        } catch (error: any) {
+            lastError = error;
+            console.warn(`[FETCH] Attempt ${attempt + 1}/${retries + 1} failed: ${error.message}`);
+            if (attempt === retries) {
+                throw new Error(`Failed after ${retries + 1} attempts: ${error.message}`);
+            }
+        }
+    }
+    throw lastError || new Error('Fetch failed');
+}
+
 export async function scanAddressForCharms(address: string) {
   try {
       console.log("[CHARMS SCAN] Initializing WASM...");
@@ -63,9 +177,22 @@ export async function scanAddressForCharms(address: string) {
       console.log("[CHARMS SCAN] WASM initialized");
 
       console.log(`[CHARMS SCAN] Fetching UTXOs for address: ${address.substring(0, 16)}...`);
-      const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`);
-      const utxos = response.data;
+      
+      let utxos = [];
+      try {
+          utxos = await fetchWithRetry(`${API_BASE}/api/utxos/${address}`, REQUEST_TIMEOUT_MS);
+      } catch (error: any) {
+          console.warn(`[CHARMS SCAN] Failed to fetch UTXOs: ${error.message}`);
+          console.log('[CHARMS SCAN] Returning empty result (graceful fallback)');
+          return [];
+      }
+      
       console.log(`[CHARMS SCAN] Found ${utxos.length} UTXOs`);
+
+      if (utxos.length === 0) {
+          console.log('[CHARMS SCAN] No UTXOs found, returning empty result');
+          return [];
+      }
 
       const payrollTokens: any[] = [];
 
@@ -74,20 +201,16 @@ export async function scanAddressForCharms(address: string) {
           const utxoId = `${utxo.txid}:${utxo.vout}`;
           console.log(`[CHARMS SCAN] Processing UTXO ${i}: txid=${utxo.txid.substring(0, 16)}..., vout=${utxo.vout}, value=${utxo.value}`);
 
-          // Skip if already spent or in-flight in the UI
           if (isUtxoUsed(utxoId)) {
               console.log(`[CHARMS SCAN]   UTXO marked as used - skipping`);
               continue;
           }
 
           try {
-              console.log(`[CHARMS SCAN]   Fetching transaction hex...`);
-              const hexRes = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/hex`, { responseType: 'text' });
-              const txHex = hexRes.data;
+              console.log(`[CHARMS SCAN]   Fetching transaction hex from local RPC...`);
+              const txHex = await fetchTextWithRetry(`${API_BASE}/api/tx/${utxo.txid}/hex`, REQUEST_TIMEOUT_MS);
               console.log(`[CHARMS SCAN]   Hex length: ${txHex.length}`);
 
-              // STRUCTURAL FIX: Pass a SINGLE-KEY object to satisfy "expected 1"
-              // Use mock=true to extract spell data without requiring prev_txs context
               console.log(`[CHARMS SCAN]   Calling extractAndVerifySpell with mock=true...`);
               const spell = extractAndVerifySpell({ bitcoin: txHex }, true);
               
@@ -96,22 +219,21 @@ export async function scanAddressForCharms(address: string) {
                   console.log(`[CHARMS SCAN]   Checking output at vout ${utxo.vout}:`, spell.tx.outs[utxo.vout]);
                   
                   const charmData = spell.tx.outs[utxo.vout];
-                  if (charmData && charmData["1"]) {
-                      console.log(`[CHARMS SCAN]   ✅ Found payroll token! amount=${charmData["1"]}`);
-                      payrollTokens.push({
-                          utxoId,
-                          spell: spell,
-                          amount: charmData["1"],
-                          timestamp: utxo.status?.block_time,
-                          validTo: charmData["validTo"] || null
-                      });
-                  } else {
-                      console.log(`[CHARMS SCAN]   No payroll token at this vout`);
-                  }
+                    if (charmData && (charmData["1"] || charmData["0"])) {
+                        const amount = charmData["1"] || charmData["0"]?.remaining || 1;
+                        console.log(`[CHARMS SCAN]   ✅ Found charm! ${charmData["1"] ? 'token' : 'NFT'}`);
+                        payrollTokens.push({
+                            utxoId,
+                            spell: spell,
+                            amount: amount,
+                            timestamp: utxo.status?.block_time,
+                            validTo: charmData["validTo"] || null
+                        });
+                    } else {
+                        console.log(`[CHARMS SCAN]   No charm at this vout`);
+                    }
               }
           } catch (e: any) {
-              // IMPORTANT: This catch handles standard BTC transactions
-              // which trigger a "Condition failed" panic
               console.log(`[CHARMS SCAN]   Skipping UTXO ${i}: ${e.message || e}`);
               continue;
           }
@@ -126,12 +248,7 @@ export async function scanAddressForCharms(address: string) {
   }
 }
 
-/**
- * Manual verification of UTXO status - Kept for debugging worker claims.
- * FIX: Added address validation and proper error handling [19]
- */
 export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean, details: any }> {
-    // FIX: Validate UTXO ID before API call [19]
     if (!utxoId || utxoId === 'null' || utxoId === 'undefined' || utxoId.trim() === '') {
         console.warn("[UTXO VERIFY] Verification deferred: No valid UTXO ID provided.");
         return { spent: true, details: { error: 'Invalid UTXO ID' } };
@@ -145,16 +262,12 @@ export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean
     }
     
     try {
-        const outspendResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}/outspend/${vout}`, {
-            timeout: 100000
-        });
-        const txResponse = await axios.get(`${MEMPOOL_API}/tx/${txid}`, {
-            timeout: 100000
-        });
+        const outspendData = await fetchWithRetry(`${API_BASE}/api/utxo/${txid}/${vout}/status`, REQUEST_TIMEOUT_MS);
+        const txData = await fetchWithRetry(`${API_BASE}/api/tx/${txid}`, REQUEST_TIMEOUT_MS);
         
         return {
-            spent: outspendResponse.data.spent,
-            details: { ...outspendResponse.data, txDetails: txResponse.data }
+            spent: outspendData.spent || false,
+            details: { ...outspendData, txDetails: txData }
         };
     } catch (error: any) {
         console.error(`Failed to verify UTXO ${utxoId}:`, error.message);
@@ -162,10 +275,6 @@ export async function verifyUtxoStatus(utxoId: string): Promise<{ spent: boolean
     }
 }
 
-/**
- * Helper function to provide user-friendly wallet status - Kept for frontend dashboard
- * FIX: Added address validation to prevent invalid API calls [19]
- */
 export async function getWalletStatus(address: string): Promise<{
   totalBalance: number;
   confirmedBalance: number;
@@ -175,7 +284,6 @@ export async function getWalletStatus(address: string): Promise<{
   usedUtxos: number;
   unconfirmedUtxos: number;
 }> {
-  // FIX: Validate address before API call - prevents Axios 400 errors [19]
   if (!address || address === 'null' || address === 'undefined' || address.trim() === '') {
     console.warn("[WALLET] Scanner deferred: No valid address provided.");
     return {
@@ -190,26 +298,24 @@ export async function getWalletStatus(address: string): Promise<{
   }
   
   try {
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
-      timeout: 100000
-    });
-    const utxos = response.data;
+    console.log(`[WALLET] Fetching UTXOs from local RPC for address: ${address.substring(0, 16)}...`);
+    const utxos = await fetchWithRetry(`${API_BASE}/api/utxos/${address}`, REQUEST_TIMEOUT_MS);
+    console.log(`[WALLET] Found ${utxos.length} UTXOs`);
     
     const usedUtxos = JSON.parse(localStorage.getItem(USED_UTXO_KEY) || '[]');
     const freshUtxos = utxos.filter((u: any) => !usedUtxos.includes(`${u.txid}:${u.vout}`));
     
     return {
       totalBalance: utxos.reduce((sum: number, u: any) => sum + u.value, 0),
-      confirmedBalance: utxos.filter((u: any) => u.status?.confirmed).reduce((sum: number, u: any) => sum + u.value, 0),
-      unconfirmedBalance: utxos.filter((u: any) => !u.status?.confirmed).reduce((sum: number, u: any) => sum + u.value, 0),
+      confirmedBalance: utxos.filter((u: any) => u.status?.confirmed !== false).reduce((sum: number, u: any) => sum + u.value, 0),
+      unconfirmedBalance: utxos.filter((u: any) => u.status?.confirmed === false).reduce((sum: number, u: any) => sum + u.value, 0),
       totalUtxos: utxos.length,
       freshUtxos: freshUtxos.length,
       usedUtxos: usedUtxos.length,
-      unconfirmedUtxos: utxos.filter((u: any) => !u.status?.confirmed).length
+      unconfirmedUtxos: utxos.filter((u: any) => u.status?.confirmed === false).length
     };
   } catch (error: any) {
-    console.error('Failed to get wallet status:', error);
-    // Return zeroed stats instead of throwing to prevent UI crashes
+    console.error('[WALLET] Failed to get wallet status:', error);
     return {
       totalBalance: 0,
       confirmedBalance: 0,
@@ -222,47 +328,36 @@ export async function getWalletStatus(address: string): Promise<{
   }
 }
 
-/**
- * DEBUG: Check all UTXOs for an address with spent status - Kept for frontend debugging
- * FIX: Added address validation [19]
- */
 export async function debugUtxos(address: string): Promise<any> {
-  // FIX: Validate address before API call [19]
   if (!address || address === 'null' || address === 'undefined' || address.trim() === '') {
     console.warn("[DEBUG UTXO] Debug deferred: No valid address provided.");
     return [];
   }
   
   try {
-    const response = await axios.get(`${MEMPOOL_API}/address/${address}/utxo`, {
-      timeout: 100000
-    });
-    const utxos = response.data;
+    const utxos = await fetchWithRetry(`${API_BASE}/api/utxos/${address}`, REQUEST_TIMEOUT_MS);
     
     const detailedUtxos = await Promise.all(
       utxos.map(async (utxo: any) => {
         const utxoId = `${utxo.txid}:${utxo.vout}`;
         try {
-          const outspend = await axios.get(`${MEMPOOL_API}/tx/${utxo.txid}/outspend/${utxo.vout}`, {
-            timeout: 5000
-          });
+          const outspend = await fetchWithRetry(`${API_BASE}/api/utxo/${utxo.txid}/${utxo.vout}/status`, REQUEST_TIMEOUT_MS);
           const isUsed = isUtxoUsed(utxoId);
           
-          // Determine status based on conditions
           let status = '✅ OK';
-          if (isUsed && !outspend.data.spent) {
+          if (isUsed && !outspend.spent) {
             status = '⚠️ POTENTIAL ISSUE';
-          } else if (!outspend.data.spent && isUsed) {
+          } else if (!outspend.spent && isUsed) {
             status = '📝 Tracked but not spent';
-          } else if (outspend.data.spent && !isUsed) {
+          } else if (outspend.spent && !isUsed) {
             status = '🔴 Spent but not tracked';
           }
           
           return {
             ...utxo,
             utxoId,
-            spent: outspend.data.spent,
-            spentByTxid: outspend.data.txid,
+            spent: outspend.spent || false,
+            spentByTxid: outspend.txid,
             locallyTracked: isUsed,
             status: status,
             timestamp: utxo.status?.block_time

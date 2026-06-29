@@ -110,6 +110,7 @@ export interface SpellRequest {
   utxoAddress?: string;
   fundingScript?: string;
   hasTreasuryChange?: boolean;
+  scrolls?: number[];
 
   planMetadata?: {
     anchorUtxo?: string;

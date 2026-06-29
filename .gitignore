@@ -110,3 +110,8 @@ transactions/*.json
 run_test.sh
 *.db
 charmbills-backend/payload.json
+subscription-engine/binary_base64.txt
+charmbills-backend/prover-payload-batch.json
+
+# keygen
+.charms/

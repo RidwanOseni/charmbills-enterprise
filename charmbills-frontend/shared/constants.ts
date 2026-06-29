@@ -1,6 +1,6 @@
 // Core Protocol Constants
-export const HARDCODED_APP_VK = "cf9522ef0acf81c12488b45dd127ff5c93b3b2acb7d547311870c8b46ae92d4c";
-export const PROVER_API_URL = "https://v14.charms.dev/spells/prove";
+export const HARDCODED_APP_VK = "a13118959704809007012e4de7d0e503369d77cf338c2590da55068e8597aa22";
+export const PROVER_API_URL = "https://v15.charms.dev/spells/prove";
 export const DEFAULT_FEE_RATE = 2;
 export const MIN_OUTPUT_SATS = 1000;
 
@@ -51,3 +51,8 @@ export const INDEXER_SCAN_INTERVAL_MS = 30000;
 
 export const DEFAULT_RPC_PORT = 48332; 
 export const DEFAULT_RPC_HOST = "localhost";
+
+// API Retry Configuration
+export const API_MAX_RETRIES = 2;
+export const API_RETRY_DELAY_MS = 1000;
+export const API_REQUEST_TIMEOUT_MS = 60000;

@@ -17,6 +17,6 @@
     "outDir": "dist",
     "resolveJsonModule": true
   },
-  "include": ["src/**/*", "../shared"],
+  "include": ["src/**/*.ts", "../shared/**/*.ts"],
   "exclude": ["src/runMintFlow.ts", "src/**/*.test.ts", "node_modules", "dist"]
 }

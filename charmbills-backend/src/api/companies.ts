@@ -1,7 +1,6 @@
 // src/api/companies.ts
 import { Request, Response } from 'express';
 import * as crypto from 'crypto';
-import * as scrolls from '../bitcoin/scrollsClient';
 import { saveCompanyConfig } from '../db/schema';
 
 // --------------------------------------------------------------------------------
@@ -9,16 +8,16 @@ import { saveCompanyConfig } from '../db/schema';
 // --------------------------------------------------------------------------------
 
 interface RegisterCompanyRequest {
-  employerAddress: string;   // HR manager's wallet address (primary key)
-  treasuryAddress: string;   // Wallet used for gas sponsorship
-  treasuryHexDest: string;   // Derived Taproot script hex (from wallet)
+  employerAddress: string;
+  treasuryAddress: string;
+  treasuryHexDest: string;
 }
 
 interface CompanyResponse {
   employerAddress: string;
   treasuryAddress: string;
   treasuryHexDest: string;
-  vaultAddress: string;      // ADDED: Unified company Scroll vault
+  vaultAddress: string;
   createdAt: string;
 }
 
@@ -34,7 +33,6 @@ function validateCompanyRequest(body: any): asserts body is RegisterCompanyReque
     throw new Error(`Missing required fields: ${missing.join(', ')}`);
   }
   
-  // Validate Bech32 address format (testnet or mainnet)
   const addressRegex = /^(tb1|bc1)[a-zA-HJ-NP-Z0-9]{25,90}$/;
   if (!addressRegex.test(body.employerAddress)) {
     throw new Error('employerAddress must be a valid Bech32 address (tb1... or bc1...)');
@@ -44,13 +42,11 @@ function validateCompanyRequest(body: any): asserts body is RegisterCompanyReque
     throw new Error('treasuryAddress must be a valid Bech32 address (tb1... or bc1...)');
   }
   
-  // Validate hex destination (should be hex string, even length, no 't' characters)
   const hexRegex = /^[0-9a-fA-F]+$/;
   if (!hexRegex.test(body.treasuryHexDest) || body.treasuryHexDest.length % 2 !== 0) {
     throw new Error('treasuryHexDest must be a valid hex string (even number of hex characters)');
   }
   
-  // Taproot scriptPubKey should start with '5120' (P2TR)
   if (!body.treasuryHexDest.startsWith('5120')) {
     console.warn(`[WARNING] treasuryHexDest does not start with '5120' (Taproot prefix). Got: ${body.treasuryHexDest.substring(0, 4)}`);
   }
@@ -72,10 +68,8 @@ function getDb(req: Request) {
  * Register a new company's infrastructure details
  * POST /api/companies/register
  * 
- * UPDATED: When a company is onboarded, calculate their unique vault address
- * from the Scroll protocol once and save it in the companies table for easy lookup.
- * This gives each company its own mathematically isolated vault while ensuring
- * the HR manager only has to fund one address for all departmental payrolls.
+ * v15: Scroll address is auto-filled by prover when dest is empty and scrolls index is specified.
+ * No manual vault address derivation needed - stored as empty string placeholder.
  */
 export async function registerCompany(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -84,7 +78,6 @@ export async function registerCompany(req: Request, res: Response) {
   console.log(`\n[COMPANY API:${requestId}] ===== START registerCompany =====`);
   
   try {
-    // Validate request body
     validateCompanyRequest(req.body);
     
     const { employerAddress, treasuryAddress, treasuryHexDest } = req.body;
@@ -93,21 +86,9 @@ export async function registerCompany(req: Request, res: Response) {
     console.log(`[COMPANY API:${requestId}] Treasury address: ${treasuryAddress.substring(0, 20)}...`);
     console.log(`[COMPANY API:${requestId}] Treasury hex dest: ${treasuryHexDest.substring(0, 30)}...`);
 
-    // 1. DERIVE DETERMINISTIC VAULT: Call Scroll Client to get the unique vault address
-    // This uses the deriveCompanyNonce logic implemented in scrollsClient.ts [1, 2]
-    console.log(`[COMPANY API:${requestId}] 🏦 Deriving unique Scroll vault address...`);
-    
-    let vaultAddress: string;
-    try {
-      vaultAddress = await scrolls.getCompanyVaultAddress(employerAddress);
-      console.log(`[COMPANY API:${requestId}] Derived vault address: ${vaultAddress.substring(0, 30)}...`);
-    } catch (scrollError: any) {
-      console.error(`[COMPANY API:${requestId}] ❌ Failed to derive vault address:`, scrollError.message);
-      throw new Error(`Cannot register company: Scroll API error - ${scrollError.message}`);
-    }
+    console.log(`[COMPANY API:${requestId}] v15: Scroll address will be auto-filled by prover`);
+    const vaultAddress = '';
 
-    // 2. SAVE TO DATABASE: Store all infra details including the new vault address
-    // Matches the updated schema.ts requirement [3]
     console.log(`[COMPANY API:${requestId}] 💾 Saving company configuration to database...`);
     
     await saveCompanyConfig(
@@ -126,8 +107,8 @@ export async function registerCompany(req: Request, res: Response) {
       createdAt: new Date().toISOString()
     };
 
-    console.log(`[COMPANY API:${requestId}] ✅ Company and Vault registered successfully`);
-    console.log(`[COMPANY API:${requestId}]   Vault: ${vaultAddress.substring(0, 30)}...`);
+    console.log(`[COMPANY API:${requestId}] ✅ Company registered successfully`);
+    console.log(`[COMPANY API:${requestId}]   Vault: auto-filled by prover (v15)`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
     return res.status(201).json({ success: true, ...response });
@@ -149,9 +130,7 @@ export async function registerCompany(req: Request, res: Response) {
  * Get company details by employer address
  * GET /api/companies/:employerAddress
  * 
- * UPDATED: Returns vaultAddress as well
- * UPDATED: LAZY POPULATION - If vaultAddress is missing (legacy company), 
- * calculate it on-the-fly and save it back to the database
+ * v15: Returns empty vaultAddress - prover fills automatically
  */
 export async function getCompany(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -167,7 +146,6 @@ export async function getCompany(req: Request, res: Response) {
     
     console.log(`[COMPANY API:${requestId}] Fetching company: ${employerAddress.substring(0, 20)}...`);
     
-    // 1. Fetch the existing record
     const result = await db.execute({
       sql: 'SELECT * FROM companies WHERE employerAddress = ?',
       args: [employerAddress]
@@ -185,31 +163,8 @@ export async function getCompany(req: Request, res: Response) {
       });
     }
     
-    // 2. LAZY POPULATION: If vaultAddress is missing (legacy company), calculate and save it now
-    if (!company.vaultAddress) {
-      console.log(`[COMPANY API:${requestId}] 🔄 Migrating legacy company: vaultAddress missing, deriving from Scroll...`);
-      
-      try {
-        const derivedVault = await scrolls.getCompanyVaultAddress(employerAddress);
-        console.log(`[COMPANY API:${requestId}] Derived vault address: ${derivedVault.substring(0, 30)}...`);
-        
-        await db.execute({
-          sql: 'UPDATE companies SET vaultAddress = ?, updatedAt = ? WHERE employerAddress = ?',
-          args: [derivedVault, new Date().toISOString(), employerAddress]
-        });
-        
-        // Update the local object for the response
-        company.vaultAddress = derivedVault;
-        
-        console.log(`[COMPANY API:${requestId}] ✅ Legacy company migrated with vault address`);
-      } catch (migrationError: any) {
-        console.error(`[COMPANY API:${requestId}] ❌ Failed to derive vault for legacy company:`, migrationError.message);
-        // Continue without vault address - don't fail the request
-      }
-    }
-    
     console.log(`[COMPANY API:${requestId}] ✅ Company found`);
-    console.log(`[COMPANY API:${requestId}]   Vault: ${company.vaultAddress ? company.vaultAddress.substring(0, 30) + '...' : 'not set'}`);
+    console.log(`[COMPANY API:${requestId}]   Vault: auto-filled by prover (v15)`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json({
@@ -218,7 +173,7 @@ export async function getCompany(req: Request, res: Response) {
         employerAddress: company.employerAddress,
         treasuryAddress: company.treasuryAddress,
         treasuryHexDest: `${company.treasuryHexDest.substring(0, 20)}...`,
-        vaultAddress: company.vaultAddress ? company.vaultAddress : null,
+        vaultAddress: '',
         createdAt: company.createdAt,
         updatedAt: company.updatedAt
       }
@@ -239,8 +194,6 @@ export async function getCompany(req: Request, res: Response) {
 /**
  * Get all companies (for admin dashboard)
  * GET /api/companies
- * 
- * UPDATED: Returns vaultAddress as well
  */
 export async function listCompanies(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -260,12 +213,11 @@ export async function listCompanies(req: Request, res: Response) {
     console.log(`[COMPANY API:${requestId}] Found ${companies.length} companies`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
-    // Return full data for admin dashboard (no truncation for internal use)
     const sanitized = companies.map((c: any) => ({
       employerAddress: c.employerAddress,
       treasuryAddress: c.treasuryAddress,
       treasuryHexDest: c.treasuryHexDest,
-      vaultAddress: c.vaultAddress,
+      vaultAddress: '',
       createdAt: c.createdAt,
       updatedAt: c.updatedAt
     }));
@@ -305,7 +257,6 @@ export async function deleteCompany(req: Request, res: Response) {
       throw new Error('employerAddress is required');
     }
     
-    // Check if company exists
     const existsResult = await db.execute({
       sql: 'SELECT employerAddress FROM companies WHERE employerAddress = ?',
       args: [employerAddress]
@@ -322,7 +273,6 @@ export async function deleteCompany(req: Request, res: Response) {
       });
     }
     
-    // Delete company
     await db.execute({
       sql: 'DELETE FROM companies WHERE employerAddress = ?',
       args: [employerAddress]
@@ -370,7 +320,6 @@ export async function updateTreasuryHex(req: Request, res: Response) {
       throw new Error('treasuryHexDest is required');
     }
     
-    // Validate hex
     const hexRegex = /^[0-9a-fA-F]+$/;
     if (!hexRegex.test(treasuryHexDest) || treasuryHexDest.length % 2 !== 0) {
       throw new Error('treasuryHexDest must be a valid hex string (even number of hex characters)');

@@ -57,7 +57,6 @@ export function buildScrollReleaseVars(
   
   const authorityUtxos = request.authorityUtxos || (request.authorityUtxo ? [request.authorityUtxo] : []);
   
-  // Filter out system outputs to identify only real workers
   const realWorkers = request.outputs.filter(o => 
     o.address !== constants.PLATFORM_FEE_ADDRESS && 
     o.address !== constants.SCROLL_FEE_ADDRESS_TESTNET4 &&
@@ -85,6 +84,11 @@ export function buildScrollReleaseVars(
   
   console.log(`[buildScrollRelease] Department NFT state: ticker=${request.planMetadata!.ticker}, remaining=${request.planMetadata!.remaining}`);
   
+  const workerCount = realWorkers.length;
+  let scrollIndex = workerCount;
+  if (platformFeeOutput) scrollIndex++;
+  if (scrollFeeOutput) scrollIndex++;
+  
   const variables: Record<string, any> = {
     type_name: "scroll-release",
     app_id: String(request.planMetadata!.appId),
@@ -93,7 +97,7 @@ export function buildScrollReleaseVars(
     authority_utxos: authorityUtxos,
     funding_utxo: String(request.fundingUtxo),
     salary_utxo: String(request.salaryUtxo),
-    treasury_dest: String(treasuryHexDest),
+    treasury_dest: "",
     ticker: request.planMetadata!.ticker,
     remaining: String(request.planMetadata!.remaining),
     metadata_hash: request.planMetadata!.metadataHash || "0".repeat(64),
@@ -102,7 +106,8 @@ export function buildScrollReleaseVars(
     compensation_sats: String(request.planMetadata!.compensationSats || 0),
     has_treasury_change: !!request.hasTreasuryChange,
     worker_dests: workerDests,
-    token_amounts: salaryAmounts
+    token_amounts: salaryAmounts,
+    scrolls: String(scrollIndex)
   };
   
   if (process.env.NODE_ENV !== 'production') {
@@ -115,6 +120,8 @@ export function buildScrollReleaseVars(
       funding_utxo: request.fundingUtxo.substring(0, 20) + '...',
       salary_utxo: request.salaryUtxo ? request.salaryUtxo.substring(0, 20) + '...' : 'undefined',
       worker_count: workerDests.length,
+      scrolls_index: variables.scrolls,
+      treasury_dest_empty: variables.treasury_dest === "",
       variableCount: Object.keys(variables).length
     });
   }

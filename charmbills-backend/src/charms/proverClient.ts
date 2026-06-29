@@ -12,6 +12,7 @@ import { buildScrollReleaseVars } from './buildScrollRelease';
 import { fetchTransactionHex } from '../lib/utxo-manager';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from 'tiny-secp256k1';
+import * as crypto from 'crypto';
 
 bitcoin.initEccLib(ecc);
 
@@ -24,6 +25,8 @@ const PROVER_TIMEOUT_MS = 500000;
 
 const ENGINE_DIR = path.resolve(process.cwd(), '../subscription-engine');
 const WASM_PATH = path.join(ENGINE_DIR, 'target/wasm32-wasip1/release/subscription-engine.wasm');
+const SIG_PATH = path.join(ENGINE_DIR, 'target/wasm32-wasip1/release/subscription-engine.wasm.sig.yaml');
+const KEY_PATH = path.join(ENGINE_DIR, '.charms/app-key.json');
 
 async function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -86,7 +89,6 @@ function deriveAppId(utxoId: string): string {
     if (!utxoId || typeof utxoId !== 'string') {
         throw new Error('Invalid utxoId: must be non-empty string');
     }
-    const crypto = require('crypto');
     return crypto.createHash('sha256').update(utxoId).digest('hex');
 }
 
@@ -138,22 +140,112 @@ function addressToHexDest(address: string): string {
     }
 }
 
+let wasmBufferCache: Buffer | null = null;
+
 function getWasmBuffer(): Buffer {
+    if (wasmBufferCache) {
+        return wasmBufferCache;
+    }
+    
     console.log(`[PAYROLL PROVER] Loading WASM from: ${WASM_PATH}`);
     
     if (!fs.existsSync(WASM_PATH)) {
         throw new Error(`CRITICAL: WASM binary not found at ${WASM_PATH}. Run 'cargo build' in subscription-engine.`);
     }
     
-    const wasmBuffer = fs.readFileSync(WASM_PATH);
-    console.log(`[PAYROLL PROVER] WASM loaded: ${wasmBuffer.length} bytes`);
+    wasmBufferCache = fs.readFileSync(WASM_PATH);
+    console.log(`[PAYROLL PROVER] WASM loaded: ${wasmBufferCache.length} bytes`);
     
-    return wasmBuffer;
+    return wasmBufferCache;
 }
 
 function getWasmBase64(): string {
     const wasmBuffer = getWasmBuffer();
     return wasmBuffer.toString('base64');
+}
+
+function getWasmHash(): string {
+    const wasmBuffer = getWasmBuffer();
+    return crypto.createHash('sha256').update(wasmBuffer).digest('hex');
+}
+
+function getWasmSignature(): Record<string, any> | null {
+    console.log(`[PAYROLL PROVER] Loading signature from: ${SIG_PATH}`);
+    
+    if (!fs.existsSync(SIG_PATH)) {
+        console.warn(`[PAYROLL PROVER] WARNING: Signature file not found at ${SIG_PATH}`);
+        console.warn('[PAYROLL PROVER] This is required for versioned apps in v15');
+        return null;
+    }
+    
+    try {
+        const rawContent = fs.readFileSync(SIG_PATH, 'utf8').trim();
+        console.log(`[PAYROLL PROVER] Raw signature content length: ${rawContent.length}`);
+        
+        let signatureHex: string | null = null;
+        const lines = rawContent.split('\n');
+        
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            
+            if (trimmed.includes(':')) {
+                const colonIndex = trimmed.indexOf(':');
+                const value = trimmed.substring(colonIndex + 1).trim();
+                if (value.length === 128 && /^[a-f0-9]+$/i.test(value)) {
+                    signatureHex = value;
+                    console.log(`[PAYROLL PROVER] Extracted signature hex (128 chars) from YAML`);
+                    break;
+                }
+            }
+        }
+        
+        if (!signatureHex) {
+            const words = rawContent.split(/\s+/);
+            for (const word of words) {
+                if (word.length === 128 && /^[a-f0-9]+$/i.test(word)) {
+                    signatureHex = word;
+                    console.log(`[PAYROLL PROVER] Extracted signature hex (128 chars) from raw content`);
+                    break;
+                }
+            }
+        }
+        
+        if (!signatureHex) {
+            console.warn(`[PAYROLL PROVER] No valid 128-char signature hex found in file`);
+            return null;
+        }
+        
+        console.log(`[PAYROLL PROVER] Signature loaded successfully, length: ${signatureHex.length} chars`);
+        
+        if (!fs.existsSync(KEY_PATH)) {
+            console.error(`[PAYROLL PROVER] CRITICAL: app-key.json not found at ${KEY_PATH}`);
+            console.error('[PAYROLL PROVER] This is required for versioned apps in v15');
+            return null;
+        }
+        
+        const keyFileContent = fs.readFileSync(KEY_PATH, 'utf8');
+        const keyFile = JSON.parse(keyFileContent);
+        const publicKeyHex = keyFile.public_key;
+        
+        if (!publicKeyHex || !/^[a-f0-9]+$/i.test(publicKeyHex)) {
+            console.error(`[PAYROLL PROVER] CRITICAL: Invalid public_key in app-key.json`);
+            return null;
+        }
+        
+        console.log(`[PAYROLL PROVER] Public key loaded, length: ${publicKeyHex.length} chars`);
+        
+        return { 
+            [APP_VK]: { 
+                public_key: publicKeyHex,
+                signature: signatureHex,
+                version: 15 
+            } 
+        };
+    } catch (error: any) {
+        console.error(`[PAYROLL PROVER] Failed to load signature: ${error.message}`);
+        return null;
+    }
 }
 
 function stringToBytes(str: string): number[] {
@@ -214,7 +306,6 @@ export async function generateUnsignedTransactions(
             finalAppId = request.planMetadata?.appId;
             console.log('[PAYROLL PROVER] Built scroll-release typed variables');
             console.log(`[PAYROLL PROVER] Variables count: ${Object.keys(variables).length}`);
-            // ADD THIS DEBUG LOG
             console.log(`[PAYROLL PROVER] authority_utxos count: ${variables.authority_utxos?.length || 0}`);
             console.log('🔍 [PROVER] variables object:', JSON.stringify(variables, null, 2));
         } else {
@@ -238,8 +329,8 @@ export async function generateUnsignedTransactions(
         spellObj = JSON.parse(processedSpellStr);
         console.log('[PAYROLL PROVER] Successfully parsed WASM output to JSON object');
         
-        console.log('[PAYROLL PROVER] Overriding spell.version from', spellObj.version, 'to 14');
-        spellObj.version = 14;
+        console.log('[PAYROLL PROVER] Overriding spell.version from', spellObj.version, 'to 15');
+        spellObj.version = 15;
         console.log('[PAYROLL PROVER] spell.version is now', spellObj.version);
         
         console.log(`[PAYROLL PROVER] Checking for Collapsed Model deduplication...`);
@@ -309,12 +400,19 @@ export async function generateUnsignedTransactions(
                 console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.ins.length} tx.ins entries`);
             }
             
-            console.log('[PAYROLL PROVER] Patching tx.coins dest from numeric arrays to Uint8Array...');
+            console.log('[PAYROLL PROVER] Patching tx.coins dest for v15 Scroll routing...');
             if (spellObj.tx && Array.isArray(spellObj.tx.coins)) {
-                spellObj.tx.coins = spellObj.tx.coins.map((coin: any) => ({
-                    ...coin,
-                    dest: new Uint8Array(coin.dest)
-                }));
+                spellObj.tx.coins = spellObj.tx.coins.map((coin: any) => {
+                    if (coin.dest === "" || coin.dest === null || coin.dest === undefined) {
+                        console.log(`[PAYROLL PROVER] Coin with empty dest - Scroll will fill address`);
+                        return { ...coin, dest: new Uint8Array(0) };
+                    }
+                    if (typeof coin.dest === 'string') {
+                        console.log(`[PAYROLL PROVER] Decoding hex destination: ${coin.dest.substring(0, 30)}...`);
+                        return { ...coin, dest: hexToBytes(coin.dest) };
+                    }
+                    return { ...coin, dest: new Uint8Array(coin.dest) };
+                });
                 console.log(`[PAYROLL PROVER] Patched ${spellObj.tx.coins.length} tx.coins dest entries`);
             }
             
@@ -326,14 +424,26 @@ export async function generateUnsignedTransactions(
                     if (parts.length === 3 && (parts[0] === 'n' || parts[0] === 't')) {
                         const [tag, idHex, vkHex] = parts;
                         const complexKey = [tag, hexToBytes(idHex), hexToBytes(vkHex)];
-                        patchedPublicInputs.set(complexKey, value);
-                        console.log(`[PAYROLL PROVER] Patched key: ${key} -> [${tag}, <${idHex.length} bytes>, <${vkHex.length} bytes>]`);
+                        patchedPublicInputs.set(complexKey, null);
+                        console.log(`[PAYROLL PROVER] Patched key: ${key} -> [${tag}, ${idHex.substring(0, 16)}..., ${vkHex.substring(0, 16)}...]`);
                     } else {
                         patchedPublicInputs.set(key, value);
                     }
                 }
                 spellObj.app_public_inputs = patchedPublicInputs;
-                console.log('[PAYROLL PROVER] app_public_inputs patched to Map with array keys');
+                console.log(`[PAYROLL PROVER] app_public_inputs patched to Map with ${patchedPublicInputs.size} entries`);
+
+                console.log('[PAYROLL PROVER] 🔍 app_public_inputs Map contents:', Array.from(patchedPublicInputs.entries()).map(([key, val]: [any, any]) => {
+                    return {
+                        key: key.map((k: any) => {
+                            if (k instanceof Uint8Array) {
+                                return `Uint8Array(${k.length})`;
+                            }
+                            return k;
+                        }),
+                        value: val
+                    };
+                }));
             }
             
         } else if (request.type === 'mint-token') {
@@ -385,23 +495,21 @@ export async function generateUnsignedTransactions(
                 console.log(`[PAYROLL PROVER] Reconstructed tx.coins array with ${spellObj.tx.coins.length} entries`);
             }
             
-            console.log('[PAYROLL PROVER] Converting app_public_inputs to Map with Uint8Array keys...');
-            const appIdBytes = new Uint8Array(Buffer.from(finalAppId!, 'hex'));
-            const appVkBytes = new Uint8Array(Buffer.from(APP_VK, 'hex'));
+            console.log('[PAYROLL PROVER] Converting app_public_inputs to Map...');
+            const appIdHex = finalAppId!;
+            const appVkHex = APP_VK;
             const publicInputsMap = new Map();
-            publicInputsMap.set(["n", appIdBytes, appVkBytes], null);
-            publicInputsMap.set(["t", appIdBytes, appVkBytes], null);
+            publicInputsMap.set(["n", hexToBytes(appIdHex), hexToBytes(appVkHex)], null);
+            publicInputsMap.set(["t", hexToBytes(appIdHex), hexToBytes(appVkHex)], null);
             spellObj.app_public_inputs = publicInputsMap;
-            console.log('[PAYROLL PROVER] app_public_inputs converted to Map with Uint8Array keys');
+            console.log(`[PAYROLL PROVER] app_public_inputs converted to Map with ${publicInputsMap.size} entries`);
             
         } else if (request.type === 'scroll-release') {
             console.log('[PAYROLL PROVER] SCROLL-RELEASE PATH: Restoring Binary Parity...');
             
-            // Get all authority UTXOs (worker tokens being spent)
             const authorityUtxos = request.authorityUtxos || (request.authorityUtxo ? [request.authorityUtxo] : []);
             console.log(`[PAYROLL PROVER] Authority UTXOs count: ${authorityUtxos.length}`);
             
-            // Build tx.ins: all authority tokens + funding UTXO + salary UTXO
             const authorityInputs = authorityUtxos.map((utxoId: string) => new Uint8Array(utxoTo36Bytes(utxoId)));
             const fundingInput = new Uint8Array(utxoTo36Bytes(request.fundingUtxo));
             const salaryInput = new Uint8Array(utxoTo36Bytes(request.salaryUtxo!));
@@ -428,15 +536,21 @@ export async function generateUnsignedTransactions(
                 console.log(`[PAYROLL PROVER] Converted ${spellObj.tx.outs.length} tx.outs entries to Maps with integer keys`);
             }
             
-            console.log('[PAYROLL PROVER] Converting tx.coins dest from addresses to hex scripts...');
+            console.log('[PAYROLL PROVER] Converting tx.coins dest for v15 Scroll routing...');
             if (spellObj.tx && Array.isArray(spellObj.tx.coins) && request.outputs) {
-                // Rebuild coins from request.outputs to ensure proper hex conversion
                 const rebuiltCoins = [];
                 for (let i = 0; i < request.outputs.length; i++) {
                     const output = request.outputs[i];
-                    const destHex = addressToHexDest(output.address);
-                    const destUint8 = new Uint8Array(Buffer.from(destHex, 'hex'));
-                    console.log(`[PAYROLL PROVER] Coin ${i}: ${output.address} -> hex ${destHex.substring(0, 30)}...`);
+                    let destUint8: Uint8Array;
+                    
+                    if (output.address === "" || output.address === null || output.address === undefined) {
+                        console.log(`[PAYROLL PROVER] Coin ${i} has empty address - Scroll will fill`);
+                        destUint8 = new Uint8Array(0);
+                    } else {
+                        const destHex = addressToHexDest(output.address);
+                        destUint8 = new Uint8Array(Buffer.from(destHex, 'hex'));
+                        console.log(`[PAYROLL PROVER] Coin ${i}: ${output.address} -> hex ${destHex.substring(0, 30)}...`);
+                    }
                     rebuiltCoins.push({
                         amount: output.sats || 0,
                         dest: destUint8
@@ -446,7 +560,7 @@ export async function generateUnsignedTransactions(
                 console.log(`[PAYROLL PROVER] Rebuilt ${spellObj.tx.coins.length} tx.coins entries with hex scripts`);
             }
             
-            console.log('[PAYROLL PROVER] Converting app_public_inputs to Map with Uint8Array keys...');
+            console.log('[PAYROLL PROVER] Converting app_public_inputs to Map...');
             if (spellObj.app_public_inputs && typeof spellObj.app_public_inputs === 'object') {
                 const patchedPublicInputs = new Map();
                 for (const [key, value] of Object.entries(spellObj.app_public_inputs)) {
@@ -454,16 +568,37 @@ export async function generateUnsignedTransactions(
                     if (parts.length === 3 && (parts[0] === 'n' || parts[0] === 't')) {
                         const [tag, idHex, vkHex] = parts;
                         const complexKey = [tag, hexToBytes(idHex), hexToBytes(vkHex)];
-                        patchedPublicInputs.set(complexKey, value);
-                        console.log(`[PAYROLL PROVER] Patched key: ${key} -> [${tag}, <${idHex.length} bytes>, <${vkHex.length} bytes>]`);
+                        patchedPublicInputs.set(complexKey, null);
+                        console.log(`[PAYROLL PROVER] Patched key: ${key} -> [${tag}, ${idHex.substring(0, 16)}..., ${vkHex.substring(0, 16)}...]`);
                     } else {
                         patchedPublicInputs.set(key, value);
                     }
                 }
                 spellObj.app_public_inputs = patchedPublicInputs;
-                console.log('[PAYROLL PROVER] app_public_inputs patched to Map with array keys');
+                console.log(`[PAYROLL PROVER] app_public_inputs patched to Map with ${patchedPublicInputs.size} entries`);
             }
         }
+        
+        if (request.scrolls && Array.isArray(request.scrolls) && request.scrolls.length > 0) {
+            if (!spellObj.tx) {
+                spellObj.tx = {};
+            }
+            spellObj.tx.scrolls = request.scrolls;
+            console.log(`[PAYROLL PROVER] Added scrolls array to tx: [${request.scrolls.join(', ')}]`);
+        } else if (spellObj.tx && spellObj.tx.scrolls) {
+            console.log(`[PAYROLL PROVER] scrolls already present in spellObj: ${JSON.stringify(spellObj.tx.scrolls)}`);
+        }
+        
+        const wasmHash = getWasmHash();
+        const versionedAppsMap = new Map();
+        const vkBytes = hexToBytes(APP_VK);
+        const wasmHashBytes = hexToBytes(wasmHash);
+        versionedAppsMap.set(vkBytes, {
+            version: 15,
+            wasm_hash: wasmHashBytes
+        });
+        spellObj.versioned_apps = versionedAppsMap;
+        console.log(`[PAYROLL PROVER] Added versioned_apps with wasm_hash: ${wasmHash.substring(0, 16)}...`);
         
         console.log('[PAYROLL PROVER] DEBUG - Final spellObj structure summary:');
         console.log(`  version: ${spellObj.version}`);
@@ -476,7 +611,12 @@ export async function generateUnsignedTransactions(
         if (spellObj.tx?.coins && spellObj.tx.coins.length > 0) {
             console.log(`  tx.coins[0].dest type: ${spellObj.tx.coins[0]?.dest instanceof Uint8Array ? 'Uint8Array' : typeof spellObj.tx.coins[0]?.dest}, isArray: ${Array.isArray(spellObj.tx.coins[0]?.dest)}`);
         }
+        console.log(`  tx.scrolls: ${spellObj.tx?.scrolls ? JSON.stringify(spellObj.tx.scrolls) : 'undefined'}`);
         console.log(`  app_public_inputs type: ${spellObj.app_public_inputs?.constructor?.name}`);
+        if (spellObj.app_public_inputs instanceof Map) {
+            console.log(`  app_public_inputs size: ${spellObj.app_public_inputs.size}`);
+        }
+        console.log(`  versioned_apps: ${JSON.stringify(spellObj.versioned_apps)}`);
         
     } catch (error: any) {
         console.error('[PAYROLL PROVER] WASM processing failed:', error);
@@ -499,6 +639,16 @@ export async function generateUnsignedTransactions(
     const wasmBase64 = getWasmBase64();
     console.log(`[PAYROLL PROVER] WASM base64 length: ${wasmBase64.length}`);
     
+    const signature = getWasmSignature();
+    if (signature) {
+        console.log(`[PAYROLL PROVER] Signature loaded, VK: ${Object.keys(signature).join(', ')}`);
+        if (signature[APP_VK] && signature[APP_VK].public_key) {
+            console.log(`[PAYROLL PROVER] Public key included, length: ${signature[APP_VK].public_key.length} chars`);
+        }
+    } else {
+        console.warn('[PAYROLL PROVER] No signature found - this may cause validation errors for versioned apps');
+    }
+    
     let identityToProve: string;
     
     if (request.type === 'mint-nft') {
@@ -514,7 +664,6 @@ export async function generateUnsignedTransactions(
         }
         console.log(`[PAYROLL PROVER] mint-token: Using planMetadata.anchorUtxo as witness`);
     } else if (request.type === 'scroll-release') {
-        // CRITICAL: Use the original anchor UTXO from planMetadata as witness
         identityToProve = (request as any).planMetadata?.anchorUtxo;
         if (!identityToProve) {
             throw new Error('No anchorUtxo found in planMetadata for scroll-release witness');
@@ -538,19 +687,28 @@ export async function generateUnsignedTransactions(
         }
     });
 
+    const wasmHash = getWasmHash();
+
     const requestBody: any = {
         spell: spellHex,
         app_private_inputs: {
             [`n/${finalAppId}/${APP_VK}`]: witnessHex
         },
         binaries: {
-            [APP_VK]: wasmBase64
+            [wasmHash]: wasmBase64
         },
         prev_txs: cleanedPrevTxs.map(hex => ({ bitcoin: hex })),
         change_address: request.changeAddress,
         fee_rate: request.feeRate || 2.0,
         chain: "bitcoin"
     };
+
+    if (signature) {
+        requestBody.app_signatures = signature;
+        console.log('[PAYROLL PROVER] Added app_signatures to request body');
+    } else {
+        console.warn('[PAYROLL PROVER] No app_signatures added - versioned apps require this');
+    }
 
     if (request.type === 'mint-token') {
         requestBody.app_private_inputs[`t/${finalAppId}/${APP_VK}`] = witnessHex;
@@ -570,6 +728,10 @@ export async function generateUnsignedTransactions(
     console.log('[PAYROLL PROVER] spell prefix:', requestBody.spell?.substring(0, 50));
     console.log('[PAYROLL PROVER] app_private_inputs keys:', Object.keys(requestBody.app_private_inputs));
     console.log('[PAYROLL PROVER] binaries keys:', Object.keys(requestBody.binaries));
+    console.log('[PAYROLL PROVER] app_signatures present:', !!requestBody.app_signatures);
+    if (requestBody.app_signatures) {
+        console.log('[PAYROLL PROVER] app_signatures keys:', Object.keys(requestBody.app_signatures));
+    }
     console.log('[PAYROLL PROVER] prev_txs length:', requestBody.prev_txs?.length);
     console.log('[PAYROLL PROVER] change_address:', requestBody.change_address);
     console.log('[PAYROLL PROVER] fee_rate:', requestBody.fee_rate);
@@ -585,6 +747,7 @@ export async function generateUnsignedTransactions(
     console.log('  spell last 100 chars:', requestBody.spell?.substring(requestBody.spell.length - 100));
     console.log('  app_private_inputs first key type:', typeof Object.keys(requestBody.app_private_inputs)[0]);
     console.log('  binaries first key type:', typeof Object.keys(requestBody.binaries)[0]);
+    console.log('  app_signatures first key type:', requestBody.app_signatures ? typeof Object.keys(requestBody.app_signatures)[0] : 'undefined');
     console.log('  prev_txs[0] type:', typeof requestBody.prev_txs[0]);
     console.log('  prev_txs[0] is object?', typeof requestBody.prev_txs[0] === 'object');
     console.log('  prev_txs[0].bitcoin type:', typeof requestBody.prev_txs[0]?.bitcoin);
@@ -689,7 +852,6 @@ export async function generateUnsignedTransactions(
                 console.error(`  Status Text: ${error.response.statusText}`);
                 console.error(`  Response Data:`, JSON.stringify(error.response.data, null, 2));
                 
-                // ADD THIS FULL BLOCK:
                 console.error(`  ===== PROVER ERROR DETAILS =====`);
                 console.error(`  Response type: ${typeof error.response.data}`);
                 
@@ -830,6 +992,7 @@ export async function createEmploymentPlan(
                 compensationSats: planDetails.compensationSats
             }
         }],
+        scrolls: [0],
         ...(multiSigSigners && { multiSigSigners, multiSigThreshold: 2 })
     };
     

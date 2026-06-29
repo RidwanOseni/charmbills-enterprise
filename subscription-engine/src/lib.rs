@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
+charms_sdk::app_version!(15);
+
 #[cfg(feature = "wasm-bridge")]
 use wasm_bindgen::prelude::*;
 
@@ -36,6 +38,7 @@ pub struct BridgeVariables {
     pub token_amounts: Option<Vec<String>>,
     pub has_treasury_change: Option<bool>,
     pub treasury_change_sats: Option<u64>,
+    pub scrolls: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,8 +81,12 @@ impl NftContent {
     }
 }
 
-pub fn app_contract(app: &App, tx: &Transaction, _x: &Data, w: &Data) -> bool {
-    let _ = _x.bytes();
+pub fn app_contract(app: &App, tx: &Transaction, x: &Data, w: &Data) -> bool {
+    let empty = Data::empty();
+    if x != &empty {
+        return false;
+    }
+
     match app.tag {
         NFT => nft_contract_satisfied(app, tx, w),
         TOKEN => token_contract_satisfied(app, tx),
@@ -637,8 +644,8 @@ pub fn process_spell_template(_template_yaml: &str, variables_json: &str) -> Res
         }
     }
 
-    let spell = serde_json::json!({
-        "version": 11,
+    let mut spell = serde_json::json!({
+        "version": 15,
         "tx": {
             "ins": ins,
             "outs": outs,
@@ -649,6 +656,15 @@ pub fn process_spell_template(_template_yaml: &str, variables_json: &str) -> Res
             format!("t/{}/{}", vars.app_id, vars.app_vk): serde_json::Value::Null
         }
     });
+
+    if let Some(scrolls_str) = vars.scrolls {
+        if let Ok(scrolls_index) = scrolls_str.parse::<usize>() {
+            if let Some(tx_obj) = spell.get_mut("tx").and_then(|t| t.as_object_mut()) {
+                tx_obj.insert("scrolls".to_string(), serde_json::json!([scrolls_index]));
+                eprintln!("[RUST-DEBUG] Added scrolls field: [{}]", scrolls_index);
+            }
+        }
+    }
 
     serde_json::to_string(&spell)
         .map_err(|e| JsValue::from_str(&format!("Serialization Error: {}", e)))

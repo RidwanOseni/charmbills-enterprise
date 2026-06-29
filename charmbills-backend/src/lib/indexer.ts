@@ -18,27 +18,16 @@ import {
 } from '@shared/constants';
 import * as dotenv from 'dotenv';
 import * as crypto from 'crypto';
-import * as scrolls from '../bitcoin/scrollsClient';
+import { requestScrollSignature } from '../bitcoin/scrollsClient';
 import { generateUnsignedTransactions } from '../charms/proverClient';
 import { getDynamicFundingUtxo, fetchTransactionHex, verifyUtxoStatus, lockUtxo, unlockUtxo, getCurrentFeeRate, estimateTransactionVSize, calculateNetworkFee } from './utxo-manager';
 import { calculateScrollFee } from './charms-utils';
 
-// =========================================================================
-// CRITICAL FIX: Use the DEDICATED SCANNER BRIDGE for extractAndVerifySpell
-// This preserves the prover bridge (charms_lib.js) for templating while
-// using the scanner bridge (charms_protocol_scanner.js) for blockchain indexing
-// =========================================================================
 console.log("Loading from:", require.resolve("../charms/wasm/charms_protocol_scanner.js"));
 const charms = require("../charms/wasm/charms_protocol_scanner.js");
 
-// Load environment variables
 dotenv.config();
 
-// =========================================================================
-// SYNC LOCK: Prevent redundant concurrent syncs
-// This ensures that if one request has already started a sync, 
-// subsequent API calls just return without starting a redundant second scan
-// =========================================================================
 let isSyncing = false;
 
 export interface IndexerConfig {
@@ -49,10 +38,6 @@ export interface IndexerConfig {
   batchSize?: number;
   scanIntervalMs?: number;
 }
-
-// =========================================================================
-// Structured Payment History Interface
-// =========================================================================
 
 export interface StructuredPaymentRecord {
   utxoId: string;
@@ -70,9 +55,6 @@ export interface StructuredPaymentRecord {
   status: 'pending' | 'confirmed' | 'spent';
 }
 
-/**
- * Adds a structured payment record to worker's historicalTokens
- */
 async function addStructuredPaymentRecord(
   db: any,
   walletAddress: string,
@@ -108,9 +90,6 @@ async function addStructuredPaymentRecord(
   console.log(`[INDEXER] ✅ Structured payment record added. History now has ${history.length} entries`);
 }
 
-/**
- * Updates an existing payment record status
- */
 async function updatePaymentRecordStatus(
   db: any,
   walletAddress: string,
@@ -158,9 +137,6 @@ async function updatePaymentRecordStatus(
   }
 }
 
-/**
- * Gets department name for a planId
- */
 async function getDepartmentName(db: any, planId: string): Promise<string> {
   const result = await db.execute({
     sql: 'SELECT department, ticker FROM plans WHERE appId = ?',
@@ -183,9 +159,6 @@ async function getDepartmentName(db: any, planId: string): Promise<string> {
   return 'Unknown Department';
 }
 
-/**
- * Gets worker role for a wallet address and planId
- */
 async function getWorkerRole(db: any, walletAddress: string, planId: string): Promise<string> {
   const result = await db.execute({
     sql: 'SELECT role FROM workers WHERE walletAddress = ? AND planId = ?',
@@ -195,10 +168,6 @@ async function getWorkerRole(db: any, walletAddress: string, planId: string): Pr
   const row = result.rows[0];
   return row?.role || 'Team Member';
 }
-
-// =========================================================================
-// Batch Scroll Release Interface
-// =========================================================================
 
 interface MatureWorker {
   walletAddress: string;
@@ -219,10 +188,6 @@ interface MatureWorker {
   payPeriodSeconds: number;
   compensationSats: number;
 }
-
-// =========================================================================
-// MARK: DerivableIndexer Class
-// =========================================================================
 
 export class DerivableIndexer {
   private db: any;
@@ -435,8 +400,8 @@ export class DerivableIndexer {
       
       await this.dbRun(`
         INSERT OR REPLACE INTO indexer_config (key, value, updatedAt)
-        VALUES ('lastIndexedBlock', ?, ?)
-      `, [blockNumber.toString(), new Date().toISOString()]);
+        VALUES (?, ?, ?)
+      `, ['lastIndexedBlock', blockNumber.toString(), new Date().toISOString()]);
       
       console.log(`[INDEXER] 💾 Saved progress: last indexed block = ${blockNumber}`);
     } catch (error) {
@@ -566,7 +531,7 @@ export class DerivableIndexer {
         const hasCharmsPattern = this.isCharmsPayTransaction(rawTxHex);
         const spendsKnownAsset = await this.isSpendingKnownAsset(tx);
 
-        console.log(`[INDEXER] 📊 Tx ${tx.txid}: hasCharmsPattern=${hasCharmsPattern}, spendsKnownAsset=${spendsKnownAsset}`);
+       // console.log(`[INDEXER] 📊 Tx ${tx.txid}: hasCharmsPattern=${hasCharmsPattern}, spendsKnownAsset=${spendsKnownAsset}`);
         
         if (!hasCharmsPattern && !spendsKnownAsset) {
           skippedCount++;
@@ -1206,51 +1171,47 @@ export class DerivableIndexer {
     }
     console.log(`[INDEXER]   🏢 Employer Address: ${employerAddress.substring(0, 20)}...`);
     
-        // Check if plan already exists to preserve anchorUtxo
-        const existingPlanRecord = await this.dbGet('SELECT anchorUtxo FROM plans WHERE appId = ?', [appId]);
+    const existingPlanRecord = await this.dbGet('SELECT anchorUtxo FROM plans WHERE appId = ?', [appId]);
     
-        if (existingPlan) {
-          // Update only mutable fields, preserve anchorUtxo
-          await this.dbRun(`
-            UPDATE plans SET 
-              nftUtxoId = ?,
-              remaining = ?,
-              status = 'active',
-              lastIndexedBlock = ?,
-              updatedAt = ?
-            WHERE appId = ?
-          `, [nftUtxoId, remaining, blockHeight, new Date().toISOString(), appId]);
-          console.log(`[INDEXER]   ✅ Plan record updated (preserved anchorUtxo: ${existingPlan.anchorUtxo})`);
-        } else {
-          // First time seeing this plan - INSERT all fields including anchorUtxo
-          await this.dbRun(`
-            INSERT INTO plans (
-              appId, nftUtxoId, anchorUtxo, employerAddress, ticker, compensationSats, 
-              payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
-              status, lastIndexedBlock, createdAt, updatedAt
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `, [
-            appId,
-            nftUtxoId,
-            anchorUtxo || '',
-            employerAddress,
-            ticker,
-            compensationSats || 0,
-            payPeriodSeconds || 0,
-            metadataHash || '',
-            scrollPolicy || 0,
-            remaining || 0,
-            'active',
-            blockHeight,
-            new Date().toISOString(),
-            new Date().toISOString()
-          ]);
-          console.log(`[INDEXER]   ✅ New plan record inserted with anchorUtxo: ${anchorUtxo}`);
-        }
+    if (existingPlanRecord) {
+      await this.dbRun(`
+        UPDATE plans SET 
+          nftUtxoId = ?,
+          remaining = ?,
+          status = 'active',
+          lastIndexedBlock = ?,
+          updatedAt = ?
+        WHERE appId = ?
+      `, [nftUtxoId, remaining, blockHeight, new Date().toISOString(), appId]);
+      console.log(`[INDEXER]   ✅ Plan record updated (preserved anchorUtxo: ${existingPlanRecord.anchorUtxo})`);
+    } else {
+      await this.dbRun(`
+        INSERT INTO plans (
+          appId, nftUtxoId, anchorUtxo, employerAddress, ticker, compensationSats, 
+          payPeriodSeconds, metadataHash, scrollPolicy, remaining, 
+          status, lastIndexedBlock, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        appId,
+        nftUtxoId,
+        anchorUtxo || '',
+        employerAddress,
+        ticker,
+        compensationSats || 0,
+        payPeriodSeconds || 0,
+        metadataHash || '',
+        scrollPolicy || 0,
+        remaining || 0,
+        'active',
+        blockHeight,
+        new Date().toISOString(),
+        new Date().toISOString()
+      ]);
+      console.log(`[INDEXER]   ✅ New plan record inserted with anchorUtxo: ${anchorUtxo}`);
+    }
     
     console.log(`[INDEXER]   ✅ Plan record saved to database with status 'active'`);
     
-    // Create BATCH_MINT audit log if workers were activated
     if (hasWorkerTokens && activatedWorkerCount > 0) {
       const auditId = crypto.randomUUID();
       await this.createAuditLog(
@@ -1263,7 +1224,6 @@ export class DerivableIndexer {
       console.log(`[INDEXER]   ✅ BATCH_MINT audit log created for ${activatedWorkerCount} workers`);
     }
     
-    // Only create PLAN_CREATED audit log if this is NOT a token mint transaction
     if (!hasWorkerTokens) {
       await this.createAuditLog(
         crypto.randomUUID(),
@@ -1401,10 +1361,6 @@ export class DerivableIndexer {
     }
   }
 
-  /**
-   * Triggers batch Scroll release for multiple mature workers in a single transaction
-   * ARCHITECTURE: Vault pays salaries only. Treasury pays ALL fees (Scroll + network + platform)
-   */
   private async triggerBatchScrollRelease(workers: MatureWorker[], currentBlockHeight: number): Promise<void> {
     if (workers.length === 0) {
       console.log(`[INDEXER] 📭 No workers provided for batch release`);
@@ -1424,26 +1380,17 @@ export class DerivableIndexer {
     const treasuryHexDest = firstWorker.treasuryHexDest;
     const treasuryAddress = firstWorker.treasuryAddress;
     
-    // =========================================================================
-    // SALARY CALCULATION (Vault only)
-    // =========================================================================
     const totalSalarySats = workers.reduce((sum, w) => sum + w.salarySats, 0);
     const vaultRequired = totalSalarySats;
     
     console.log(`[INDEXER]   Total salary from vault: ${vaultRequired} sats for ${workers.length} workers`);
     
-    // =========================================================================
-    // FEE CALCULATION (Treasury pays all fees)
-    // =========================================================================
-
     const NFT_CARRYING_COST = 1000;
     const platformFeeSats = Math.floor(totalSalarySats * (PLATFORM_FEE_BASIS_POINTS / 10000));
     const platformFeeAddress = process.env.PLATFORM_FEE_ADDRESS || PLATFORM_FEE_ADDRESS;
     
-    // Dynamic network fee calculation
     const inputCount = 3;
     const outputCount = workers.length + 2;
-    // Inside triggerBatchScrollRelease, replace the network fee calculation:
     const baseVSize = estimateTransactionVSize(inputCount, outputCount);
     const proofFloor = 1500;
     const perWorkerWeight = 100;
@@ -1460,9 +1407,6 @@ export class DerivableIndexer {
     console.log(`[INDEXER]   Network fee: ${networkFee} sats (${totalVSize} vB @ dynamic rate)`);
     console.log(`[INDEXER]   Total fees from treasury: ${totalFeesRequired} sats`);
     
-    // =========================================================================
-    // SELECT VAULT UTXO (Salary only - no fees)
-    // =========================================================================
     let vaultUtxo: any;
     try {
       console.log(`[INDEXER]   Selecting vault UTXO from: ${vaultAddress.substring(0, 20)}...`);
@@ -1480,9 +1424,6 @@ export class DerivableIndexer {
       return;
     }
     
-    // =========================================================================
-    // SELECT TREASURY UTXO (All fees: Scroll + network + platform)
-    // =========================================================================
     let treasuryUtxo: any;
     try {
       console.log(`[INDEXER]   Selecting treasury UTXO from: ${treasuryAddress.substring(0, 20)}...`);
@@ -1502,24 +1443,17 @@ export class DerivableIndexer {
       return;
     }
     
-    // =========================================================================
-    // CALCULATE TREASURY CHANGE
-    // =========================================================================
     const totalTreasuryInput = treasuryUtxo.value;
     const totalTreasuryOutput = platformFeeSats + SCROLL_FIXED_COST + networkFee;
     const treasuryChangeSats = totalTreasuryInput - totalTreasuryOutput;
 
-    // Only add change output if amount meets dust limit (>= 1000 sats)
     const hasTreasuryChange = treasuryChangeSats >= 1000;
 
     if (treasuryChangeSats > 0 && treasuryChangeSats < 1000) {
         console.log(`[INDEXER] Change (${treasuryChangeSats} sats) is below dust limit. Adding to fee instead.`);
     }
 
-    // =========================================================================
-    // BUILD OUTPUTS ARRAY DYNAMICALLY
-    // =========================================================================
-      const outputs: any[] = [
+    const outputs: any[] = [
       ...workers.map(w => ({ address: w.walletAddress, sats: w.salarySats })),
       { address: platformFeeAddress, sats: platformFeeSats },
       { address: SCROLL_FEE_ADDRESS_TESTNET4, sats: SCROLL_FIXED_COST },
@@ -1533,16 +1467,12 @@ export class DerivableIndexer {
           compensationSats: workers[0].compensationSats,
           anchorUtxo: workers[0].anchorUtxo
       }}
-  ];
+    ];
 
-    // Only add treasury change if it has value
     if (hasTreasuryChange) {
         outputs.push({ address: treasuryAddress, sats: treasuryChangeSats });
     }
 
-    // =========================================================================
-    // BUILD BATCH SPELL REQUEST
-    // =========================================================================
     const releaseRequest: any = {
         type: 'scroll-release',
         authorityUtxos: workers.map(w => w.currentTokenUtxo),
@@ -1569,9 +1499,6 @@ export class DerivableIndexer {
     
     console.log(`[INDEXER]   Spell request prepared with ${releaseRequest.outputs.length} outputs`);
     
-    // =========================================================================
-    // FETCH PREVIOUS TRANSACTIONS
-    // =========================================================================
     const tokenTxids = workers.map(w => w.currentTokenUtxo.split(':')[0]);
     console.log(`[INDEXER]   Fetching ${tokenTxids.length} token transactions for context...`);
     
@@ -1594,9 +1521,6 @@ export class DerivableIndexer {
     
     console.log(`[INDEXER]   Total prev_txs: ${prevTxHexes.length}`);
     
-    // =========================================================================
-    // CALL PROVER
-    // =========================================================================
     console.log(`[INDEXER]   Calling prover to generate unsigned batch transaction...`);
     
     let proverResult: ProverResult;
@@ -1616,17 +1540,13 @@ export class DerivableIndexer {
       return;
     }
     
-    // =========================================================================
-    // REQUEST SCROLL SIGNATURE
-    // =========================================================================
-    const nonce = scrolls.deriveCompanyNonce(employerAddress);
-    console.log(`[INDEXER]   Requesting Scroll signature with nonce: ${nonce}`);
+    console.log(`[INDEXER]   Requesting Scroll signature for batch release...`);
     
     let signedTx: string;
     try {
-      signedTx = await scrolls.requestScrollSignature(
+      signedTx = await requestScrollSignature(
         proverResult.spellTxHex,
-        [{ index: 0, nonce }],
+        [{ index: 0 }],
         [prevTxHexes[0]]
       );
     } catch (error: any) {
@@ -1637,9 +1557,6 @@ export class DerivableIndexer {
       return;
     }
     
-    // =========================================================================
-    // BROADCAST TRANSACTION
-    // =========================================================================
     console.log(`[INDEXER]   Broadcasting batch release transaction...`);
     
     let txid: string;
@@ -1654,9 +1571,6 @@ export class DerivableIndexer {
       return;
     }
     
-    // =========================================================================
-    // UPDATE WORKER RECORDS
-    // =========================================================================
     for (const worker of workers) {
       await this.dbRun(
         'UPDATE workers SET currentTokenUtxo = NULL, status = ?, updatedAt = ? WHERE walletAddress = ? AND planId = ?',
@@ -1849,10 +1763,6 @@ export class DerivableIndexer {
     }
   }
 }
-
-// =========================================================================
-// LAZY INDEXER PATTERN FOR SERVERLESS (Vercel) DEPLOYMENT
-// =========================================================================
 
 export async function syncIndexer(db: any, maxBlocksToScan: number = 50): Promise<void> {
   if (isSyncing) {
