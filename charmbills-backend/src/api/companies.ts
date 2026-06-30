@@ -2,6 +2,7 @@
 import { Request, Response } from 'express';
 import * as crypto from 'crypto';
 import { saveCompanyConfig } from '../db/schema';
+import { getCompanyVaultAddress } from '../bitcoin/scrollsClient';
 
 // --------------------------------------------------------------------------------
 // Types
@@ -68,8 +69,9 @@ function getDb(req: Request) {
  * Register a new company's infrastructure details
  * POST /api/companies/register
  * 
- * v15: Scroll address is auto-filled by prover when dest is empty and scrolls index is specified.
- * No manual vault address derivation needed - stored as empty string placeholder.
+ * v15 Dual-Custody:
+ * - Stable vaultAddress: Nonce-based deterministic address for Salary Vault (treasury deposits)
+ * - Asset routing: Uses scrolls: [0] in spells for ephemeral addresses
  */
 export async function registerCompany(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -86,8 +88,16 @@ export async function registerCompany(req: Request, res: Response) {
     console.log(`[COMPANY API:${requestId}] Treasury address: ${treasuryAddress.substring(0, 20)}...`);
     console.log(`[COMPANY API:${requestId}] Treasury hex dest: ${treasuryHexDest.substring(0, 30)}...`);
 
-    console.log(`[COMPANY API:${requestId}] v15: Scroll address will be auto-filled by prover`);
-    const vaultAddress = '';
+    console.log(`[COMPANY API:${requestId}] Deriving stable nonce-based vault address...`);
+    
+    let vaultAddress: string;
+    try {
+      vaultAddress = await getCompanyVaultAddress(employerAddress);
+      console.log(`[COMPANY API:${requestId}] Derived vault address: ${vaultAddress.substring(0, 30)}...`);
+    } catch (scrollError: any) {
+      console.error(`[COMPANY API:${requestId}] ❌ Failed to derive vault address:`, scrollError.message);
+      throw new Error(`Cannot register company: Scroll API error - ${scrollError.message}`);
+    }
 
     console.log(`[COMPANY API:${requestId}] 💾 Saving company configuration to database...`);
     
@@ -108,7 +118,7 @@ export async function registerCompany(req: Request, res: Response) {
     };
 
     console.log(`[COMPANY API:${requestId}] ✅ Company registered successfully`);
-    console.log(`[COMPANY API:${requestId}]   Vault: auto-filled by prover (v15)`);
+    console.log(`[COMPANY API:${requestId}]   Vault: ${vaultAddress.substring(0, 30)}... (stable nonce-based)`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
     return res.status(201).json({ success: true, ...response });
@@ -129,8 +139,6 @@ export async function registerCompany(req: Request, res: Response) {
 /**
  * Get company details by employer address
  * GET /api/companies/:employerAddress
- * 
- * v15: Returns empty vaultAddress - prover fills automatically
  */
 export async function getCompany(req: Request, res: Response) {
   const requestId = crypto.randomBytes(4).toString('hex');
@@ -164,7 +172,7 @@ export async function getCompany(req: Request, res: Response) {
     }
     
     console.log(`[COMPANY API:${requestId}] ✅ Company found`);
-    console.log(`[COMPANY API:${requestId}]   Vault: auto-filled by prover (v15)`);
+    console.log(`[COMPANY API:${requestId}]   Vault: ${company.vaultAddress ? company.vaultAddress.substring(0, 30) + '...' : 'not set'}`);
     console.log(`[COMPANY API:${requestId}] ===== END =====\n`);
     
     return res.status(200).json({
@@ -173,7 +181,7 @@ export async function getCompany(req: Request, res: Response) {
         employerAddress: company.employerAddress,
         treasuryAddress: company.treasuryAddress,
         treasuryHexDest: `${company.treasuryHexDest.substring(0, 20)}...`,
-        vaultAddress: '',
+        vaultAddress: company.vaultAddress || '',
         createdAt: company.createdAt,
         updatedAt: company.updatedAt
       }
@@ -217,7 +225,7 @@ export async function listCompanies(req: Request, res: Response) {
       employerAddress: c.employerAddress,
       treasuryAddress: c.treasuryAddress,
       treasuryHexDest: c.treasuryHexDest,
-      vaultAddress: '',
+      vaultAddress: c.vaultAddress || '',
       createdAt: c.createdAt,
       updatedAt: c.updatedAt
     }));

@@ -18,7 +18,7 @@ import {
 } from '@shared/constants';
 import * as dotenv from 'dotenv';
 import * as crypto from 'crypto';
-import { requestScrollSignature } from '../bitcoin/scrollsClient';
+import { requestScrollSignature, deriveCompanyNonce } from '../bitcoin/scrollsClient';
 import { generateUnsignedTransactions } from '../charms/proverClient';
 import { getDynamicFundingUtxo, fetchTransactionHex, verifyUtxoStatus, lockUtxo, unlockUtxo, getCurrentFeeRate, estimateTransactionVSize, calculateNetworkFee } from './utxo-manager';
 import { calculateScrollFee } from './charms-utils';
@@ -1386,7 +1386,13 @@ export class DerivableIndexer {
     console.log(`[INDEXER]   Total salary from vault: ${vaultRequired} sats for ${workers.length} workers`);
     
     const NFT_CARRYING_COST = 1000;
-    const platformFeeSats = Math.floor(totalSalarySats * (PLATFORM_FEE_BASIS_POINTS / 10000));
+    let platformFeeSats = Math.floor(totalSalarySats * (PLATFORM_FEE_BASIS_POINTS / 10000));
+    
+    if (platformFeeSats > 0 && platformFeeSats < MIN_OUTPUT_SATS) {
+      console.log(`[INDEXER] Bumping platform fee from ${platformFeeSats} to ${MIN_OUTPUT_SATS} (Dust Limit)`);
+      platformFeeSats = MIN_OUTPUT_SATS;
+    }
+    
     const platformFeeAddress = process.env.PLATFORM_FEE_ADDRESS || PLATFORM_FEE_ADDRESS;
     
     const inputCount = 3;
@@ -1400,10 +1406,16 @@ export class DerivableIndexer {
 
     console.log(`[INDEXER] Network fee: ${networkFee} sats (base=${baseVSize}, proof overhead=${PROOF_OVERHEAD_BYTES}, total=${totalVSize} vB)`);
     
-    const totalFeesRequired = SCROLL_FIXED_COST + networkFee + platformFeeSats + NFT_CARRYING_COST;
+    let scrollFeeSats = SCROLL_FIXED_COST;
+    if (scrollFeeSats > 0 && scrollFeeSats < MIN_OUTPUT_SATS) {
+      console.log(`[INDEXER] Bumping Scroll fee from ${scrollFeeSats} to ${MIN_OUTPUT_SATS} (Dust Limit)`);
+      scrollFeeSats = MIN_OUTPUT_SATS;
+    }
+    
+    const totalFeesRequired = scrollFeeSats + networkFee + platformFeeSats + NFT_CARRYING_COST;
     
     console.log(`[INDEXER]   Platform fee: ${platformFeeSats} sats (${PLATFORM_FEE_BASIS_POINTS / 100}%) -> ${platformFeeAddress.substring(0, 20)}...`);
-    console.log(`[INDEXER]   Scroll fixed fee: ${SCROLL_FIXED_COST} sats`);
+    console.log(`[INDEXER]   Scroll fixed fee: ${scrollFeeSats} sats`);
     console.log(`[INDEXER]   Network fee: ${networkFee} sats (${totalVSize} vB @ dynamic rate)`);
     console.log(`[INDEXER]   Total fees from treasury: ${totalFeesRequired} sats`);
     
@@ -1444,7 +1456,7 @@ export class DerivableIndexer {
     }
     
     const totalTreasuryInput = treasuryUtxo.value;
-    const totalTreasuryOutput = platformFeeSats + SCROLL_FIXED_COST + networkFee;
+    const totalTreasuryOutput = platformFeeSats + scrollFeeSats + networkFee;
     const treasuryChangeSats = totalTreasuryInput - totalTreasuryOutput;
 
     const hasTreasuryChange = treasuryChangeSats >= 1000;
@@ -1456,7 +1468,7 @@ export class DerivableIndexer {
     const outputs: any[] = [
       ...workers.map(w => ({ address: w.walletAddress, sats: w.salarySats })),
       { address: platformFeeAddress, sats: platformFeeSats },
-      { address: SCROLL_FEE_ADDRESS_TESTNET4, sats: SCROLL_FIXED_COST },
+      { address: SCROLL_FEE_ADDRESS_TESTNET4, sats: scrollFeeSats },
       { address: vaultAddress, sats: NFT_CARRYING_COST, nftMetadata: {
           appId: workers[0].appId,
           ticker: workers[0].ticker,
@@ -1540,14 +1552,15 @@ export class DerivableIndexer {
       return;
     }
     
-    console.log(`[INDEXER]   Requesting Scroll signature for batch release...`);
+    const nonce = deriveCompanyNonce(employerAddress);
+    console.log(`[INDEXER]   Requesting Scroll signature with nonce: ${nonce}`);
     
     let signedTx: string;
     try {
       signedTx = await requestScrollSignature(
         proverResult.spellTxHex,
-        [{ index: 0 }],
-        [prevTxHexes[0]]
+        [{ index: 3, nonce: nonce }],
+        prevTxHexes
       );
     } catch (error: any) {
       console.error(`[INDEXER]   ❌ Scroll signature failed: ${error.message}`);

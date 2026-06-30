@@ -1,13 +1,24 @@
 import axios from 'axios';
+import * as crypto from 'crypto';
 
-const SCROLL_BASE = "https://scrolls-v15.charms.dev";
+const SCROLL_BASE = "https://scrolls-v14.charms.dev";
 
 /**
- * v15 Simplified Scroll Routing
- * In v15, you no longer derive Scroll addresses manually via nonce.
- * The prover fills them when you leave dest empty and specify scrolls indexes.
- * Each company gets a unique Scroll address automatically based on their UTXO.
+ * v15 Dual-Custody Architecture:
+ * - Nonce-Based Address: Stable, deterministic vault address for company treasury (salary deposits)
+ * - Simplified Scroll Routing: Ephemeral addresses for assets (scrolls: [0] in spells)
  */
+
+/**
+ * Derives a deterministic 64-bit nonce from the employer's wallet.
+ * This ensures each company has a stable, unique vault address.
+ */
+export function deriveCompanyNonce(employerAddress: string): number {
+    const hash = crypto.createHash('sha256').update(employerAddress).digest('hex');
+    const nonce = parseInt(hash.substring(0, 15), 16);
+    console.log(`[Scrolls Client] Derived company nonce: ${nonce} from employer address ${employerAddress.substring(0, 16)}...`);
+    return nonce;
+}
 
 /**
  * Helper function to fetch with retries and longer timeout
@@ -33,11 +44,41 @@ async function fetchWithRetry(url: string, retries: number = 2, delayMs: number 
 }
 
 /**
+ * Fetches the deterministic, stable company vault address.
+ * Used for the Salary Vault (liquidity layer) - NOT for asset routing.
+ * 
+ * @param employerAddress - The employer's wallet address (HR manager)
+ * @returns The stable vault address as a string (e.g., "tb1...")
+ */
+export async function getCompanyVaultAddress(employerAddress: string): Promise<string> {
+    const nonce = deriveCompanyNonce(employerAddress);
+    const network = "testnet4";
+    const targetUrl = `${SCROLL_BASE}/${network}/address/${nonce}`;
+    
+    try {
+        console.log(`[Scrolls Client] Querying company vault: ${targetUrl}`);
+        
+        const res = await fetchWithRetry(targetUrl, 2, 1500);
+        
+        if (!res.data || typeof res.data !== 'string') {
+            throw new Error('Invalid response from Scroll API');
+        }
+        
+        return res.data.trim().replace(/"/g, '');
+    } catch (error: any) {
+        const status = error.response?.status;
+        console.error('[Scrolls Client] Failed to get company vault address:', error.message);
+        
+        if (status === 404) {
+            throw new Error(`Scroll API Error: Endpoint ${targetUrl} not found. Check network version.`);
+        }
+        throw new Error(`Scroll API error: ${error.message}`);
+    }
+}
+
+/**
  * Triggers the Scroll Settlement (Payment Release).
  * Scrolls will ONLY sign if the tx carries a correct spell (token spend).
- * 
- * v15: The prover handles address derivation. This function is only for
- * signing Scroll-controlled outputs after the prover has filled the addresses.
  * 
  * @param txToSign - The transaction hex string to be signed by Scroll
  * @param signInputs - Array of objects containing input index and nonce for each input to sign
@@ -82,9 +123,6 @@ export async function requestScrollSignature(
 
 /**
  * Returns the current configuration of the Scrolls Bitcoin API.
- * Useful for fee calculation validation.
- * 
- * @returns Scroll configuration with fee_address, fee_per_input, fee_basis_points, fixed_cost
  */
 export async function getScrollConfig(): Promise<{
     fee_address: { main: string; testnet4: string };
